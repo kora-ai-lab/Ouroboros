@@ -220,6 +220,29 @@
       font-size: 12px;
     }
 
+    .memory-item.active {
+      border-color: var(--white);
+      color: var(--white);
+    }
+
+    .sidebar-controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin: 0 0 12px;
+    }
+
+    .sidebar-controls button:first-child {
+      grid-column: 1 / -1;
+    }
+
+    .section-title {
+      color: var(--gray-4);
+      font-size: 11px;
+      margin: 14px 0 8px;
+      text-transform: uppercase;
+    }
+
     .status {
       color: var(--gray-4);
       font-size: 12px;
@@ -354,6 +377,14 @@
         <div class="brand">Memory</div>
         <button id="refreshMemory" type="button">Refresh</button>
       </div>
+      <div class="sidebar-controls" aria-label="Session navigation">
+        <button id="newSession" type="button">New Session</button>
+        <button id="previousSession" type="button">Previous Session</button>
+        <button id="nextSession" type="button">Next Session</button>
+      </div>
+      <div class="section-title">Conversation Threads</div>
+      <div id="sessionList"></div>
+      <div class="section-title">Episodic Memory Snippets</div>
       <div id="memoryList"></div>
     </aside>
   </div>
@@ -442,10 +473,14 @@
     const fileInput = document.getElementById('fileInput');
     const contextStrip = document.getElementById('contextStrip');
     const memoryList = document.getElementById('memoryList');
+    const sessionList = document.getElementById('sessionList');
     const memorySidebar = document.getElementById('memorySidebar');
     const toggleMemory = document.getElementById('toggleMemory');
     const saveSession = document.getElementById('saveSession');
     const refreshMemory = document.getElementById('refreshMemory');
+    const newSessionButton = document.getElementById('newSession');
+    const previousSessionButton = document.getElementById('previousSession');
+    const nextSessionButton = document.getElementById('nextSession');
     const openSettings = document.getElementById('openSettings');
     const closeSettings = document.getElementById('closeSettings');
     const settingsPanel = document.getElementById('settingsPanel');
@@ -470,6 +505,8 @@
     const messages = [];
     const contextFiles = [];
     let settingsState = null;
+    let activeSessionId = null;
+    let sessionRecords = [];
 
     function setStatus(text) {
       statusNode.textContent = text;
@@ -523,7 +560,104 @@
       contextStrip.appendChild(chip);
     }
 
+    function createSessionId() {
+      return `session-${Date.now()}`;
+    }
+
+    function renderLoadedMessages(loadedMessages) {
+      messages.length = 0;
+      output.innerHTML = '';
+      for (const m of loadedMessages) {
+        messages.push(m);
+        if (m.role === 'user') addTextMessage('User', m.content);
+        else if (m.role === 'assistant') addTextMessage('Ouroboros', m.content);
+        else if (m.role === 'system') addTextMessage('System', m.content);
+        else if (m.role === 'tool') addMessage('Tool result', `<pre style="font-size:11px;">${m.content}</pre>`);
+      }
+      if (!loadedMessages.length) addTextMessage('System', 'New session started.');
+    }
+
+    function startNewSession(showStatus = true) {
+      activeSessionId = createSessionId();
+      renderLoadedMessages([]);
+      if (showStatus) setStatus(`New session: ${activeSessionId}`);
+      refreshSessions();
+      return activeSessionId;
+    }
+
+    async function persistSessionArchive(statusText = '') {
+      if (!activeSessionId) activeSessionId = createSessionId();
+      if (!messages.length) return;
+      const response = await fetch(`/sessions/${activeSessionId}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages })
+      });
+      if (!response.ok) throw new Error(await response.text());
+      if (statusText) setStatus(statusText);
+      await refreshSessions();
+    }
+
+    async function loadSession(sessionId, confirmReplace = true) {
+      if (confirmReplace && messages.length && !confirm('Replace current chat with this session?')) return;
+      const res = await fetch(`/sessions/${sessionId}`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      activeSessionId = data.session_id;
+      renderLoadedMessages(data.messages || []);
+      setStatus(`Loaded session: ${activeSessionId}`);
+      await refreshSessions();
+    }
+
+    function currentSessionIndex() {
+      return sessionRecords.findIndex(session => session.session_id === activeSessionId);
+    }
+
+    async function navigateSession(direction) {
+      if (!sessionRecords.length) {
+        setStatus('No saved sessions yet.');
+        return;
+      }
+      const current = currentSessionIndex();
+      const nextIndex = current < 0
+        ? 0
+        : Math.min(Math.max(current + direction, 0), sessionRecords.length - 1);
+      const target = sessionRecords[nextIndex];
+      if (target) await loadSession(target.session_id, true);
+    }
+
+    async function refreshSessions() {
+      try {
+        const response = await fetch('/sessions');
+        const data = await response.json();
+        sessionRecords = data.sessions || [];
+        sessionList.innerHTML = '';
+        for (const session of sessionRecords) {
+          const item = document.createElement('button');
+          item.type = 'button';
+          item.className = `memory-item${session.session_id === activeSessionId ? ' active' : ''}`;
+          const updated = new Date(session.updated_at).toLocaleString();
+          const summary = session.summary || session.session_id;
+          item.innerHTML = `<strong>${session.title || session.session_id}</strong>${updated}<br>${summary.length > 120 ? summary.substring(0, 120) + '...' : summary}`;
+          item.addEventListener('click', async () => {
+            try {
+              await loadSession(session.session_id, true);
+            } catch (err) {
+              setStatus(`Load failed: ${err.message}`);
+            }
+          });
+          sessionList.appendChild(item);
+        }
+        if (!sessionList.children.length) {
+          sessionList.innerHTML = '<div class="memory-item">No saved conversation threads yet.</div>';
+        }
+      } catch (e) {
+        sessionList.innerHTML = `<div class="memory-item">Failed to load sessions: ${e.message}</div>`;
+      }
+    }
+
     async function refreshMemories() {
+      await refreshSessions();
       try {
         const response = await fetch('/memory');
         const data = await response.json();
@@ -542,14 +676,12 @@
           item.appendChild(summary);
           
           item.addEventListener('click', () => {
-            // Add to context
             const contextItem = { type: 'memory', name: `memory-${memory.id}`, content: memory.summary };
             if (!contextFiles.some(f => f.name === contextItem.name)) {
               contextFiles.push(contextItem);
               addChip(contextItem);
             }
             
-            // Show preview in chat
             const contentNode = addMessage('System', `Memory preview: ${memory.id}<br>`);
             const node = document.createElement('div');
             node.innerHTML = `<div style="border-left:2px solid var(--gray-3);padding-left:12px;margin-top:8px;font-family:monospace;white-space:pre-wrap;">${memory.summary}</div>`;
@@ -560,25 +692,11 @@
           loadBtn.type = 'button';
           loadBtn.className = 'chip';
           loadBtn.style.marginTop = '8px';
-          loadBtn.textContent = 'LOAD SESSION';
+          loadBtn.textContent = 'LOAD THREAD';
           loadBtn.onclick = async (e) => {
             e.stopPropagation();
-            if (!confirm('Replace current chat with this session?')) return;
             try {
-              const res = await fetch(`/memory/${memory.session_id}`);
-              const data = await res.json();
-              if (data.messages) {
-                messages.length = 0;
-                output.innerHTML = '';
-                for (const m of data.messages) {
-                  messages.push(m);
-                  if (m.role === 'user') addTextMessage('User', m.content);
-                  else if (m.role === 'assistant') addTextMessage('Ouroboros', m.content);
-                  else if (m.role === 'system') addTextMessage('System', m.content);
-                  else if (m.role === 'tool') addMessage('Tool result', `<pre style="font-size:11px;">${m.content}</pre>`);
-                }
-                setStatus(`Loaded session: ${memory.session_id}`);
-              }
+              await loadSession(memory.session_id, true);
             } catch (err) {
               setStatus(`Load failed: ${err.message}`);
             }
@@ -776,16 +894,17 @@
         setStatus('Nothing to save yet.');
         return;
       }
-      const sessionId = `session-${Date.now()}`;
+      if (!activeSessionId) activeSessionId = createSessionId();
       setStatus('Saving session to memory...');
       try {
         const response = await fetch('/memory/save', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sessionId, messages })
+          body: JSON.stringify({ session_id: activeSessionId, messages })
         });
         const data = await response.json();
         if (response.ok && data.status !== 'error') {
+          activeSessionId = data.session_id || activeSessionId;
           setStatus('Session saved.');
           refreshMemories();
         } else {
@@ -842,6 +961,11 @@
       }
 
       messages.push({ role: 'assistant', content: assistantText });
+      try {
+        await persistSessionArchive();
+      } catch (error) {
+        setStatus(`Session archive failed: ${error.message}`);
+      }
       sendButton.disabled = false;
       promptInput.focus();
     }
@@ -892,6 +1016,9 @@
       }
     });
     saveSession.addEventListener('click', saveCurrentSession);
+    newSessionButton.addEventListener('click', () => startNewSession(true));
+    previousSessionButton.addEventListener('click', () => navigateSession(1));
+    nextSessionButton.addEventListener('click', () => navigateSession(-1));
     openSettings.addEventListener('click', async () => {
       await loadSettings();
       settingsPanel.classList.add('open');
@@ -957,7 +1084,8 @@
       setSettingsStatus('Settings saved.');
     });
     refreshMemory.addEventListener('click', refreshMemories);
-    loadSettings();
+    loadSettings().catch(() => {});
+    startNewSession(false);
     refreshMemories();
   </script>
 </body>

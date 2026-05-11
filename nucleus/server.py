@@ -940,9 +940,8 @@ CONVERSATION:
         if not keywords:
             keywords = ["session", "archive"]
             
-        # Archive full session
-        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-        (ARCHIVE_DIR / f"{session_id}.json").write_text(json.dumps({"session_id": session_id, "messages": messages}, indent=2), encoding="utf-8")
+        # Archive the full conversation thread separately from episodic memory snippets.
+        write_session_archive(session_id, messages, summary=summary)
 
         with connect_db() as conn:
             conn.execute(
@@ -959,6 +958,82 @@ CONVERSATION:
 class MemorySaveRequest(BaseModel):
     session_id: str
     messages: list[ChatMessage]
+
+
+class SessionUpdateRequest(BaseModel):
+    messages: list[ChatMessage]
+    summary: str = ""
+    title: str = ""
+
+
+def safe_session_id(session_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", session_id):
+        raise HTTPException(status_code=400, detail="Invalid session id.")
+    return session_id
+
+
+def session_archive_path(session_id: str) -> Path:
+    return ARCHIVE_DIR / f"{safe_session_id(session_id)}.json"
+
+
+def derive_session_title(messages: list[dict[str, str]], fallback: str) -> str:
+    for message in messages:
+        if message.get("role") == "user" and message.get("content", "").strip():
+            title = re.sub(r"\s+", " ", message["content"].strip())
+            return title[:80]
+    return fallback
+
+
+def archive_updated_at(path: Path, payload: dict[str, Any]) -> str:
+    updated_at = payload.get("updated_at") or payload.get("created_at")
+    if isinstance(updated_at, str) and updated_at:
+        return updated_at
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+
+
+def normalize_session_archive(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    session_id = str(payload.get("session_id") or path.stem)
+    messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    updated_at = archive_updated_at(path, payload)
+    title = payload.get("title") or derive_session_title(messages, session_id)
+    return {
+        "session_id": session_id,
+        "type": payload.get("type") or "conversation_thread",
+        "title": title,
+        "summary": payload.get("summary", ""),
+        "messages": messages,
+        "created_at": payload.get("created_at") or updated_at,
+        "updated_at": updated_at,
+    }
+
+
+def write_session_archive(
+    session_id: str,
+    messages: list[dict[str, str]],
+    summary: str = "",
+    title: str = "",
+) -> dict[str, Any]:
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    path = session_archive_path(session_id)
+    existing: dict[str, Any] = {}
+    if path.exists():
+        try:
+            existing = normalize_session_archive(path)
+        except Exception:
+            existing = {}
+    timestamp = now_iso()
+    payload = {
+        "session_id": safe_session_id(session_id),
+        "type": "conversation_thread",
+        "title": title or existing.get("title") or derive_session_title(messages, session_id),
+        "summary": summary or existing.get("summary", ""),
+        "messages": messages,
+        "created_at": existing.get("created_at") or timestamp,
+        "updated_at": timestamp,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return payload
 
 
 @app.post("/memory/save")
@@ -994,7 +1069,45 @@ async def get_memory() -> JSONResponse:
         rows = conn.execute(
             "SELECT id, created_at, keywords, summary, session_id FROM episodic_memory ORDER BY created_at DESC"
         ).fetchall()
-    return JSONResponse({"memories": [dict(row) for row in rows]})
+    memories = []
+    for row in rows:
+        memory = dict(row)
+        memory["type"] = "memory_snippet"
+        memory["title"] = "Episodic memory"
+        memories.append(memory)
+    return JSONResponse({"memories": memories})
+
+
+@app.get("/sessions")
+async def get_sessions() -> JSONResponse:
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    sessions: list[dict[str, Any]] = []
+    for path in ARCHIVE_DIR.glob("*.json"):
+        try:
+            archive = normalize_session_archive(path)
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
+        sessions.append({key: archive[key] for key in ("session_id", "type", "title", "summary", "created_at", "updated_at")})
+    sessions.sort(key=lambda item: item["updated_at"], reverse=True)
+    return JSONResponse({"sessions": sessions})
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str) -> JSONResponse:
+    path = session_archive_path(session_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Session not found.")
+    try:
+        return JSONResponse(normalize_session_archive(path))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/sessions/{session_id}")
+async def put_session(session_id: str, request: SessionUpdateRequest) -> JSONResponse:
+    messages = [message.model_dump() for message in request.messages]
+    archive = write_session_archive(session_id, messages, summary=request.summary, title=request.title)
+    return JSONResponse(archive)
 
 
 @app.get("/settings")
@@ -1115,11 +1228,11 @@ async def upload(file: UploadFile = File(...)) -> JSONResponse:
 
 @app.get("/memory/{session_id}")
 async def get_session_history(session_id: str) -> JSONResponse:
-    path = ARCHIVE_DIR / f"{session_id}.json"
+    path = session_archive_path(session_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Session not found.")
     try:
-        return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+        return JSONResponse(normalize_session_archive(path))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
