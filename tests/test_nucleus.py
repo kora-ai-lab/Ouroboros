@@ -94,6 +94,35 @@ async def test_retrieve_relevant_memory(tmp_path, monkeypatch):
     assert matches[0]["session_id"] == "session-1"
 
 
+def test_summarize_and_store_archives_when_provider_fails(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    session_id = "session-provider-failure"
+    messages = [{"role": "user", "content": "Archive this before summary."}]
+    archive_path = tmp_path / "data" / "archive" / f"{session_id}.json"
+
+    async def failing_call_model(prompt, model="openai-fast"):
+        assert archive_path.exists()
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(server, "call_model_simple", failing_call_model)
+
+    result = asyncio.run(server.summarize_and_store(messages, session_id))
+
+    assert result["status"] == "saved"
+    assert result["archive_saved"] is True
+    assert result["summary_fallback"] is True
+    assert result["summary"] == f"Conversation session {session_id}"
+    assert json.loads(archive_path.read_text(encoding="utf-8")) == {
+        "session_id": session_id,
+        "messages": messages,
+    }
+
+    memory_response = asyncio.run(server.get_memory())
+    memories = json.loads(memory_response.body)["memories"]
+    assert memories[0]["session_id"] == session_id
+    assert memories[0]["summary"] == f"Conversation session {session_id}"
+
+
 def test_upload_text(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     response = client.post("/upload", files={"file": ("note.txt", b"hello", "text/plain")})

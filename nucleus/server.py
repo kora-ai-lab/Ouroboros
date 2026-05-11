@@ -914,13 +914,23 @@ async def call_model_simple(prompt: str, model: str = "openai-fast") -> str:
         raise
 
 
-async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
+def archive_session(session_id: str, messages: list[dict[str, str]]) -> Path:
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    archive_path = ARCHIVE_DIR / f"{session_id}.json"
+    archive_path.write_text(
+        json.dumps({"session_id": session_id, "messages": messages}, indent=2),
+        encoding="utf-8",
+    )
+    return archive_path
+
+
+async def summarize_session(messages: list[dict[str, str]]) -> str:
     conversation_text = "\n".join([
         f"{m['role'].upper()}: {m['content']}"
         for m in messages
         if m['role'] in ['user', 'assistant']
     ])
-    
+
     summary_prompt = f"""
 Summarize this conversation in 150 to 250 words.
 Include: main topics, decisions made, tools built or registered, files modified, and any named entities (projects, people, dates, domain names, tools).
@@ -929,31 +939,56 @@ Write in past tense. Be specific and factual. No filler. No intro sentence.
 CONVERSATION:
 {conversation_text[:8000]}
 """
+    return await call_model_simple(summary_prompt, model="openai-fast")
+
+
+def store_episodic_memory(session_id: str, summary: str, keywords: list[str]) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO episodic_memory (id, created_at, keywords, summary, session_id) VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), now_iso(), ",".join(keywords), summary, session_id),
+        )
+        conn.commit()
+
+
+async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
     try:
-        try:
-            summary = await call_model_simple(summary_prompt, model="openai-fast")
-        except Exception as e:
-            print(f"WARNING: Model summarization failed, using fallback. Error: {e}")
-            summary = f"Conversation session {session_id}. Summary unavailable due to model error."
-        
+        archive_path = archive_session(session_id, messages)
+    except Exception as e:
+        print(f"ERROR: archive_session failed: {e}")
+        return {"status": "error", "message": str(e), "session_id": session_id, "archive_saved": False}
+
+    summary_failed = False
+    try:
+        summary = await summarize_session(messages)
+    except Exception as e:
+        summary_failed = True
+        print(f"WARNING: Model summarization failed, using fallback. Error: {e}")
+        summary = f"Conversation session {session_id}"
+
+    try:
         keywords = extract_keywords(summary)
         if not keywords:
             keywords = ["session", "archive"]
-            
-        # Archive full session
-        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-        (ARCHIVE_DIR / f"{session_id}.json").write_text(json.dumps({"session_id": session_id, "messages": messages}, indent=2), encoding="utf-8")
 
-        with connect_db() as conn:
-            conn.execute(
-                "INSERT INTO episodic_memory (id, created_at, keywords, summary, session_id) VALUES (?, ?, ?, ?, ?)",
-                (str(uuid.uuid4()), now_iso(), ",".join(keywords), summary, session_id),
-            )
-            conn.commit()
-        return {"status": "saved", "session_id": session_id, "summary": summary}
+        store_episodic_memory(session_id, summary, keywords)
+        return {
+            "status": "saved",
+            "session_id": session_id,
+            "summary": summary,
+            "archive_saved": True,
+            "archive_path": str(archive_path),
+            "summary_fallback": summary_failed,
+        }
     except Exception as e:
-        print(f"ERROR: summarize_and_store failed: {e}")
-        return {"status": "error", "message": str(e)}
+        print(f"ERROR: summarize_and_store failed after archiving: {e}")
+        return {
+            "status": "error",
+            "message": str(e),
+            "session_id": session_id,
+            "archive_saved": True,
+            "archive_path": str(archive_path),
+        }
 
 
 class MemorySaveRequest(BaseModel):
