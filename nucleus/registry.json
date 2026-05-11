@@ -11,10 +11,12 @@
             "description": "Valid Python code to execute"
           }
         },
-        "required": ["code"]
+        "required": [
+          "code"
+        ]
       },
       "builtin": true,
-      "requires_approval": false
+      "requires_approval": true
     },
     {
       "name": "register_tool",
@@ -41,7 +43,10 @@
           }
         },
         "required": [
-          "name","description","parameters_schema","filepath"
+          "name",
+          "description",
+          "parameters_schema",
+          "filepath"
         ]
       },
       "builtin": true,
@@ -55,7 +60,16 @@
         "properties": {
           "action": {
             "type": "string",
-            "enum": ["read", "write", "append", "delete", "list", "mkdir", "copy", "move"],
+            "enum": [
+              "read",
+              "write",
+              "append",
+              "delete",
+              "list",
+              "mkdir",
+              "copy",
+              "move"
+            ],
             "description": "Operation to perform"
           },
           "path": {
@@ -71,7 +85,10 @@
             "description": "Destination path for copy/move actions"
           }
         },
-        "required": ["action", "path"]
+        "required": [
+          "action",
+          "path"
+        ]
       },
       "filepath": "filesystem_manager.py",
       "builtin": false,

@@ -981,19 +981,48 @@
       const node = document.createElement('div');
       node.className = 'message';
       node.style.border = '1px solid var(--white)';
-      node.innerHTML = `
-        <div class="role">Approval Required</div>
-        <div style="margin-bottom:12px;">Tool: <strong>${data.tool_name}</strong></div>
-        <pre style="font-size:11px;background:var(--gray-1);padding:8px;">${JSON.stringify(data.arguments, null, 2)}</pre>
-        <div class="actions" style="margin-top:12px;">
-          <button class="approve-btn" style="background:var(--white);color:var(--black);">APPROVE</button>
-          <button class="reject-btn">REJECT</button>
-        </div>
-      `;
+      const role = document.createElement('div');
+      role.className = 'role';
+      role.textContent = 'Approval Required';
+
+      const tool = document.createElement('div');
+      tool.style.marginBottom = '8px';
+      tool.innerHTML = 'Tool: ';
+      const toolName = document.createElement('strong');
+      toolName.textContent = data.tool_name || 'unknown';
+      tool.appendChild(toolName);
+
+      const risk = document.createElement('div');
+      risk.style.marginBottom = '12px';
+      risk.textContent = data.risk_summary || 'Review this tool execution before approving.';
+
+      const codeLabel = document.createElement('div');
+      codeLabel.className = 'role';
+      codeLabel.textContent = data.code ? 'Exact code to execute' : 'Arguments';
+
+      const pre = document.createElement('pre');
+      pre.style.fontSize = '11px';
+      pre.style.background = 'var(--gray-1)';
+      pre.style.padding = '8px';
+      pre.textContent = data.code || JSON.stringify(data.arguments || {}, null, 2);
+
+      const actions = document.createElement('div');
+      actions.className = 'actions';
+      actions.style.marginTop = '12px';
+      const approve = document.createElement('button');
+      approve.className = 'approve-btn';
+      approve.style.background = 'var(--white)';
+      approve.style.color = 'var(--black)';
+      approve.textContent = 'APPROVE';
+      const reject = document.createElement('button');
+      reject.className = 'reject-btn';
+      reject.textContent = 'REJECT';
+      actions.append(approve, reject);
+      node.append(role, tool, risk, codeLabel, pre, actions);
       output.appendChild(node);
       output.scrollTop = output.scrollHeight;
 
-      node.querySelector('.approve-btn').onclick = async () => {
+      approve.onclick = async () => {
         node.remove();
         await fetch('/approve', {
           method: 'POST',
@@ -1001,7 +1030,7 @@
           body: JSON.stringify({ request_id: data.request_id })
         });
       };
-      node.querySelector('.reject-btn').onclick = async () => {
+      reject.onclick = async () => {
         node.remove();
         await fetch('/reject', {
           method: 'POST',
