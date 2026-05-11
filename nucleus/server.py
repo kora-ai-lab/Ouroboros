@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import os
 import re
@@ -61,6 +62,20 @@ MODEL_OPTIONS = {
         "mistral",
     ]
 }
+
+RUNTIME_SETTING_DEFAULTS = {
+    "n_threads": max((os.cpu_count() or 4) - 1, 1),
+    "n_gpu_layers": 0,
+    "n_ctx": 4096,
+    "n_batch": 512,
+    "n_ubatch": 512,
+    "use_mmap": True,
+    "use_mlock": False,
+    "flash_attn": False,
+}
+RUNTIME_INT_SETTINGS = {"n_threads", "n_gpu_layers", "n_ctx", "n_batch", "n_ubatch"}
+RUNTIME_BOOL_SETTINGS = {"use_mmap", "use_mlock", "flash_attn"}
+RUNTIME_SETTINGS = tuple(RUNTIME_SETTING_DEFAULTS.keys())
 
 DEFAULT_SETTINGS = {
     "default_provider": "pollinations",
@@ -184,6 +199,7 @@ class SettingsUpdate(BaseModel):
     default_provider: str = "pollinations"
     default_model: str = "openai-fast"
     provider_keys: dict[str, str] = Field(default_factory=dict)
+    runtime_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class ProviderUpdate(BaseModel):
@@ -194,6 +210,7 @@ class ProviderUpdate(BaseModel):
     api_key: str = ""
     models: list[str] = Field(default_factory=list)
     models_path: str = ""
+    runtime_settings: dict[str, Any] = Field(default_factory=dict)
 
 
 class LocalModelScanRequest(BaseModel):
@@ -224,7 +241,7 @@ class ProviderAdapter(ModelAdapter):
                 yield token
             return
         if provider_type == "gguf":
-            async for token in stream_gguf(messages, model):
+            async for token in stream_gguf(provider_config, messages, model):
                 yield token
             return
         async for token in stream_openai_compatible(provider_config, messages, model):
@@ -290,6 +307,45 @@ async def stream_openai_compatible(
                     yield content
 
 
+def normalize_runtime_settings(raw_settings: dict[str, Any] | None) -> dict[str, Any]:
+    settings = dict(RUNTIME_SETTING_DEFAULTS)
+    if not isinstance(raw_settings, dict):
+        return settings
+    for key in RUNTIME_INT_SETTINGS:
+        value = raw_settings.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            settings[key] = int(value)
+        except (TypeError, ValueError):
+            continue
+    for key in RUNTIME_BOOL_SETTINGS:
+        value = raw_settings.get(key)
+        if isinstance(value, str):
+            settings[key] = value.lower() in {"1", "true", "yes", "on"}
+        elif value is not None:
+            settings[key] = bool(value)
+    return settings
+
+
+def llama_init_kwargs(runtime_settings: dict[str, Any]) -> dict[str, Any]:
+    kwargs = {key: runtime_settings[key] for key in RUNTIME_SETTINGS if key != "flash_attn"}
+    kwargs["verbose"] = False
+    return kwargs
+
+
+def ollama_options(runtime_settings: dict[str, Any]) -> dict[str, Any]:
+    options = {
+        "num_thread": runtime_settings["n_threads"],
+        "num_ctx": runtime_settings["n_ctx"],
+        "num_batch": runtime_settings["n_batch"],
+        "num_gpu": runtime_settings["n_gpu_layers"],
+        "use_mmap": runtime_settings["use_mmap"],
+        "use_mlock": runtime_settings["use_mlock"],
+    }
+    return {key: value for key, value in options.items() if value is not None}
+
+
 async def stream_ollama(
     provider_config: dict[str, Any],
     messages: list[dict[str, str]],
@@ -305,7 +361,8 @@ async def stream_ollama(
         else:
             mapped_messages.append(m)
 
-    payload = {"model": model, "messages": mapped_messages, "stream": True}
+    runtime_settings = normalize_runtime_settings(provider_config.get("runtime_settings"))
+    payload = {"model": model, "messages": mapped_messages, "stream": True, "options": ollama_options(runtime_settings)}
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", f"{base_url}/api/chat", json=payload) as response:
             response.raise_for_status()
@@ -323,7 +380,11 @@ async def stream_ollama(
                     break
 
 
-async def stream_gguf(messages: list[dict[str, str]], model_path: str) -> AsyncIterator[str]:
+async def stream_gguf(
+    provider_config: dict[str, Any],
+    messages: list[dict[str, str]],
+    model_path: str,
+) -> AsyncIterator[str]:
     path = Path(model_path).expanduser()
     if not path.exists() or path.suffix.lower() != ".gguf":
         raise RuntimeError("Selected GGUF model path does not exist.")
@@ -332,9 +393,21 @@ async def stream_gguf(messages: list[dict[str, str]], model_path: str) -> AsyncI
     except ImportError as exc:
         raise RuntimeError("Direct GGUF inference requires llama-cpp-python. Install it or run the model through Ollama or llama.cpp server.") from exc
 
-    cache_key = str(path.resolve())
+    runtime_settings = normalize_runtime_settings(provider_config.get("runtime_settings"))
+    init_kwargs = llama_init_kwargs(runtime_settings)
+    try:
+        llama_params = inspect.signature(Llama.__init__).parameters
+    except (TypeError, ValueError):
+        llama_params = {}
+    if runtime_settings.get("flash_attn") and "flash_attn" in llama_params:
+        init_kwargs["flash_attn"] = True
+
+    cache_key = json.dumps(
+        {"model_path": str(path.resolve()), "runtime_settings": init_kwargs},
+        sort_keys=True,
+    )
     if cache_key not in LLAMA_CACHE:
-        LLAMA_CACHE[cache_key] = Llama(model_path=cache_key, n_ctx=4096, verbose=False)
+        LLAMA_CACHE[cache_key] = Llama(model_path=str(path.resolve()), **init_kwargs)
     llm = LLAMA_CACHE[cache_key]
     stream = llm.create_chat_completion(messages=messages, stream=True)
     for chunk in stream:
@@ -592,6 +665,7 @@ def provider_status() -> dict[str, Any]:
             "configured": bool(os.getenv(key_name)),
             "models": provider.get("models") or MODEL_OPTIONS.get(provider_id, []),
             "models_path": provider.get("models_path", ""),
+            "runtime_settings": normalize_runtime_settings(provider.get("runtime_settings")),
         }
     return {
         "default_provider": settings.get("default_provider", "pollinations"),
@@ -641,6 +715,7 @@ def upsert_provider(update: ProviderUpdate) -> dict[str, Any]:
         "api_key_env": existing.get("api_key_env", api_key_env),
         "models": [model.strip() for model in update.models if model.strip()],
         "models_path": update.models_path.strip(),
+        "runtime_settings": normalize_runtime_settings(update.runtime_settings or existing.get("runtime_settings")),
     }
     if provider["type"] == "ollama" and not provider["base_url"]:
         provider["base_url"] = "http://127.0.0.1:11434"
@@ -1167,6 +1242,8 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
 
     settings["default_provider"] = update.default_provider
     settings["default_model"] = update.default_model
+    if update.runtime_settings:
+        settings["providers"][update.default_provider]["runtime_settings"] = normalize_runtime_settings(update.runtime_settings)
     for provider_id, api_key in update.provider_keys.items():
         if not api_key:
             continue

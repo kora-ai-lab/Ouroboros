@@ -159,7 +159,8 @@
     }
 
     input[type="password"],
-    input[type="text"] {
+    input[type="text"],
+    input[type="number"] {
       width: 100%;
       border: 1px solid var(--gray-2);
       background: var(--gray-1);
@@ -304,6 +305,27 @@
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .help-text {
+      color: var(--gray-4);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .check-field {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--gray-4);
+      font-size: 12px;
+      text-transform: uppercase;
     }
 
     @media (max-width: 760px) {
@@ -507,6 +529,13 @@
     let settingsState = null;
     let activeSessionId = null;
     let sessionRecords = [];
+
+    const LOCAL_RUNTIME_PRESETS = {
+      safe: { n_threads: 4, n_gpu_layers: 0, n_ctx: 2048, n_batch: 256, n_ubatch: 256, use_mmap: true, use_mlock: false, flash_attn: false },
+      balanced: { n_threads: Math.max((navigator.hardwareConcurrency || 6) - 1, 1), n_gpu_layers: 0, n_ctx: 4096, n_batch: 512, n_ubatch: 512, use_mmap: true, use_mlock: false, flash_attn: false },
+      turbo_cpu: { n_threads: navigator.hardwareConcurrency || 8, n_gpu_layers: 0, n_ctx: 4096, n_batch: 1024, n_ubatch: 512, use_mmap: true, use_mlock: true, flash_attn: false },
+      turbo_gpu: { n_threads: Math.max(Math.floor((navigator.hardwareConcurrency || 8) / 2), 1), n_gpu_layers: 999, n_ctx: 8192, n_batch: 1024, n_ubatch: 512, use_mmap: true, use_mlock: true, flash_attn: true }
+    };
 
     function setStatus(text) {
       statusNode.textContent = text;
@@ -728,6 +757,95 @@
       }
     }
 
+    function runtimeSettingsHtml(provider) {
+      if (!['gguf', 'ollama'].includes(provider.type)) return '';
+      const runtime = provider.runtime_settings || {};
+      const value = (key, fallback) => runtime[key] ?? fallback;
+      const checked = (key, fallback) => value(key, fallback) ? 'checked' : '';
+      return `
+        <div class="field">
+          <label>Performance preset</label>
+          <div class="actions">
+            <button type="button" data-runtime-preset="safe">Safe</button>
+            <button type="button" data-runtime-preset="balanced">Balanced</button>
+            <button type="button" data-runtime-preset="turbo_cpu">Turbo CPU</button>
+            <button type="button" data-runtime-preset="turbo_gpu">Turbo GPU</button>
+          </div>
+        </div>
+        <div class="field-grid">
+          <div class="field">
+            <label for="runtimeNThreads">n_threads</label>
+            <input id="runtimeNThreads" type="number" min="1" value="${value('n_threads', 4)}">
+          </div>
+          <div class="field">
+            <label for="runtimeNGpuLayers">n_gpu_layers</label>
+            <input id="runtimeNGpuLayers" type="number" min="0" value="${value('n_gpu_layers', 0)}">
+          </div>
+          <div class="field">
+            <label for="runtimeNCtx">n_ctx</label>
+            <input id="runtimeNCtx" type="number" min="512" step="512" value="${value('n_ctx', 4096)}">
+          </div>
+          <div class="field">
+            <label for="runtimeNBatch">n_batch</label>
+            <input id="runtimeNBatch" type="number" min="1" value="${value('n_batch', 512)}">
+          </div>
+          <div class="field">
+            <label for="runtimeNUbatch">n_ubatch</label>
+            <input id="runtimeNUbatch" type="number" min="1" value="${value('n_ubatch', 512)}">
+          </div>
+        </div>
+        <div class="actions">
+          <label class="check-field"><input id="runtimeUseMmap" type="checkbox" ${checked('use_mmap', true)}> use_mmap</label>
+          <label class="check-field"><input id="runtimeUseMlock" type="checkbox" ${checked('use_mlock', false)}> use_mlock</label>
+          <label class="check-field"><input id="runtimeFlashAttn" type="checkbox" ${checked('flash_attn', false)}> flash_attn</label>
+        </div>
+        <div class="help-text">
+          Quant guidance: smaller/faster models use Q4_K_M or Q4_0; balanced models use Q5_K_M; higher quality/slower models use Q6_K or Q8_0.
+        </div>
+      `;
+    }
+
+    function applyRuntimePreset(name) {
+      const preset = LOCAL_RUNTIME_PRESETS[name];
+      if (!preset) return;
+      const setNumber = (id, value) => {
+        const input = document.getElementById(id);
+        if (input) input.value = value;
+      };
+      setNumber('runtimeNThreads', preset.n_threads);
+      setNumber('runtimeNGpuLayers', preset.n_gpu_layers);
+      setNumber('runtimeNCtx', preset.n_ctx);
+      setNumber('runtimeNBatch', preset.n_batch);
+      setNumber('runtimeNUbatch', preset.n_ubatch);
+      const useMmap = document.getElementById('runtimeUseMmap');
+      const useMlock = document.getElementById('runtimeUseMlock');
+      const flashAttn = document.getElementById('runtimeFlashAttn');
+      if (useMmap) useMmap.checked = preset.use_mmap;
+      if (useMlock) useMlock.checked = preset.use_mlock;
+      if (flashAttn) flashAttn.checked = preset.flash_attn;
+    }
+
+    function collectRuntimeSettings() {
+      if (!settingsState) return {};
+      const provider = settingsState.providers[providerSelect.value];
+      if (!provider || !['gguf', 'ollama'].includes(provider.type)) return {};
+      const numberValue = (id, fallback) => {
+        const input = document.getElementById(id);
+        const parsed = input ? Number.parseInt(input.value, 10) : Number.NaN;
+        return Number.isFinite(parsed) ? parsed : fallback;
+      };
+      return {
+        n_threads: numberValue('runtimeNThreads', 4),
+        n_gpu_layers: numberValue('runtimeNGpuLayers', 0),
+        n_ctx: numberValue('runtimeNCtx', 4096),
+        n_batch: numberValue('runtimeNBatch', 512),
+        n_ubatch: numberValue('runtimeNUbatch', 512),
+        use_mmap: Boolean(document.getElementById('runtimeUseMmap')?.checked),
+        use_mlock: Boolean(document.getElementById('runtimeUseMlock')?.checked),
+        flash_attn: Boolean(document.getElementById('runtimeFlashAttn')?.checked)
+      };
+    }
+
     function renderProviderSettings() {
       if (!settingsState) return;
       const providerId = providerSelect.value;
@@ -753,6 +871,7 @@
           <label>Models</label>
           <div>${(provider.models || []).join(', ') || 'No models saved yet'}</div>
         </div>
+        ${runtimeSettingsHtml(provider)}
         <div class="field">
           <label for="providerKey">API key</label>
           <input id="providerKey" type="password" autocomplete="off" placeholder="${provider.configured ? 'Leave blank to keep current key' : 'Paste API key'}">
@@ -764,6 +883,9 @@
       providerSettings.appendChild(card);
       const discoverButton = document.getElementById('discoverModels');
       discoverButton.addEventListener('click', discoverModels);
+      for (const button of card.querySelectorAll('[data-runtime-preset]')) {
+        button.addEventListener('click', () => applyRuntimePreset(button.dataset.runtimePreset));
+      }
     }
 
     async function loadSettings() {
@@ -1071,7 +1193,8 @@
           default_model: settingsModelSelect.value,
           provider_keys: {
             [providerId]: keyInput ? keyInput.value.trim() : ''
-          }
+          },
+          runtime_settings: collectRuntimeSettings()
         })
       });
       if (!response.ok) {
