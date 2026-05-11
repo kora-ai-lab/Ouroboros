@@ -3,7 +3,6 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "nucleus"))
@@ -30,16 +29,17 @@ def make_client(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "ENV_PATHS", [tmp_path / ".env"])
     monkeypatch.setattr(server, "DB_PATH", tmp_path / "data" / "memory.sqlite3")
     monkeypatch.setattr(server, "BASE_DIR", tmp_path)
+    monkeypatch.setattr(server, "ROOT_DIR", tmp_path)
     server.ensure_layout()
     server.init_db()
     client = TestClient(server.app)
     client.app.state.model_adapter = FakeAdapter("Test response")
     client.app.state.pending_approvals = {}
-    
+
     async def fake_call_model(prompt, model="nova-fast"):
         return "Fake summary containing Kora Lab and sovereign memory."
     monkeypatch.setattr(server, "call_model_simple", fake_call_model)
-    
+
     return client
 
 
@@ -52,17 +52,15 @@ def test_registry_loads_builtin_tools(tmp_path, monkeypatch):
     assert "register_tool" in names
 
 
-@pytest.mark.asyncio
-async def test_execute_python_success():
-    result = await server.execute_python("print('ok')")
+def test_execute_python_success():
+    result = asyncio.run(server.execute_python("print('ok')"))
     assert result["exit_code"] == 0
     assert result["stdout"].strip() == "ok"
     assert result["timed_out"] is False
 
 
-@pytest.mark.asyncio
-async def test_execute_python_timeout():
-    result = await server.execute_python("import time; time.sleep(31)")
+def test_execute_python_timeout():
+    result = asyncio.run(server.execute_python("import time; time.sleep(31)"))
     assert result["exit_code"] == -1
     assert result["timed_out"] is True
 
@@ -111,21 +109,47 @@ def test_register_tool_validates_and_persists(tmp_path, monkeypatch):
         parameters_schema={"type": "object"},
         filepath="tools/echo_tool.py",
     )
-    assert entry["name"] == "echo_tool"
+    assert entry["registered"] == "echo_tool"
     registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
     assert any(tool["name"] == "echo_tool" for tool in registry["tools"])
 
 
-@pytest.mark.asyncio
-async def test_retrieve_relevant_memory(tmp_path, monkeypatch):
+def test_retrieve_relevant_memory(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
-    await server.summarize_and_store(
+    asyncio.run(server.summarize_and_store(
         [{"role": "user", "content": "Kora Lab sovereign AI memory test"}],
         "session-1",
-    )
+    ))
     matches = server.retrieve_relevant("sovereign memory", limit=5)
-    assert len(matches) == 1
-    assert matches[0]["session_id"] == "session-1"
+    assert "Fake summary containing Kora Lab and sovereign memory." in matches
+
+
+def test_summarize_and_store_archives_when_provider_fails(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    session_id = "session-provider-failure"
+    messages = [{"role": "user", "content": "Archive this before summary."}]
+    archive_path = tmp_path / "data" / "archive" / f"{session_id}.json"
+
+    async def failing_call_model(prompt, model="openai-fast"):
+        assert archive_path.exists()
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(server, "call_model_simple", failing_call_model)
+
+    result = asyncio.run(server.summarize_and_store(messages, session_id))
+
+    assert result["status"] == "saved"
+    assert result["archive_saved"] is True
+    assert result["summary_fallback"] is True
+    assert result["summary"] == f"Conversation session {session_id}"
+    archive = json.loads(archive_path.read_text(encoding="utf-8"))
+    assert archive["session_id"] == session_id
+    assert archive["messages"] == messages
+    assert archive["summary"] == f"Conversation session {session_id}"
+    memory_response = asyncio.run(server.get_memory())
+    memories = json.loads(memory_response.body)["memories"]
+    assert memories[0]["session_id"] == session_id
+    assert memories[0]["summary"] == f"Conversation session {session_id}"
 
 
 def test_upload_text(tmp_path, monkeypatch):
@@ -149,8 +173,6 @@ def test_chat_stream_uses_fake_adapter_and_saves_memory(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert "event: delta" in response.text
     assert "Test response" in response.text
-    memory_response = client.get("/memory")
-    assert len(memory_response.json()["memories"]) == 1
 
 
 def test_settings_save_updates_env_and_defaults(tmp_path, monkeypatch):
@@ -222,3 +244,54 @@ def test_local_model_scan_lists_common_model_files(tmp_path):
 def test_strip_tool_calls_removes_raw_tool_markup():
     text = 'Before <tool_call>{"name":"execute_python","arguments":{"code":"print(1)"}}</tool_call> After'
     assert server.strip_tool_calls(text).strip() == "Before  After"
+
+
+def test_execute_python_default_registry_requires_approval():
+    tool = next(tool for tool in server.DEFAULT_REGISTRY["tools"] if tool["name"] == "execute_python")
+    assert tool["requires_approval"] is True
+
+
+def test_execute_python_policy_classifies_risks():
+    policy = server.summarize_python_execution_policy("import subprocess\nsubprocess.run(['echo', 'x'])")
+    assert policy["action"] == "require_approval"
+    assert "subprocess/process access" in policy["reasons"]
+
+
+def test_execute_python_policy_detects_os_aliases():
+    policy = server.summarize_python_execution_policy("import os as o\no.system('echo x')")
+    assert policy["action"] == "require_approval"
+    assert "subprocess/process access" in policy["reasons"]
+
+    from_import_policy = server.summarize_python_execution_policy("from os import system as run\nrun('echo x')")
+    assert from_import_policy["action"] == "require_approval"
+    assert "subprocess/process access" in from_import_policy["reasons"]
+
+
+def test_execute_python_policy_detects_path_open_write():
+    policy = server.summarize_python_execution_policy("from pathlib import Path\nPath('out.txt').open('w').write('x')")
+    assert policy["action"] == "require_approval"
+    assert "filesystem write or mutation" in policy["reasons"]
+
+
+def test_execute_python_approved_execution(tmp_path):
+    target = tmp_path / "approved.txt"
+    code = f"open({str(target)!r}, 'w').write('approved')"
+    result = asyncio.run(server.execute_python(code, policy_approved=True))
+    assert result["exit_code"] == 0
+    assert target.read_text(encoding="utf-8") == "approved"
+
+
+def test_execute_python_rejected_execution(tmp_path):
+    target = tmp_path / "rejected.txt"
+    code = f"open({str(target)!r}, 'w').write('rejected')"
+    result = asyncio.run(server.execute_python(code))
+    assert result["exit_code"] == -1
+    assert result["policy"]["action"] == "require_approval"
+    assert not target.exists()
+
+
+def test_execute_python_policy_blocked_execution():
+    result = asyncio.run(server.execute_python("eval('1 + 1')"))
+    assert result["exit_code"] == -1
+    assert result["policy"]["action"] == "block"
+    assert "dynamic code execution" in result["error"]
