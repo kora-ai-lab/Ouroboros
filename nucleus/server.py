@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import base64
 import json
@@ -86,7 +87,7 @@ DEFAULT_REGISTRY = {
                 "required": ["code"],
             },
             "builtin": True,
-            "requires_approval": False,
+            "requires_approval": True,
         },
         {
             "name": "register_tool",
@@ -127,7 +128,7 @@ BEHAVIORAL RULES — these are absolute:
 
 1. DO NOT call tools for conversational exchanges. Greetings, questions, discussions, strategy sessions do not require tool calls. A user saying "hi" gets "Hello." Nothing else.
 
-2. You are a Real OS AI. Your scope is the entire host operating system, not just the project directory. Use absolute paths to read, write, or execute anywhere on the machine. You manage files, processes, and configurations globally as Kheir's digital executor. The UI features a Memory sidebar on the RIGHT.
+2. You are a Real OS AI with host access mediated by the tool policy. Prefer project-relative paths under approved roots. Writes, subprocess calls, network access, home-directory access, and absolute paths outside approved roots require user approval. The UI features a Memory sidebar on the RIGHT.
 
 3. When you need a capability you do not have, follow these atomic steps:
    a. Write the Python logic (for PDFs, use the `pymupdf` library which is pre-installed).
@@ -137,7 +138,7 @@ BEHAVIORAL RULES — these are absolute:
 
 4. You are direct and strategic. No corporate fluff. No emotional validation. You report facts and actions.
 
-5. You can modify your own nucleus code by reading and writing files in the nucleus directory, but you are not confined to it.
+5. You can modify your own nucleus code by reading and writing files in the nucleus directory when approved by policy.
 
 6. You do not ask for confirmation more than once per action. If the user has asked for something, do it.
 
@@ -199,10 +200,18 @@ class LocalModelScanRequest(BaseModel):
 
 
 class PendingApproval:
-    def __init__(self, tool_name: str, arguments: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        risk_summary: str = "Approval required before tool execution.",
+        policy_reasons: list[str] | None = None,
+    ) -> None:
         self.id = str(uuid.uuid4())
         self.tool_name = tool_name
         self.arguments = arguments
+        self.risk_summary = risk_summary
+        self.policy_reasons = policy_reasons or []
         self.event = asyncio.Event()
         self.approved: bool | None = None
 
@@ -786,7 +795,112 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
-async def execute_python(code: str) -> dict[str, Any]:
+WRITE_CALLS = {"write_text", "write_bytes", "unlink", "mkdir", "makedirs", "rmdir", "remove", "rename", "replace", "touch"}
+SUBPROCESS_IMPORTS = {"subprocess", "pty", "shutil"}
+NETWORK_IMPORTS = {"socket", "http.client", "httpx", "requests", "urllib", "urllib.request", "ftplib", "smtplib"}
+BLOCKED_IMPORTS = {"ctypes"}
+DYNAMIC_EXECUTION_CALLS = {"eval", "exec", "compile", "__import__"}
+
+
+def approved_execution_roots() -> list[Path]:
+    roots = [ROOT_DIR, BASE_DIR, TOOLS_DIR, DATA_DIR, ARCHIVE_DIR, KORA_DIR]
+    return [root.resolve() for root in roots]
+
+
+def path_in_approved_roots(path: Path) -> bool:
+    resolved = path.resolve()
+    for root in approved_execution_roots():
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
+def summarize_python_execution_policy(code: str) -> dict[str, Any]:
+    reasons: list[str] = []
+    blocked: list[str] = []
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return {
+            "action": "block",
+            "risk_summary": f"Policy blocked execution: Python syntax error at line {exc.lineno}.",
+            "reasons": ["syntax error"],
+        }
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            module_names = []
+            if isinstance(node, ast.Import):
+                module_names = [alias.name for alias in node.names]
+            elif node.module:
+                module_names = [node.module]
+            for module_name in module_names:
+                top_level = module_name.split(".")[0]
+                if module_name in SUBPROCESS_IMPORTS or top_level in SUBPROCESS_IMPORTS:
+                    reasons.append("subprocess/process access")
+                if module_name in NETWORK_IMPORTS or top_level in NETWORK_IMPORTS:
+                    reasons.append("network access")
+                if module_name in BLOCKED_IMPORTS or top_level in BLOCKED_IMPORTS:
+                    blocked.append(f"blocked import: {module_name}")
+
+        if isinstance(node, ast.Call):
+            func_name = ""
+            if isinstance(node.func, ast.Name):
+                func_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                func_name = node.func.attr
+                if isinstance(node.func.value, ast.Name):
+                    owner = node.func.value.id
+                    if owner == "os" and func_name in {"system", "popen", "spawnl", "spawnlp", "spawnv", "spawnvp", "execv", "execvp"}:
+                        reasons.append("subprocess/process access")
+            if func_name in DYNAMIC_EXECUTION_CALLS:
+                blocked.append(f"dynamic code execution via {func_name}()")
+            if func_name in WRITE_CALLS:
+                reasons.append("filesystem write or mutation")
+            if func_name == "open":
+                mode = "r"
+                if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str):
+                    mode = node.args[1].value
+                for keyword in node.keywords:
+                    if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                        mode = keyword.value.value
+                if any(flag in mode for flag in ("w", "a", "x", "+")):
+                    reasons.append("filesystem write or mutation")
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            text = node.value
+            if text.startswith("~"):
+                reasons.append("home-directory access")
+            path = Path(text)
+            if path.is_absolute() and not path_in_approved_roots(path):
+                reasons.append(f"absolute path outside approved roots: {text}")
+
+        if isinstance(node, ast.Attribute) and node.attr in {"home", "expanduser"}:
+            reasons.append("home-directory access")
+
+    if blocked:
+        unique_blocked = sorted(set(blocked))
+        return {
+            "action": "block",
+            "risk_summary": "Policy blocked execution: " + "; ".join(unique_blocked) + ".",
+            "reasons": unique_blocked,
+        }
+    unique_reasons = sorted(set(reasons))
+    if unique_reasons:
+        return {
+            "action": "require_approval",
+            "risk_summary": "Requires approval: " + "; ".join(unique_reasons) + ".",
+            "reasons": unique_reasons,
+        }
+    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
+
+
+async def execute_python(code: str, policy_approved: bool = False) -> dict[str, Any]:
+    policy = summarize_python_execution_policy(code)
+    if policy["action"] == "block":
+        return {"error": policy["risk_summary"], "policy": policy, "exit_code": -1, "timed_out": False}
+    if policy["action"] == "require_approval" and not policy_approved:
+        return {"error": "Python execution requires approval by policy.", "policy": policy, "exit_code": -1, "timed_out": False}
     start = time.time()
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-c", code,
@@ -1200,18 +1314,44 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if not isinstance(arguments, dict):
                         arguments = {}
                     tool = find_tool(tool_name)
-                    if tool is not None and tool.get("requires_approval"):
-                        pending = PendingApproval(tool_name, arguments)
+                    policy: dict[str, Any] | None = None
+                    if tool_name == "execute_python":
+                        policy = summarize_python_execution_policy(str(arguments.get("code", "")))
+                        if policy["action"] == "block":
+                            result = {"error": policy["risk_summary"], "policy": policy}
+                            store_tool_execution(tool_name, arguments, result, False)
+                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            conversation.append({"role": "tool", "content": json.dumps(result)})
+                            continue
+                    requires_approval = bool(tool is not None and tool.get("requires_approval"))
+                    if policy is not None and policy["action"] == "require_approval":
+                        requires_approval = True
+                    if requires_approval:
+                        risk_summary = "Approval required before tool execution."
+                        policy_reasons: list[str] = []
+                        if policy is not None:
+                            risk_summary = policy.get("risk_summary", risk_summary)
+                            policy_reasons = policy.get("reasons", [])
+                        elif tool is not None and tool.get("requires_approval"):
+                            risk_summary = "Approval required by tool registry."
+                        pending = PendingApproval(tool_name, arguments, risk_summary, policy_reasons)
                         app.state.pending_approvals[pending.id] = pending
                         yield sse(
                             "approval_request",
-                            {"request_id": pending.id, "tool_name": tool_name, "arguments": arguments},
+                            {
+                                "request_id": pending.id,
+                                "tool_name": tool_name,
+                                "arguments": arguments,
+                                "risk_summary": pending.risk_summary,
+                                "policy_reasons": pending.policy_reasons,
+                                "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
+                            },
                         )
                         await pending.event.wait()
                         approved = bool(pending.approved)
                         app.state.pending_approvals.pop(pending.id, None)
                         if not approved:
-                            result = {"error": "Tool execution rejected by user."}
+                            result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
                             store_tool_execution(tool_name, arguments, result, False)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
                             
@@ -1222,7 +1362,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             continue
                     yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     if tool_name == "execute_python":
-                        result = await execute_python(str(arguments.get("code", "")))
+                        result = await execute_python(str(arguments.get("code", "")), policy_approved=requires_approval)
                     elif tool_name == "register_tool":
                         result = register_tool(
                             name=str(arguments.get("name", "")),
