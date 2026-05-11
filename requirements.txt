@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+httpx
+python-multipart
+pymupdf
+pytest
+# Optional for direct local GGUF inference:
+# llama-cpp-python

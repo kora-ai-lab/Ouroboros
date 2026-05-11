@@ -1,0 +1,73 @@
+{
+  "default_provider": "pollinations",
+  "default_model": "acestep",
+  "providers": {
+    "pollinations": {
+      "label": "Pollinations",
+      "type": "openai_compatible",
+      "base_url": "https://gen.pollinations.ai/v1",
+      "api_key_env": "POLLINATIONS_API_KEY",
+      "models": [
+        "acestep",
+        "claude-fast",
+        "flux",
+        "gemini-fast",
+        "gemini-search",
+        "glm",
+        "gptimage",
+        "gptimage-large",
+        "grok",
+        "kimi",
+        "kimi-k2.6",
+        "klein",
+        "kontext",
+        "llama",
+        "llama-scout",
+        "ltx-2",
+        "midijourney",
+        "minimax",
+        "mistral",
+        "mistral-large",
+        "nova",
+        "nova-fast",
+        "nova-reel",
+        "openai",
+        "openai-3-large",
+        "openai-3-small",
+        "openai-audio",
+        "openai-audio-large",
+        "openai-fast",
+        "openai-large",
+        "perplexity-fast",
+        "perplexity-reasoning",
+        "polly",
+        "qwen-coder",
+        "qwen-coder-large",
+        "qwen-image",
+        "qwen-large",
+        "qwen-safety",
+        "qwen-tts",
+        "qwen-vision",
+        "scribe",
+        "universal-2",
+        "wan-image",
+        "whisper",
+        "zimage"
+      ]
+    },
+    "local_gguf": {
+      "label": "Local GGUF",
+      "type": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "api_key_env": "LOCAL_GGUF_API_KEY",
+      "models": [
+        "gemma4-claude:latest",
+        "gemma4:e2b",
+        "phi3:mini",
+        "qwen2.5:0.5b",
+        "qwen2.5:1.5b"
+      ],
+      "models_path": "C:\\Users\\junio\\.cache\\huggingface\\hub\\models--Qwen--Qwen2.5-Coder-0.5B-Instruct\\snapshots\\ea3f2471cf1b1f0db85067f1ef93848e38e88c25"
+    }
+  }
+}

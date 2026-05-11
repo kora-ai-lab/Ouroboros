@@ -1,0 +1,849 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ouroboros</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --black: #0A0A0A;
+      --white: #FFFFFF;
+      --gray-1: #1A1A1A;
+      --gray-2: #2A2A2A;
+      --gray-3: #6B6B6B;
+      --gray-4: #ABABAB;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--black);
+      color: var(--white);
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      letter-spacing: 0;
+    }
+
+    button,
+    input,
+    textarea,
+    select {
+      font: inherit;
+    }
+
+    button,
+    input,
+    select,
+    textarea {
+      border-radius: 0;
+    }
+
+    .app {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      min-height: 100vh;
+      background: var(--black);
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--gray-2);
+      background: var(--gray-1);
+      padding: 16px;
+      overflow-y: auto;
+    }
+
+    .sidebar.closed {
+      display: none;
+    }
+
+    .main {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-width: 0;
+      height: 100vh;
+    }
+
+    .topbar,
+    .context-strip,
+    .composer {
+      border-bottom: 1px solid var(--gray-2);
+      padding: 12px 16px;
+      background: var(--black);
+    }
+
+    .composer {
+      border-top: 1px solid var(--gray-2);
+      border-bottom: 0;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .brand {
+      font-size: 14px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .output {
+      overflow-y: auto;
+      padding: 24px;
+    }
+
+    .message {
+      max-width: 920px;
+      margin: 0 0 18px;
+      border: 1px solid var(--gray-2);
+      padding: 14px;
+      white-space: pre-wrap;
+      line-height: 1.5;
+      background: var(--black);
+    }
+
+    .role {
+      color: var(--gray-4);
+      font-size: 12px;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+    }
+
+    .context-strip {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      overflow-x: auto;
+      min-height: 48px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid var(--gray-2);
+      padding: 6px 8px;
+      color: var(--white);
+      background: var(--gray-1);
+      white-space: nowrap;
+      font-size: 12px;
+    }
+
+    .input-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 72px;
+      max-height: 220px;
+      resize: vertical;
+      border: 1px solid var(--gray-2);
+      background: var(--gray-1);
+      color: var(--white);
+      padding: 12px;
+      outline: none;
+    }
+
+    input[type="password"],
+    input[type="text"] {
+      width: 100%;
+      border: 1px solid var(--gray-2);
+      background: var(--gray-1);
+      color: var(--white);
+      padding: 10px 12px;
+      outline: none;
+    }
+
+    textarea:focus,
+    input:focus,
+    button:focus,
+    select:focus {
+      outline: 1px solid var(--white);
+      outline-offset: 2px;
+    }
+
+    button,
+    select,
+    .file-label {
+      border: 1px solid var(--gray-2);
+      background: var(--gray-1);
+      color: var(--white);
+      padding: 10px 12px;
+      cursor: pointer;
+      min-height: 40px;
+    }
+
+    button:hover,
+    .file-label:hover,
+    select:hover {
+      background: var(--gray-2);
+    }
+
+    button:disabled {
+      color: var(--gray-3);
+      cursor: not-allowed;
+    }
+
+    input[type="file"] {
+      display: none;
+    }
+
+    .memory-item {
+      border: 1px solid var(--gray-2);
+      padding: 10px;
+      margin-bottom: 10px;
+      background: var(--black);
+      color: var(--gray-4);
+      cursor: pointer;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .memory-item strong {
+      display: block;
+      color: var(--white);
+      margin-bottom: 6px;
+      font-size: 12px;
+    }
+
+    .status {
+      color: var(--gray-4);
+      font-size: 12px;
+      padding: 8px 0 0;
+      min-height: 24px;
+    }
+
+    .settings-panel {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: stretch;
+      justify-content: flex-end;
+      background: rgba(10, 10, 10, 0.78);
+      z-index: 10;
+    }
+
+    .settings-panel.open {
+      display: flex;
+    }
+
+    .settings-content {
+      width: min(520px, 100vw);
+      height: 100vh;
+      background: var(--black);
+      border-left: 1px solid var(--gray-2);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    .settings-body {
+      overflow-y: auto;
+      padding: 16px;
+      display: grid;
+      gap: 16px;
+      align-content: start;
+    }
+
+    .field {
+      display: grid;
+      gap: 8px;
+    }
+
+    .field label {
+      color: var(--gray-4);
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .provider-card {
+      border: 1px solid var(--gray-2);
+      padding: 12px;
+      display: grid;
+      gap: 12px;
+      background: var(--gray-1);
+    }
+
+    .actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    @media (max-width: 760px) {
+      .app {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        max-height: 35vh;
+        border-right: 0;
+        border-bottom: 1px solid var(--gray-2);
+      }
+
+      .controls {
+        flex-wrap: wrap;
+        justify-content: flex-end;
+      }
+
+      .input-row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <aside id="memorySidebar" class="sidebar">
+      <div class="topbar" style="padding:0 0 12px;border-bottom:0;">
+        <div class="brand">Memory</div>
+        <button id="refreshMemory" type="button">Refresh</button>
+      </div>
+      <div id="memoryList"></div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="brand">Ouroboros</div>
+        <div class="controls">
+          <button id="toggleMemory" type="button">Memory</button>
+          <button id="openSettings" type="button">Settings</button>
+          <select id="model">
+            <option value="openai-fast">openai-fast</option>
+            <option value="qwen-coder">qwen-coder</option>
+            <option value="deepseek">deepseek</option>
+            <option value="nova-fast">nova-fast</option>
+          </select>
+        </div>
+      </header>
+
+      <section id="output" class="output" aria-live="polite">
+        <div class="message">
+          <div class="role">System</div>
+          Ouroboros nucleus is ready.
+        </div>
+      </section>
+
+      <section>
+        <div id="contextStrip" class="context-strip">
+          <label class="file-label" for="fileInput">Add file</label>
+          <input id="fileInput" type="file">
+        </div>
+        <form id="composer" class="composer">
+          <div class="input-row">
+            <textarea id="prompt" placeholder="Message Ouroboros"></textarea>
+            <button id="send" type="submit">SEND</button>
+          </div>
+          <div id="status" class="status"></div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <section id="settingsPanel" class="settings-panel" aria-hidden="true">
+    <form id="settingsForm" class="settings-content">
+      <header class="topbar">
+        <div class="brand">Settings</div>
+        <button id="closeSettings" type="button">Close</button>
+      </header>
+      <div class="settings-body">
+        <div class="field">
+          <label for="provider">Provider</label>
+          <select id="provider"></select>
+        </div>
+        <div class="field">
+          <label for="settingsModel">Default model</label>
+          <select id="settingsModel"></select>
+        </div>
+        <div id="providerSettings"></div>
+        <div class="provider-card">
+          <div class="brand">Local models</div>
+          <div class="field">
+            <label for="localModelRoot">Optional folder</label>
+            <input id="localModelRoot" type="text" placeholder="C:\models">
+          </div>
+          <div class="actions">
+            <button id="scanLocalModels" type="button">Scan computer</button>
+          </div>
+          <div id="localModelRoots" class="status"></div>
+          <div id="localModelList"></div>
+        </div>
+        <div class="provider-card">
+          <div class="brand">Add provider</div>
+          <div class="field">
+            <label for="newProviderId">Provider id</label>
+            <input id="newProviderId" type="text" placeholder="ollama">
+          </div>
+          <div class="field">
+            <label for="newProviderLabel">Label</label>
+            <input id="newProviderLabel" type="text" placeholder="Ollama">
+          </div>
+          <div class="field">
+            <label for="newProviderType">Type</label>
+            <select id="newProviderType">
+              <option value="openai_compatible">OpenAI compatible</option>
+              <option value="ollama">Ollama</option>
+              <option value="gguf">Local GGUF folder</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="newProviderBaseUrl">Base URL</label>
+            <input id="newProviderBaseUrl" type="text" placeholder="http://127.0.0.1:11434">
+          </div>
+          <div class="field">
+            <label for="newProviderModels">Models</label>
+            <input id="newProviderModels" type="text" placeholder="model-a, model-b">
+          </div>
+          <div class="field">
+            <label for="newProviderModelsPath">GGUF folder</label>
+            <input id="newProviderModelsPath" type="text" placeholder="C:\models">
+          </div>
+          <div class="field">
+            <label for="newProviderKey">API key</label>
+            <input id="newProviderKey" type="password" autocomplete="off" placeholder="Optional">
+          </div>
+          <div class="actions">
+            <button id="saveProvider" type="button">Save provider</button>
+          </div>
+        </div>
+        <div class="status" id="settingsStatus"></div>
+      </div>
+      <footer class="composer">
+        <button type="submit">Save settings</button>
+      </footer>
+    </form>
+  </section>
+
+  <script>
+    const output = document.getElementById('output');
+    const composer = document.getElementById('composer');
+    const promptInput = document.getElementById('prompt');
+    const sendButton = document.getElementById('send');
+    const modelSelect = document.getElementById('model');
+    const statusNode = document.getElementById('status');
+    const fileInput = document.getElementById('fileInput');
+    const contextStrip = document.getElementById('contextStrip');
+    const memoryList = document.getElementById('memoryList');
+    const memorySidebar = document.getElementById('memorySidebar');
+    const toggleMemory = document.getElementById('toggleMemory');
+    const refreshMemory = document.getElementById('refreshMemory');
+    const openSettings = document.getElementById('openSettings');
+    const closeSettings = document.getElementById('closeSettings');
+    const settingsPanel = document.getElementById('settingsPanel');
+    const settingsForm = document.getElementById('settingsForm');
+    const providerSelect = document.getElementById('provider');
+    const settingsModelSelect = document.getElementById('settingsModel');
+    const providerSettings = document.getElementById('providerSettings');
+    const settingsStatus = document.getElementById('settingsStatus');
+    const saveProviderButton = document.getElementById('saveProvider');
+    const scanLocalModelsButton = document.getElementById('scanLocalModels');
+    const localModelRoots = document.getElementById('localModelRoots');
+    const localModelList = document.getElementById('localModelList');
+    const localModelRoot = document.getElementById('localModelRoot');
+    const newProviderId = document.getElementById('newProviderId');
+    const newProviderLabel = document.getElementById('newProviderLabel');
+    const newProviderType = document.getElementById('newProviderType');
+    const newProviderBaseUrl = document.getElementById('newProviderBaseUrl');
+    const newProviderModels = document.getElementById('newProviderModels');
+    const newProviderModelsPath = document.getElementById('newProviderModelsPath');
+    const newProviderKey = document.getElementById('newProviderKey');
+
+    const messages = [];
+    const contextFiles = [];
+    let settingsState = null;
+
+    function setStatus(text) {
+      statusNode.textContent = text;
+    }
+
+    function addMessage(role, html) {
+      const node = document.createElement('div');
+      node.className = 'message';
+      node.innerHTML = `<div class="role">${role}</div><div class="content">${html}</div>`;
+      output.appendChild(node);
+      output.scrollTop = output.scrollHeight;
+      return node.querySelector('.content');
+    }
+
+    function addTextMessage(role, text) {
+      const node = document.createElement('div');
+      node.className = 'message';
+      const roleNode = document.createElement('div');
+      roleNode.className = 'role';
+      roleNode.textContent = role;
+      const contentNode = document.createElement('div');
+      contentNode.className = 'content';
+      contentNode.textContent = text;
+      node.appendChild(roleNode);
+      node.appendChild(contentNode);
+      output.appendChild(node);
+      output.scrollTop = output.scrollHeight;
+      return contentNode;
+    }
+
+    function renderJsonBlock(role, data) {
+      const pre = document.createElement('pre');
+      pre.textContent = JSON.stringify(data, null, 2);
+      const node = document.createElement('div');
+      node.appendChild(pre);
+      addMessage(role, node.innerHTML);
+    }
+
+    function addChip(item) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'chip';
+      chip.textContent = item.name;
+      chip.addEventListener('click', () => {
+        const index = contextFiles.indexOf(item);
+        if (index >= 0) {
+          contextFiles.splice(index, 1);
+          chip.remove();
+        }
+      });
+      contextStrip.appendChild(chip);
+    }
+
+    async function refreshMemories() {
+      const response = await fetch('/memory');
+      const data = await response.json();
+      memoryList.innerHTML = '';
+      for (const memory of data.memories || []) {
+        const item = document.createElement('div');
+        item.className = 'memory-item';
+        const created = document.createElement('strong');
+        created.textContent = memory.created_at;
+        const summary = document.createElement('span');
+        summary.textContent = memory.summary;
+        item.appendChild(created);
+        item.appendChild(summary);
+        item.addEventListener('click', () => {
+          const contextItem = { type: 'memory', name: `memory-${memory.id}`, content: memory.summary };
+          contextFiles.push(contextItem);
+          addChip(contextItem);
+        });
+        memoryList.appendChild(item);
+      }
+      if (!memoryList.children.length) {
+        memoryList.innerHTML = '<div class="memory-item">No episodic memories yet.</div>';
+      }
+    }
+
+    function setSettingsStatus(text) {
+      settingsStatus.textContent = text;
+    }
+
+    function rebuildModelOptions(select, models, selected) {
+      select.innerHTML = '';
+      for (const model of models) {
+        const option = document.createElement('option');
+        option.value = model;
+        option.textContent = model;
+        if (model === selected) option.selected = true;
+        select.appendChild(option);
+      }
+    }
+
+    function renderProviderSettings() {
+      if (!settingsState) return;
+      const providerId = providerSelect.value;
+      const provider = settingsState.providers[providerId];
+      rebuildModelOptions(settingsModelSelect, provider.models || [], settingsState.default_model);
+      providerSettings.innerHTML = '';
+      const card = document.createElement('div');
+      card.className = 'provider-card';
+      card.innerHTML = `
+        <div class="field">
+          <label>Provider status</label>
+          <div>${provider.configured ? 'Configured' : 'Not configured'}</div>
+        </div>
+        <div class="field">
+          <label>Provider type</label>
+          <div>${provider.type}</div>
+        </div>
+        <div class="field">
+          <label>Base URL</label>
+          <input type="text" value="${provider.base_url}" readonly>
+        </div>
+        <div class="field">
+          <label>Models</label>
+          <div>${(provider.models || []).join(', ') || 'No models saved yet'}</div>
+        </div>
+        <div class="field">
+          <label for="providerKey">API key</label>
+          <input id="providerKey" type="password" autocomplete="off" placeholder="${provider.configured ? 'Leave blank to keep current key' : 'Paste API key'}">
+        </div>
+        <div class="actions">
+          <button id="discoverModels" type="button">Discover models</button>
+        </div>
+      `;
+      providerSettings.appendChild(card);
+      const discoverButton = document.getElementById('discoverModels');
+      discoverButton.addEventListener('click', discoverModels);
+    }
+
+    async function loadSettings() {
+      const response = await fetch('/settings');
+      settingsState = await response.json();
+      providerSelect.innerHTML = '';
+      for (const [id, provider] of Object.entries(settingsState.providers)) {
+        const option = document.createElement('option');
+        option.value = id;
+        option.textContent = provider.label;
+        if (id === settingsState.default_provider) option.selected = true;
+        providerSelect.appendChild(option);
+      }
+      renderProviderSettings();
+      rebuildModelOptions(modelSelect, settingsState.providers[settingsState.default_provider].models, settingsState.default_model);
+    }
+
+    async function discoverModels() {
+      const providerId = providerSelect.value;
+      setSettingsStatus('Discovering models.');
+      const response = await fetch(`/providers/${providerId}/discover`, { method: 'POST' });
+      if (!response.ok) {
+        setSettingsStatus(await response.text());
+        return;
+      }
+      const data = await response.json();
+      settingsState = data.settings;
+      renderProviderSettings();
+      rebuildModelOptions(modelSelect, settingsState.providers[settingsState.default_provider].models, settingsState.default_model);
+      setSettingsStatus(data.models.length ? 'Models discovered.' : 'No models found.');
+    }
+
+    function renderLocalModels(data) {
+      localModelRoots.textContent = `Scanned: ${(data.roots || []).join(', ') || 'No existing default roots found'}`;
+      localModelList.innerHTML = '';
+      for (const model of data.models || []) {
+        const item = document.createElement('button');
+        item.type = 'button';
+        item.className = 'memory-item';
+        item.innerHTML = `<strong>${model.name}</strong>${model.type} · ${model.size_mb} MB<br>${model.path}`;
+        item.addEventListener('click', () => {
+          newProviderId.value = 'local_gguf';
+          newProviderLabel.value = 'Local GGUF';
+          newProviderType.value = 'gguf';
+          newProviderModels.value = model.path;
+          newProviderModelsPath.value = model.path.split(/[\\\\/]/).slice(0, -1).join('\\');
+          setSettingsStatus('Local model selected. Save provider to use it.');
+        });
+        localModelList.appendChild(item);
+      }
+      if (!localModelList.children.length) {
+        localModelList.innerHTML = '<div class="memory-item">No model files found in common locations.</div>';
+      }
+    }
+
+    async function scanLocalModels() {
+      setSettingsStatus('Scanning model folders.');
+      const root = localModelRoot.value.trim();
+      const response = root
+        ? await fetch('/models/local/scan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ roots: [root], max_results: 200 })
+          })
+        : await fetch('/models/local');
+      if (!response.ok) {
+        setSettingsStatus(await response.text());
+        return;
+      }
+      renderLocalModels(await response.json());
+      setSettingsStatus('Local scan complete.');
+    }
+
+    function handleSseLine(eventName, data, assistantNode) {
+      if (eventName === 'delta') {
+        assistantNode.appendChild(document.createTextNode(data.content));
+      } else if (eventName === 'assistant_replace') {
+        assistantNode.textContent = data.content;
+      } else if (eventName === 'tool_call') {
+        renderJsonBlock('Tool call', data);
+      } else if (eventName === 'tool_result') {
+        renderJsonBlock('Tool result', data);
+      } else if (eventName === 'approval_request') {
+        renderJsonBlock('Approval', data);
+      } else if (eventName === 'memory_saved') {
+        setStatus('Memory saved.');
+        refreshMemories();
+      } else if (eventName === 'error') {
+        setStatus(data.message);
+      } else if (eventName === 'done') {
+        setStatus('Done.');
+      }
+    }
+
+    async function sendMessage(text) {
+      messages.push({ role: 'user', content: text });
+      addTextMessage('User', text);
+      const assistantNode = addTextMessage('Ouroboros', '');
+      sendButton.disabled = true;
+      setStatus('Thinking.');
+
+      const response = await fetch('/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages,
+          model: modelSelect.value,
+          provider: providerSelect.value || 'pollinations',
+          context_files: contextFiles
+        })
+      });
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let eventName = 'message';
+      let assistantText = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() || '';
+        for (const part of parts) {
+          const lines = part.split('\n');
+          let dataLine = '';
+          for (const line of lines) {
+            if (line.startsWith('event: ')) eventName = line.slice(7);
+            if (line.startsWith('data: ')) dataLine = line.slice(6);
+          }
+          if (!dataLine) continue;
+          const data = JSON.parse(dataLine);
+          if (eventName === 'delta') assistantText += data.content;
+          handleSseLine(eventName, data, assistantNode);
+        }
+      }
+
+      messages.push({ role: 'assistant', content: assistantText });
+      sendButton.disabled = false;
+      promptInput.focus();
+    }
+
+    composer.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const text = promptInput.value.trim();
+      if (!text || sendButton.disabled) return;
+      promptInput.value = '';
+      try {
+        await sendMessage(text);
+      } catch (error) {
+        setStatus(error.message || String(error));
+        sendButton.disabled = false;
+      }
+    });
+
+    promptInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        composer.requestSubmit();
+      }
+    });
+
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+      const form = new FormData();
+      form.append('file', file);
+      setStatus('Uploading file.');
+      const response = await fetch('/upload', { method: 'POST', body: form });
+      if (!response.ok) {
+        setStatus(await response.text());
+        return;
+      }
+      const item = await response.json();
+      contextFiles.push(item);
+      addChip(item);
+      setStatus('Context file added.');
+      fileInput.value = '';
+    });
+
+    toggleMemory.addEventListener('click', () => {
+      memorySidebar.classList.toggle('closed');
+    });
+    openSettings.addEventListener('click', async () => {
+      await loadSettings();
+      settingsPanel.classList.add('open');
+      settingsPanel.setAttribute('aria-hidden', 'false');
+    });
+    closeSettings.addEventListener('click', () => {
+      settingsPanel.classList.remove('open');
+      settingsPanel.setAttribute('aria-hidden', 'true');
+    });
+    providerSelect.addEventListener('change', renderProviderSettings);
+    scanLocalModelsButton.addEventListener('click', scanLocalModels);
+    saveProviderButton.addEventListener('click', async () => {
+      const models = newProviderModels.value.split(',').map(item => item.trim()).filter(Boolean);
+      const response = await fetch('/providers', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: newProviderId.value.trim(),
+          label: newProviderLabel.value.trim(),
+          type: newProviderType.value,
+          base_url: newProviderBaseUrl.value.trim(),
+          api_key: newProviderKey.value.trim(),
+          models,
+          models_path: newProviderModelsPath.value.trim()
+        })
+      });
+      if (!response.ok) {
+        setSettingsStatus(await response.text());
+        return;
+      }
+      settingsState = await response.json();
+      newProviderId.value = '';
+      newProviderLabel.value = '';
+      newProviderBaseUrl.value = '';
+      newProviderModels.value = '';
+      newProviderModelsPath.value = '';
+      newProviderKey.value = '';
+      await loadSettings();
+      setSettingsStatus('Provider saved.');
+    });
+    settingsForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const providerId = providerSelect.value;
+      const keyInput = document.getElementById('providerKey');
+      const response = await fetch('/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          default_provider: providerId,
+          default_model: settingsModelSelect.value,
+          provider_keys: {
+            [providerId]: keyInput ? keyInput.value.trim() : ''
+          }
+        })
+      });
+      if (!response.ok) {
+        setSettingsStatus(await response.text());
+        return;
+      }
+      settingsState = await response.json();
+      rebuildModelOptions(modelSelect, settingsState.providers[providerId].models, settingsState.default_model);
+      renderProviderSettings();
+      setSettingsStatus('Settings saved.');
+    });
+    refreshMemory.addEventListener('click', refreshMemories);
+    loadSettings();
+    refreshMemories();
+  </script>
+</body>
+</html>

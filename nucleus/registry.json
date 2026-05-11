@@ -1,0 +1,53 @@
+{
+  "tools": [
+    {
+      "name": "execute_python",
+      "description": "Execute Python code and return stdout and stderr. This is how you gain any capability you do not have.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "builtin": true,
+      "requires_approval": false
+    },
+    {
+      "name": "register_tool",
+      "description": "Permanently register a new tool from a Python file you have already written and tested via execute_python.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "parameters_schema": {
+            "type": "object"
+          },
+          "filepath": {
+            "type": "string"
+          },
+          "requires_approval": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "parameters_schema",
+          "filepath"
+        ]
+      },
+      "builtin": true,
+      "requires_approval": false
+    }
+  ]
+}

@@ -1,0 +1,142 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..600;1,9..40,400&family=DM+Serif+Display:ital@0;1&family=JetBrains+Mono:wght@400&display=swap') layer(base);
+@import "tailwindcss";
+
+/* ━━━ DESIGN TOKENS — Ouroboros ━━━ */
+/* References: docs/design-system.md */
+
+/* ━━━ THEME ━━━ */
+@theme {
+  /* Brand colors */
+  --color-brand-50:  #fffcf5;
+  --color-brand-100: #fef6e0;
+  --color-brand-200: #fdeab5;
+  --color-brand-300: #fcd87a;
+  --color-brand-400: #facc44;
+  --color-brand-500: #e8b730;
+  --color-brand-600: #c49a1f;
+  --color-brand-700: #9b7717;
+  --color-brand-800: #775912;
+  --color-brand-900: #58420f;
+  --color-brand-950: #3d2c0a;
+
+  /* Neutral (warm grays) */
+  --color-neutral-50:  #faf8f5;
+  --color-neutral-100: #f0ece6;
+  --color-neutral-200: #ded8ce;
+  --color-neutral-300: #c4bbb0;
+  --color-neutral-400: #a3998c;
+  --color-neutral-500: #8a7e70;
+  --color-neutral-600: #6b6055;
+  --color-neutral-700: #4f463d;
+  --color-neutral-800: #363028;
+  --color-neutral-900: #1f1c17;
+  --color-neutral-950: #141210;
+
+  /* Status colors */
+  --color-success-500: #22c55e;
+  --color-success-600: #16a34a;
+  --color-warning-500: #f59e0b;
+  --color-warning-600: #d97706;
+  --color-error-500:   #ef4444;
+  --color-error-600:   #dc2626;
+
+  /* Font families */
+  --font-sans:    'DM Sans', ui-sans-serif, system-ui;
+  --font-serif:   'DM Serif Display', ui-serif, Georgia;
+  --font-mono:    'JetBrains Mono', ui-monospace, monospace;
+
+  /* Type scale */
+  --text-h1:      1.75rem;
+  --text-h2:      1.375rem;
+  --text-h3:      1.125rem;
+  --text-body-lg: 1rem;
+  --text-body:    0.9375rem;
+  --text-body-sm: 0.8125rem;
+  --text-label-lg: 0.9375rem;
+  --text-label:   0.875rem;
+  --text-label-sm: 0.75rem;
+  --text-mono:    0.8125rem;
+
+  /* Font weights */
+  --font-weight-normal:   400;
+  --font-weight-medium:   500;
+  --font-weight-semibold: 600;
+
+  /* Spacing (base 4px) */
+  --spacing-1:  0.25rem;
+  --spacing-2:  0.5rem;
+  --spacing-3:  0.75rem;
+  --spacing-4:  1rem;
+  --spacing-5:  1.25rem;
+  --spacing-6:  1.5rem;
+  --spacing-8:  2rem;
+  --spacing-10: 2.5rem;
+  --spacing-12: 3rem;
+  --spacing-16: 4rem;
+
+  /* Border radius */
+  --radius-sm:  0.25rem;
+  --radius-md:  0.5rem;
+  --radius-lg:  0.75rem;
+  --radius-xl:  1rem;
+  --radius-full: 9999px;
+
+  /* Elevation shadows */
+  --shadow-level-1: 0 1px 2px rgba(0,0,0,0.3), 0 1px 3px rgba(0,0,0,0.2);
+  --shadow-level-2: 0 4px 8px rgba(0,0,0,0.3), 0 2px 4px rgba(0,0,0,0.2);
+  --shadow-level-3: 0 8px 24px rgba(0,0,0,0.4), 0 4px 8px rgba(0,0,0,0.3), 0 0 0 1px rgba(255,255,255,0.06);
+  --shadow-bubble:  0 0 16px rgba(232,183,48,0.15), 0 2px 8px rgba(0,0,0,0.2);
+
+  /* Motion */
+  --ease-default: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-enter:   cubic-bezier(0, 0, 0.2, 1);
+  --ease-exit:    cubic-bezier(0.4, 0, 1, 1);
+  --ease-bounce:  cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --duration-instant: 75ms;
+  --duration-fast:    150ms;
+  --duration-normal:  250ms;
+  --duration-slow:    400ms;
+}
+
+/* ━━━ BASE STYLES ━━━ */
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  font-family: var(--font-sans);
+  color: var(--color-neutral-100);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ━━━ UTILITY CLASSES ━━━ */
+@utility bg-page        { background-color: var(--color-neutral-950); }
+@utility bg-surface     { background-color: var(--color-neutral-900); }
+@utility bg-surface-hover { background-color: var(--color-neutral-800); }
+@utility bg-input       { background-color: var(--color-neutral-800); }
+@utility bg-brand       { background-color: var(--color-brand-500); }
+@utility bg-brand-hover { background-color: var(--color-brand-600); }
+
+@utility text-primary   { color: var(--color-neutral-100); }
+@utility text-secondary { color: var(--color-neutral-400); }
+@utility text-tertiary  { color: var(--color-neutral-600); }
+@utility text-on-brand  { color: var(--color-neutral-950); }
+@utility text-link      { color: var(--color-brand-400); }
+
+@utility border-default { border-color: var(--color-neutral-800); }
+@utility border-strong  { border-color: var(--color-neutral-700); }
+@utility border-subtle  { border-color: rgba(255,255,255,0.06); }
+
+@utility font-heading   { font-family: var(--font-serif); }
+
+/* ━━━ REDUCED MOTION ━━━ */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
