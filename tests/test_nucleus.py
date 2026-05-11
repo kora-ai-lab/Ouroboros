@@ -3,6 +3,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "nucleus"))
@@ -34,6 +35,11 @@ def make_client(tmp_path, monkeypatch):
     client = TestClient(server.app)
     client.app.state.model_adapter = FakeAdapter("Test response")
     client.app.state.pending_approvals = {}
+    
+    async def fake_call_model(prompt, model="nova-fast"):
+        return "Fake summary containing Kora Lab and sovereign memory."
+    monkeypatch.setattr(server, "call_model_simple", fake_call_model)
+    
     return client
 
 
@@ -46,16 +52,18 @@ def test_registry_loads_builtin_tools(tmp_path, monkeypatch):
     assert "register_tool" in names
 
 
-def test_execute_python_success():
-    result = server.execute_python("print('ok')")
+@pytest.mark.asyncio
+async def test_execute_python_success():
+    result = await server.execute_python("print('ok')")
     assert result["exit_code"] == 0
     assert result["stdout"].strip() == "ok"
     assert result["timed_out"] is False
 
 
-def test_execute_python_timeout():
-    result = server.execute_python("import time; time.sleep(31)")
-    assert result["exit_code"] == 124
+@pytest.mark.asyncio
+async def test_execute_python_timeout():
+    result = await server.execute_python("import time; time.sleep(31)")
+    assert result["exit_code"] == -1
     assert result["timed_out"] is True
 
 
@@ -74,11 +82,12 @@ def test_register_tool_validates_and_persists(tmp_path, monkeypatch):
     assert any(tool["name"] == "echo_tool" for tool in registry["tools"])
 
 
-def test_retrieve_relevant_memory(tmp_path, monkeypatch):
+@pytest.mark.asyncio
+async def test_retrieve_relevant_memory(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
-    server.summarize_session(
-        "session-1",
+    await server.summarize_and_store(
         [{"role": "user", "content": "Kora Lab sovereign AI memory test"}],
+        "session-1",
     )
     matches = server.retrieve_relevant("sovereign memory", limit=5)
     assert len(matches) == 1

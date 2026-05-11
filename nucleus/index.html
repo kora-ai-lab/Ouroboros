@@ -43,13 +43,13 @@
 
     .app {
       display: grid;
-      grid-template-columns: 320px 1fr;
+      grid-template-columns: 1fr 320px;
       min-height: 100vh;
       background: var(--black);
     }
 
     .sidebar {
-      border-right: 1px solid var(--gray-2);
+      border-left: 1px solid var(--gray-2);
       background: var(--gray-1);
       padding: 16px;
       overflow-y: auto;
@@ -307,25 +307,22 @@
 </head>
 <body>
   <div class="app">
-    <aside id="memorySidebar" class="sidebar">
-      <div class="topbar" style="padding:0 0 12px;border-bottom:0;">
-        <div class="brand">Memory</div>
-        <button id="refreshMemory" type="button">Refresh</button>
-      </div>
-      <div id="memoryList"></div>
-    </aside>
-
     <main class="main">
       <header class="topbar">
         <div class="brand">Ouroboros</div>
         <div class="controls">
+          <button id="saveSession" type="button">Save Session</button>
           <button id="toggleMemory" type="button">Memory</button>
           <button id="openSettings" type="button">Settings</button>
           <select id="model">
             <option value="openai-fast">openai-fast</option>
             <option value="qwen-coder">qwen-coder</option>
             <option value="deepseek">deepseek</option>
+            <option value="claude-fast">claude-fast</option>
+            <option value="claude">claude</option>
             <option value="nova-fast">nova-fast</option>
+            <option value="searchgpt">searchgpt</option>
+            <option value="mistral">mistral</option>
           </select>
         </div>
       </header>
@@ -351,6 +348,14 @@
         </form>
       </section>
     </main>
+
+    <aside id="memorySidebar" class="sidebar">
+      <div class="topbar" style="padding:0 0 12px;border-bottom:0;">
+        <div class="brand">Memory</div>
+        <button id="refreshMemory" type="button">Refresh</button>
+      </div>
+      <div id="memoryList"></div>
+    </aside>
   </div>
 
   <section id="settingsPanel" class="settings-panel" aria-hidden="true">
@@ -439,6 +444,7 @@
     const memoryList = document.getElementById('memoryList');
     const memorySidebar = document.getElementById('memorySidebar');
     const toggleMemory = document.getElementById('toggleMemory');
+    const saveSession = document.getElementById('saveSession');
     const refreshMemory = document.getElementById('refreshMemory');
     const openSettings = document.getElementById('openSettings');
     const closeSettings = document.getElementById('closeSettings');
@@ -518,27 +524,74 @@
     }
 
     async function refreshMemories() {
-      const response = await fetch('/memory');
-      const data = await response.json();
-      memoryList.innerHTML = '';
-      for (const memory of data.memories || []) {
-        const item = document.createElement('div');
-        item.className = 'memory-item';
-        const created = document.createElement('strong');
-        created.textContent = memory.created_at;
-        const summary = document.createElement('span');
-        summary.textContent = memory.summary;
-        item.appendChild(created);
-        item.appendChild(summary);
-        item.addEventListener('click', () => {
-          const contextItem = { type: 'memory', name: `memory-${memory.id}`, content: memory.summary };
-          contextFiles.push(contextItem);
-          addChip(contextItem);
-        });
-        memoryList.appendChild(item);
-      }
-      if (!memoryList.children.length) {
-        memoryList.innerHTML = '<div class="memory-item">No episodic memories yet.</div>';
+      try {
+        const response = await fetch('/memory');
+        const data = await response.json();
+        memoryList.innerHTML = '';
+        for (const memory of data.memories || []) {
+          const item = document.createElement('div');
+          item.className = 'memory-item';
+          
+          const created = document.createElement('strong');
+          created.textContent = new Date(memory.created_at).toLocaleString();
+          
+          const summary = document.createElement('span');
+          summary.textContent = memory.summary.length > 100 ? memory.summary.substring(0, 100) + '...' : memory.summary;
+          
+          item.appendChild(created);
+          item.appendChild(summary);
+          
+          item.addEventListener('click', () => {
+            // Add to context
+            const contextItem = { type: 'memory', name: `memory-${memory.id}`, content: memory.summary };
+            if (!contextFiles.some(f => f.name === contextItem.name)) {
+              contextFiles.push(contextItem);
+              addChip(contextItem);
+            }
+            
+            // Show preview in chat
+            const contentNode = addMessage('System', `Memory preview: ${memory.id}<br>`);
+            const node = document.createElement('div');
+            node.innerHTML = `<div style="border-left:2px solid var(--gray-3);padding-left:12px;margin-top:8px;font-family:monospace;white-space:pre-wrap;">${memory.summary}</div>`;
+            contentNode.appendChild(node);
+          });
+
+          const loadBtn = document.createElement('button');
+          loadBtn.type = 'button';
+          loadBtn.className = 'chip';
+          loadBtn.style.marginTop = '8px';
+          loadBtn.textContent = 'LOAD SESSION';
+          loadBtn.onclick = async (e) => {
+            e.stopPropagation();
+            if (!confirm('Replace current chat with this session?')) return;
+            try {
+              const res = await fetch(`/memory/${memory.session_id}`);
+              const data = await res.json();
+              if (data.messages) {
+                messages.length = 0;
+                output.innerHTML = '';
+                for (const m of data.messages) {
+                  messages.push(m);
+                  if (m.role === 'user') addTextMessage('User', m.content);
+                  else if (m.role === 'assistant') addTextMessage('Ouroboros', m.content);
+                  else if (m.role === 'system') addTextMessage('System', m.content);
+                  else if (m.role === 'tool') addMessage('Tool result', `<pre style="font-size:11px;">${m.content}</pre>`);
+                }
+                setStatus(`Loaded session: ${memory.session_id}`);
+              }
+            } catch (err) {
+              setStatus(`Load failed: ${err.message}`);
+            }
+          };
+          item.appendChild(loadBtn);
+
+          memoryList.appendChild(item);
+        }
+        if (!memoryList.children.length) {
+          memoryList.innerHTML = '<div class="memory-item">No episodic memories yet.</div>';
+        }
+      } catch (e) {
+        memoryList.innerHTML = `<div class="memory-item">Failed to load memories: ${e.message}</div>`;
       }
     }
 
@@ -676,14 +729,71 @@
       } else if (eventName === 'tool_result') {
         renderJsonBlock('Tool result', data);
       } else if (eventName === 'approval_request') {
-        renderJsonBlock('Approval', data);
-      } else if (eventName === 'memory_saved') {
-        setStatus('Memory saved.');
-        refreshMemories();
+        renderApprovalRequest(data);
       } else if (eventName === 'error') {
         setStatus(data.message);
       } else if (eventName === 'done') {
         setStatus('Done.');
+      }
+    }
+
+    function renderApprovalRequest(data) {
+      const node = document.createElement('div');
+      node.className = 'message';
+      node.style.border = '1px solid var(--white)';
+      node.innerHTML = `
+        <div class="role">Approval Required</div>
+        <div style="margin-bottom:12px;">Tool: <strong>${data.tool_name}</strong></div>
+        <pre style="font-size:11px;background:var(--gray-1);padding:8px;">${JSON.stringify(data.arguments, null, 2)}</pre>
+        <div class="actions" style="margin-top:12px;">
+          <button class="approve-btn" style="background:var(--white);color:var(--black);">APPROVE</button>
+          <button class="reject-btn">REJECT</button>
+        </div>
+      `;
+      output.appendChild(node);
+      output.scrollTop = output.scrollHeight;
+
+      node.querySelector('.approve-btn').onclick = async () => {
+        node.remove();
+        await fetch('/approve', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ request_id: data.request_id })
+        });
+      };
+      node.querySelector('.reject-btn').onclick = async () => {
+        node.remove();
+        await fetch('/reject', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ request_id: data.request_id, reason: 'User rejected' })
+        });
+      };
+    }
+
+    async function saveCurrentSession() {
+      if (messages.length < 2) {
+        setStatus('Nothing to save yet.');
+        return;
+      }
+      const sessionId = `session-${Date.now()}`;
+      setStatus('Saving session to memory...');
+      try {
+        const response = await fetch('/memory/save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sessionId, messages })
+        });
+        const data = await response.json();
+        if (response.ok && data.status !== 'error') {
+          setStatus('Session saved.');
+          refreshMemories();
+        } else {
+          const errorMsg = data.message || data.detail || 'Unknown error';
+          setStatus(`Failed to save: ${errorMsg}`);
+        }
+      } catch (error) {
+        setStatus(`Network error: ${error.message}`);
       }
     }
 
@@ -775,8 +885,13 @@
     });
 
     toggleMemory.addEventListener('click', () => {
+      const isOpening = memorySidebar.classList.contains('closed');
       memorySidebar.classList.toggle('closed');
+      if (isOpening) {
+        refreshMemories();
+      }
     });
+    saveSession.addEventListener('click', saveCurrentSession);
     openSettings.addEventListener('click', async () => {
       await loadSettings();
       settingsPanel.classList.add('open');

@@ -21,6 +21,19 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    load_env_files()
+    ensure_layout()
+    init_db()
+    app.state.model_adapter = ProviderAdapter()
+    app.state.pending_approvals = {}
+    yield
+
+
+app = FastAPI(title="Ouroboros Nucleus", lifespan=lifespan)
+
+
 BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
@@ -40,7 +53,11 @@ MODEL_OPTIONS = {
         "openai-fast",
         "qwen-coder",
         "deepseek",
+        "claude-fast",
+        "claude",
         "nova-fast",
+        "searchgpt",
+        "mistral",
     ]
 }
 
@@ -103,34 +120,38 @@ DEFAULT_FACTS = {
     },
 }
 
-SYSTEM_TEMPLATE = """You are Ouroboros, a self-evolving personal AI substrate built for Kheir Lissi, founder of Kora Lab in Lome, Togo.
+SYSTEM_TEMPLATE = """
+You are Ouroboros. You are the personal sovereign AI workspace of Kheir Lissi, founder of Kora Lab, Lome Togo.
 
-Your purpose is not to answer questions. Your purpose is to act as a sovereign thinking and execution environment that grows its own capabilities over time.
+BEHAVIORAL RULES — these are absolute:
 
-You have two built-in tools: execute_python and register_tool. These two tools contain every other capability. When you need to do something you cannot currently do, write the Python code to do it, test it via execute_python, then register it as a permanent tool via register_tool so it is available in every future session.
+1. DO NOT call tools for conversational exchanges. Greetings, questions, discussions, strategy sessions do not require tool calls. A user saying "hi" gets "Hello." Nothing else.
 
-To call a tool, return a JSON object inside <tool_call> tags:
-<tool_call>{{"name":"execute_python","arguments":{{"code":"print('hello')"}}}}</tool_call>
+2. You are a Real OS AI. Your scope is the entire host operating system, not just the project directory. Use absolute paths to read, write, or execute anywhere on the machine. You manage files, processes, and configurations globally as Kheir's digital executor. The UI features a Memory sidebar on the RIGHT.
 
-You have access to the following registered tools:
+3. When you need a capability you do not have, follow these atomic steps:
+   a. Write the Python logic (for PDFs, use the `pymupdf` library which is pre-installed).
+   b. Use execute_python to write the code to a file inside `nucleus/tools/`.
+   c. Use execute_python to test the file (calling it with JSON via stdin).
+   d. Use register_tool to install it permanently, providing the filename (no path needed for filepath).
+
+4. You are direct and strategic. No corporate fluff. No emotional validation. You report facts and actions.
+
+5. You can modify your own nucleus code by reading and writing files in the nucleus directory, but you are not confined to it.
+
+6. You do not ask for confirmation more than once per action. If the user has asked for something, do it.
+
+CURRENT CAPABILITIES:
 {tool_registry}
 
-You have the following permanent facts about the user:
+PERMANENT FACTS ABOUT KHEIR AND KORA:
 {facts}
 
-Recalled memories relevant to this conversation:
+RECALLED RELEVANT MEMORIES:
 {recalled_memories}
 
-Kora Lab knowledge base:
+KORA KNOWLEDGE BASE:
 {kora_context}
-
-Rules:
-- Be direct. No hedging.
-- When you build something, tell the user what you built and that it is now permanent.
-- When you update facts.json, say so.
-- When you register a new tool, confirm it by name.
-- You can return HTML in your response and it will render. Use this to build persistent UI panels when useful.
-- You are not a generic assistant. You are Kheir's sovereign workspace.
 """
 
 
@@ -217,7 +238,16 @@ async def stream_openai_compatible(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    payload = {"model": model, "messages": messages, "stream": True}
+    
+    # Map "tool" role to "user" for maximum compatibility
+    mapped_messages = []
+    for m in messages:
+        if m["role"] == "tool":
+            mapped_messages.append({"role": "user", "content": f"[TOOL RESULT]: {m['content']}"})
+        else:
+            mapped_messages.append(m)
+
+    payload = {"model": model, "messages": mapped_messages, "stream": True}
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
             "POST",
@@ -225,7 +255,19 @@ async def stream_openai_compatible(
             headers=headers,
             json=payload,
         ) as response:
-            response.raise_for_status()
+            if response.status_code != 200:
+                await response.aread()
+                error_text = response.text
+                detail = f"Provider returned HTTP {response.status_code}"
+                try:
+                    err_body = json.loads(error_text)
+                    err_obj = err_body.get("error", err_body)
+                    msg = err_obj.get("message", error_text)
+                    detail = f"{msg} (HTTP {response.status_code})"
+                except (json.JSONDecodeError, AttributeError):
+                    if error_text:
+                        detail = f"{error_text[:500]} (HTTP {response.status_code})"
+                raise RuntimeError(detail)
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -251,7 +293,16 @@ async def stream_ollama(
     model: str,
 ) -> AsyncIterator[str]:
     base_url = (provider_config.get("base_url") or "http://127.0.0.1:11434").rstrip("/")
-    payload = {"model": model, "messages": messages, "stream": True}
+    
+    # Map "tool" role to "user" for maximum compatibility
+    mapped_messages = []
+    for m in messages:
+        if m["role"] == "tool":
+            mapped_messages.append({"role": "user", "content": f"[TOOL RESULT]: {m['content']}"})
+        else:
+            mapped_messages.append(m)
+
+    payload = {"model": model, "messages": mapped_messages, "stream": True}
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", f"{base_url}/api/chat", json=payload) as response:
             response.raise_for_status()
@@ -618,61 +669,78 @@ def load_kora_context() -> str:
     return "\n\n".join(parts) if parts else "No Kora knowledge files loaded."
 
 
-def keywords_for(text: str, limit: int = 40) -> list[str]:
-    words = re.findall(r"[a-zA-Z0-9_]{3,}", text.lower())
-    stop = {
-        "the",
-        "and",
-        "for",
-        "that",
-        "with",
-        "this",
-        "from",
-        "you",
-        "are",
-        "was",
-        "have",
-        "has",
-        "not",
-        "but",
+def extract_keywords(text: str) -> list[str]:
+    stopwords = {
+        "the","a","an","is","was","and","or","to",
+        "in","of","for","that","this","it","on","at",
+        "with","from","by","as","be","been","have",
+        "has","had","will","would","could","should"
     }
-    seen: list[str] = []
-    for word in words:
-        if word not in stop and word not in seen:
-            seen.append(word)
-        if len(seen) >= limit:
-            break
-    return seen
+    words = text.lower().split()
+    return list({
+        w.strip(".,!?:;\"'()[]") 
+        for w in words 
+        if len(w) > 3 and w not in stopwords
+    })[:20]
 
 
-def retrieve_relevant(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    query_words = set(keywords_for(query, limit=80))
+def retrieve_relevant(query: str, limit: int = 4) -> str:
+    query_words = set(extract_keywords(query))
     if not query_words:
-        return []
+        return ""
     with connect_db() as conn:
-        rows = conn.execute("SELECT * FROM episodic_memory ORDER BY created_at DESC").fetchall()
-    scored: list[tuple[int, dict[str, Any]]] = []
+        rows = conn.execute("SELECT summary, keywords, created_at FROM episodic_memory").fetchall()
+    
+    scored = []
     for row in rows:
-        row_keywords = set(filter(None, row["keywords"].split(",")))
-        score = len(query_words & row_keywords)
+        mem_words = set(row["keywords"].split(","))
+        score = len(query_words & mem_words)
         if score > 0:
-            scored.append((score, dict(row)))
-    scored.sort(key=lambda item: (item[0], item[1]["created_at"]), reverse=True)
-    return [item[1] for item in scored[:limit]]
+            scored.append((score, row))
+    
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if not scored:
+        return ""
+    
+    top = scored[:limit]
+    return "\n\n".join([
+        f"[{row['created_at'][:10]}] {row['summary']}"
+        for _, row in top
+    ])
 
 
 def build_system_prompt(request: ChatRequest) -> str:
     facts = json.dumps(load_json(FACTS_PATH, DEFAULT_FACTS), indent=2)
     registry = json.dumps(load_registry(), indent=2)
-    query = "\n".join(message.content for message in request.messages[-4:])
-    recalled = retrieve_relevant(query)
-    recalled_text = "\n\n".join(f"{item['created_at']}: {item['summary']}" for item in recalled)
+    first_query = request.messages[0].content if request.messages else ""
+    recalled_text = retrieve_relevant(first_query)
     if not recalled_text:
         recalled_text = "No relevant memories found."
-    context_file_text = "\n\n".join(f"### {item.name}\n{item.content}" for item in request.context_files)
+    else:
+        # Cap recalled memories
+        if len(recalled_text) > 4000:
+            recalled_text = recalled_text[:4000] + "... [truncated]"
+    
+    # Cap context files
+    context_parts = []
+    total_chars = 0
+    for item in request.context_files:
+        content = item.content
+        if len(content) > 8000:
+            content = content[:8000] + "... [file truncated]"
+        
+        part = f"### {item.name}\n{content}"
+        if total_chars + len(part) > 24000:
+            context_parts.append(f"### {item.name}\n[OMITTED: Context too large]")
+            break
+        context_parts.append(part)
+        total_chars += len(part)
+        
+    context_file_text = "\n\n".join(context_parts)
     kora_context = load_kora_context()
     if context_file_text:
         kora_context = f"{kora_context}\n\nUploaded context files:\n{context_file_text}"
+        
     return SYSTEM_TEMPLATE.format(
         tool_registry=registry,
         facts=facts,
@@ -718,33 +786,40 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
-def execute_python(code: str) -> dict[str, Any]:
+async def execute_python(code: str) -> dict[str, Any]:
     start = time.time()
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", code,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(ROOT_DIR)
+    )
     try:
-        completed = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=ROOT_DIR,
-            input="",
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=30
         )
         return {
-            "stdout": completed.stdout[-100_000:],
-            "stderr": completed.stderr[-100_000:],
-            "exit_code": completed.returncode,
+            "stdout": stdout.decode()[-100_000:],
+            "stderr": stderr.decode()[-100_000:],
+            "exit_code": proc.returncode,
             "timed_out": False,
-            "duration_ms": int((time.time() - start) * 1000),
+            "duration_ms": int((time.time() - start) * 1000)
         }
-    except subprocess.TimeoutExpired as exc:
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
         return {
-            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": "Stopped after 30 seconds.",
-            "exit_code": 124,
+            "stdout": "",
+            "stderr": "Timed out after 30s",
+            "exit_code": -1,
             "timed_out": True,
-            "duration_ms": int((time.time() - start) * 1000),
+            "duration_ms": int((time.time() - start) * 1000)
         }
+
+
+
 
 
 def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
@@ -777,21 +852,25 @@ def register_tool(
     requires_approval: bool = False,
 ) -> dict[str, Any]:
     validate_tool_name(name)
-    path = resolve_tool_path(filepath)
-    subprocess.run([sys.executable, "-m", "py_compile", str(path)], check=True, capture_output=True, text=True)
+    full_path = ROOT_DIR / filepath
+    if not full_path.exists():
+        return {
+            "error": f"File not found: {filepath}. Write the file first via execute_python before registering."
+        }
+    
     registry = load_registry()
     entry = {
         "name": name,
         "description": description,
         "parameters": parameters_schema,
-        "filepath": str(path.relative_to(BASE_DIR)).replace("\\", "/"),
+        "filepath": str(filepath),
         "builtin": False,
         "requires_approval": bool(requires_approval),
     }
-    registry["tools"] = [tool for tool in registry["tools"] if tool.get("name") != name]
+    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return entry
+    return {"registered": name, "permanent": True}
 
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> None:
@@ -810,37 +889,93 @@ def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict
         conn.commit()
 
 
-def summarize_session(session_id: str, messages: list[dict[str, str]]) -> dict[str, str]:
-    text = "\n".join(f"{message['role']}: {message['content']}" for message in messages)
-    words = text.split()
-    summary = " ".join(words[:260])
-    if len(words) > 260:
-        summary += " ..."
-    if not summary:
-        summary = "Empty session."
-    keywords = ",".join(keywords_for(text))
-    archive_path = ARCHIVE_DIR / f"{session_id}.json"
-    archive_path.write_text(json.dumps({"session_id": session_id, "messages": messages}, indent=2), encoding="utf-8")
-    with connect_db() as conn:
-        conn.execute(
-            "INSERT INTO episodic_memory (id, created_at, keywords, summary, session_id) VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), now_iso(), keywords, summary[:2400], session_id),
-        )
-        conn.commit()
-    return {"summary": summary[:2400], "keywords": keywords}
+async def call_model_simple(prompt: str, model: str = "openai-fast") -> str:
+    try:
+        messages = [{"role": "user", "content": prompt}]
+        provider_config = get_provider("pollinations")
+        base_url = provider_config.get("base_url") or POLLINATIONS_BASE_URL
+        api_key = get_provider_api_key_from_config(provider_config)
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        
+        payload = {"model": model, "messages": messages, "stream": False}
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{base_url.rstrip('/')}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"ERROR: call_model_simple failed: {e}")
+        raise
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    load_env_files()
-    ensure_layout()
-    init_db()
-    app.state.model_adapter = ProviderAdapter()
-    app.state.pending_approvals = {}
-    yield
+async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
+    conversation_text = "\n".join([
+        f"{m['role'].upper()}: {m['content']}"
+        for m in messages
+        if m['role'] in ['user', 'assistant']
+    ])
+    
+    summary_prompt = f"""
+Summarize this conversation in 150 to 250 words.
+Include: main topics, decisions made, tools built or registered, files modified, and any named entities (projects, people, dates, domain names, tools).
+Write in past tense. Be specific and factual. No filler. No intro sentence.
+
+CONVERSATION:
+{conversation_text[:8000]}
+"""
+    try:
+        try:
+            summary = await call_model_simple(summary_prompt, model="openai-fast")
+        except Exception as e:
+            print(f"WARNING: Model summarization failed, using fallback. Error: {e}")
+            summary = f"Conversation session {session_id}. Summary unavailable due to model error."
+        
+        keywords = extract_keywords(summary)
+        if not keywords:
+            keywords = ["session", "archive"]
+            
+        # Archive full session
+        ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        (ARCHIVE_DIR / f"{session_id}.json").write_text(json.dumps({"session_id": session_id, "messages": messages}, indent=2), encoding="utf-8")
+
+        with connect_db() as conn:
+            conn.execute(
+                "INSERT INTO episodic_memory (id, created_at, keywords, summary, session_id) VALUES (?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), now_iso(), ",".join(keywords), summary, session_id),
+            )
+            conn.commit()
+        return {"status": "saved", "session_id": session_id, "summary": summary}
+    except Exception as e:
+        print(f"ERROR: summarize_and_store failed: {e}")
+        return {"status": "error", "message": str(e)}
 
 
-app = FastAPI(title="Ouroboros Nucleus", lifespan=lifespan)
+class MemorySaveRequest(BaseModel):
+    session_id: str
+    messages: list[ChatMessage]
+
+
+@app.post("/memory/save")
+async def save_memory(request: MemorySaveRequest) -> JSONResponse:
+    try:
+        print(f"DEBUG: Saving session {request.session_id} with {len(request.messages)} messages")
+        messages_dict = [m.model_dump() for m in request.messages]
+        result = await summarize_and_store(messages_dict, request.session_id)
+        if result.get("status") == "error":
+            print(f"DEBUG: Summarization error: {result.get('message')}")
+        return JSONResponse(result)
+    except Exception as e:
+        print(f"DEBUG: Save memory endpoint exception: {e}")
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+
+
 
 
 @app.get("/")
@@ -977,20 +1112,78 @@ async def upload(file: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse({"type": "text", "name": name, "content": content})
 
 
+
+@app.get("/memory/{session_id}")
+async def get_session_history(session_id: str) -> JSONResponse:
+    path = ARCHIVE_DIR / f"{session_id}.json"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Session not found.")
+    try:
+        return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def prune_conversation(messages: list[dict[str, str]], max_chars: int = 32000) -> list[dict[str, str]]:
+    total_chars = sum(len(m["content"]) for m in messages)
+    if total_chars <= max_chars:
+        return messages
+    
+    print(f"DEBUG: Pruning conversation. Current size: {total_chars} chars. Target: {max_chars}")
+    system_msg = messages[0] if messages and messages[0]["role"] == "system" else None
+    
+    # Keep system prompt and last 5 messages
+    keep_last = 5
+    if len(messages) <= keep_last + 1:
+        # Just truncate the middle if we have very few but very large messages
+        return messages
+        
+    head = [system_msg] if system_msg else []
+    tail = messages[-keep_last:]
+    middle = messages[1:-keep_last] if system_msg else messages[:-keep_last]
+    
+    pruned_middle = []
+    for m in middle:
+        content = m["content"]
+        if m["role"] == "tool":
+            # Aggressively truncate old tool results
+            if len(content) > 500:
+                content = content[:500] + "... [Old tool result pruned]"
+        elif m["role"] in ["user", "assistant"]:
+            if len(content) > 2000:
+                content = content[:2000] + "... [Old message truncated]"
+        pruned_middle.append({"role": m["role"], "content": content})
+        
+    return head + pruned_middle + tail
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
         session_id = str(uuid.uuid4())
+        
+        # Sanitize incoming messages: cap extremely long ones
+        sanitized_messages = []
+        for msg in request.messages:
+            content = msg.content
+            if len(content) > 12000:
+                content = content[:12000] + "... [Message truncated in history]"
+            sanitized_messages.append({"role": msg.role, "content": content})
+            
         conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
-        conversation.extend(message.model_dump() for message in request.messages)
-        public_messages = [message.model_dump() for message in request.messages]
+        conversation.extend(sanitized_messages)
+        public_messages = sanitized_messages.copy()
         yield sse("meta", {"session_id": session_id, "model": request.model})
         try:
             for _ in range(4):
                 text = ""
                 provider = request.provider or load_settings().get("default_provider", "pollinations")
                 model = request.model or load_settings().get("default_model", "openai-fast")
-                async for token in app.state.model_adapter.complete(conversation, model, provider):
+                
+                # Auto-compaction / Pruning before calling model
+                active_conversation = prune_conversation(conversation)
+                
+                async for token in app.state.model_adapter.complete(active_conversation, model, provider):
                     text += token
                     yield sse("delta", {"content": token})
                 display_text = strip_tool_calls(text).strip()
@@ -1021,11 +1214,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             result = {"error": "Tool execution rejected by user."}
                             store_tool_execution(tool_name, arguments, result, False)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            conversation.append({"role": "tool", "content": json.dumps(result)})
+                            
+                            result_str = json.dumps(result)
+                            if len(result_str) > 10000:
+                                result_str = result_str[:10000] + "... [Result truncated]"
+                            conversation.append({"role": "tool", "content": result_str})
                             continue
                     yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     if tool_name == "execute_python":
-                        result = execute_python(str(arguments.get("code", "")))
+                        result = await execute_python(str(arguments.get("code", "")))
                     elif tool_name == "register_tool":
                         result = register_tool(
                             name=str(arguments.get("name", "")),
@@ -1035,14 +1232,22 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             requires_approval=bool(arguments.get("requires_approval", False)),
                         )
                     else:
-                        if tool is None:
-                            raise ValueError(f"Unknown tool: {tool_name}")
-                        result = run_registered_tool(tool, arguments)
+                        tool = find_tool(tool_name)
+                        if tool is not None and tool.get("builtin"):
+                            result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
+                        elif tool is not None:
+                            result = run_registered_tool(tool, arguments)
+                        else:
+                            result = {"error": f"Tool {tool_name} not found."}
                     store_tool_execution(tool_name, arguments, result, True)
                     yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
-                    conversation.append({"role": "tool", "content": json.dumps(result)})
-            memory = summarize_session(session_id, public_messages)
-            yield sse("memory_saved", memory)
+                    
+                    # Cap result for conversation history to avoid 400 errors
+                    result_str = json.dumps(result)
+                    if len(result_str) > 10000:
+                        result_str = result_str[:10000] + "... [Result truncated for context]"
+                    conversation.append({"role": "tool", "content": result_str})
+            # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id})
         except Exception as exc:
             yield sse("error", {"message": str(exc)})

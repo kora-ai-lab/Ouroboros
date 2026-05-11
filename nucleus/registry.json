@@ -2,24 +2,23 @@
   "tools": [
     {
       "name": "execute_python",
-      "description": "Execute Python code and return stdout and stderr. This is how you gain any capability you do not have.",
+      "description": "Execute Python code in the Ouroboros project directory. Use this to test code before registering it as a permanent tool, to read or modify files in the project, and to gain any capability you need. Returns stdout, stderr, exit_code.",
       "parameters": {
         "type": "object",
         "properties": {
           "code": {
-            "type": "string"
+            "type": "string",
+            "description": "Valid Python code to execute"
           }
         },
-        "required": [
-          "code"
-        ]
+        "required": ["code"]
       },
       "builtin": true,
       "requires_approval": false
     },
     {
       "name": "register_tool",
-      "description": "Permanently register a new tool from a Python file you have already written and tested via execute_python.",
+      "description": "Permanently register a Python file as a tool. The file must already exist on disk (written via execute_python). After registration the tool is available in all future sessions without restart.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -33,21 +32,50 @@
             "type": "object"
           },
           "filepath": {
-            "type": "string"
+            "type": "string",
+            "description": "Path relative to project root"
           },
           "requires_approval": {
-            "type": "boolean"
+            "type": "boolean",
+            "default": false
           }
         },
         "required": [
-          "name",
-          "description",
-          "parameters_schema",
-          "filepath"
+          "name","description","parameters_schema","filepath"
         ]
       },
       "builtin": true,
       "requires_approval": false
+    },
+    {
+      "name": "filesystem",
+      "description": "Universal file system access. Read, write, append, delete, list, create directories, copy, and move files/folders anywhere on your computer.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": ["read", "write", "append", "delete", "list", "mkdir", "copy", "move"],
+            "description": "Operation to perform"
+          },
+          "path": {
+            "type": "string",
+            "description": "File or directory path (supports ~ for home directory)"
+          },
+          "content": {
+            "type": "string",
+            "description": "Content for write/append actions"
+          },
+          "target_path": {
+            "type": "string",
+            "description": "Destination path for copy/move actions"
+          }
+        },
+        "required": ["action", "path"]
+      },
+      "filepath": "filesystem_manager.py",
+      "builtin": false,
+      "requires_approval": true
     }
   ]
 }
