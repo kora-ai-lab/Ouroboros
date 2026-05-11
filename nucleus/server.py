@@ -8,6 +8,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import textwrap
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -135,11 +136,13 @@ BEHAVIORAL RULES — these are absolute:
    c. Use execute_python to test the file (calling it with JSON via stdin).
    d. Use register_tool to install it permanently, providing the filename (no path needed for filepath).
 
-4. You are direct and strategic. No corporate fluff. No emotional validation. You report facts and actions.
+4. Tool-call contract: when using a tool, output exactly `<tool_call>{{"name":"execute_python","arguments":{{"code":"..."}}}}</tool_call>`. Do not use markdown fences for tools. Example: `<tool_call>{{"name":"execute_python","arguments":{{"code":"print('hello')"}}}}</tool_call>`.
 
-5. You can modify your own nucleus code by reading and writing files in the nucleus directory, but you are not confined to it.
+5. You are direct and strategic. No corporate fluff. No emotional validation. You report facts and actions.
 
-6. You do not ask for confirmation more than once per action. If the user has asked for something, do it.
+6. You can modify your own nucleus code by reading and writing files in the nucleus directory, but you are not confined to it.
+
+7. You do not ask for confirmation more than once per action. If the user has asked for something, do it.
 
 CURRENT CAPABILITIES:
 {tool_registry}
@@ -753,6 +756,31 @@ def sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=True)}\n\n"
 
 
+def extract_fenced_execute_python_code(info: str, body: str) -> str | None:
+    info = info.strip()
+    body = body.strip("\n")
+    if info.startswith("execute_python"):
+        tool_body = body
+    else:
+        lines = body.splitlines()
+        if not lines or not lines[0].strip().startswith("execute_python"):
+            return None
+        tool_body = "\n".join(lines[1:])
+
+    match = re.search(r"(?ms)^\s*code\s*:\s*(.*)\Z", tool_body)
+    if not match:
+        return None
+
+    raw_code = match.group(1)
+    stripped_code = raw_code.lstrip()
+    if re.match(r"[|>][+-]?", stripped_code):
+        lines = stripped_code.splitlines()
+        return textwrap.dedent("\n".join(lines[1:])).strip("\n")
+    if raw_code.startswith("\n"):
+        return textwrap.dedent(raw_code).strip("\n")
+    return raw_code.strip()
+
+
 def extract_tool_calls(text: str) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
     for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL):
@@ -762,11 +790,23 @@ def extract_tool_calls(text: str) -> list[dict[str, Any]]:
             continue
         if isinstance(payload, dict) and "name" in payload and "arguments" in payload:
             calls.append(payload)
+
+    for match in re.finditer(r"```([^`\n]*)\n(.*?)```", text, re.DOTALL):
+        code = extract_fenced_execute_python_code(match.group(1), match.group(2))
+        if code is None:
+            continue
+        calls.append({"name": "execute_python", "arguments": {"code": code}})
     return calls
 
 
 def strip_tool_calls(text: str) -> str:
-    return re.sub(r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", text, flags=re.DOTALL)
+    stripped = re.sub(r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", text, flags=re.DOTALL)
+
+    def replace_fenced_tool(match: re.Match[str]) -> str:
+        code = extract_fenced_execute_python_code(match.group(1), match.group(2))
+        return "" if code is not None else match.group(0)
+
+    return re.sub(r"```([^`\n]*)\n(.*?)```", replace_fenced_tool, stripped, flags=re.DOTALL)
 
 
 def validate_tool_name(name: str) -> None:

@@ -67,6 +67,40 @@ async def test_execute_python_timeout():
     assert result["timed_out"] is True
 
 
+def test_extract_tool_calls_reads_tool_call_json():
+    text = 'Before <tool_call>{"name":"execute_python","arguments":{"code":"print(1)"}}</tool_call> After'
+    assert server.extract_tool_calls(text) == [
+        {"name": "execute_python", "arguments": {"code": "print(1)"}}
+    ]
+
+
+def test_extract_tool_calls_reads_fenced_execute_python_format():
+    text = """```execute_python
+code: |
+  from pathlib import Path
+  print(Path.cwd())
+```"""
+    assert server.extract_tool_calls(text) == [
+        {
+            "name": "execute_python",
+            "arguments": {"code": "from pathlib import Path\nprint(Path.cwd())"},
+        }
+    ]
+
+
+def test_extract_tool_calls_ignores_invalid_tool_text_safely():
+    text = """
+<tool_call>{not valid json}</tool_call>
+```execute_python
+not_code: print(1)
+```
+```python
+print("not a tool")
+```
+"""
+    assert server.extract_tool_calls(text) == []
+
+
 def test_register_tool_validates_and_persists(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
     tool_path = tmp_path / "tools" / "echo_tool.py"
