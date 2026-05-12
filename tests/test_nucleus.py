@@ -18,6 +18,19 @@ class FakeAdapter(server.ModelAdapter):
             yield chunk
 
 
+class SequenceFakeAdapter(server.ModelAdapter):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    async def complete(self, messages, model, provider):
+        self.calls.append(list(messages))
+        if self.responses:
+            yield self.responses.pop(0)
+        else:
+            yield "Done"
+
+
 def make_client(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(server, "ARCHIVE_DIR", tmp_path / "data" / "archive")
@@ -175,6 +188,70 @@ def test_chat_stream_uses_fake_adapter_and_saves_memory(tmp_path, monkeypatch):
     assert "Test response" in response.text
 
 
+def test_chat_evaluation_retry_performs_second_tool_call(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    first_call = json.dumps({"name": "execute_python", "arguments": {"code": "raise Exception(\"fail\")"}})
+    second_call = json.dumps({"name": "execute_python", "arguments": {"code": "print(\"ok\")"}})
+    adapter = SequenceFakeAdapter([
+        f"<tool_call>{first_call}</tool_call>",
+        '{"decision":"retry","rationale":"The previous result failed."}',
+        f"<tool_call>{second_call}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
+        'Final answer after retry.',
+    ])
+    client.app.state.model_adapter = adapter
+
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "run the fake task"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text.count("event: tool_call") == 2
+    assert '"decision": "retry"' in response.text
+    assert '"decision": "final"' in response.text
+    assert "Final answer after retry." in response.text
+    with server.connect_db() as conn:
+        rows = conn.execute("SELECT decision, rationale FROM evaluation_decision ORDER BY timestamp").fetchall()
+    assert [row["decision"] for row in rows] == ["retry", "final"]
+
+
+def test_chat_evaluation_success_finalizes(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    tool_call = json.dumps({"name": "execute_python", "arguments": {"code": "print(\"ok\")"}})
+    adapter = SequenceFakeAdapter([
+        f"<tool_call>{tool_call}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
+        'Final answer.',
+    ])
+    client.app.state.model_adapter = adapter
+
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "run the fake task"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text.count("event: tool_call") == 1
+    assert '"decision": "final"' in response.text
+    assert "Final answer." in response.text
+    with server.connect_db() as conn:
+        rows = conn.execute("SELECT decision, rationale FROM evaluation_decision").fetchall()
+    assert [row["decision"] for row in rows] == ["final"]
+
+
 def test_settings_save_updates_env_and_defaults(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     response = client.post(
@@ -309,9 +386,11 @@ class SequenceAdapter(server.ModelAdapter):
 
 def test_refusal_recovery_reprompts_self_evolution_without_hardcoded_tool(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
+    tool_call = json.dumps({"name": "execute_python", "arguments": {"code": "print(\"model built capability\")"}})
     adapter = SequenceAdapter([
         "I don't have internet access to search for real-time information about ST Digital.",
-        '<tool_call>{"name":"execute_python","arguments":{"code":"print(\\\"model built capability\\\")"}}</tool_call>',
+        f"<tool_call>{tool_call}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
         "Recovered summary from tool results.",
     ])
     client.app.state.model_adapter = adapter
@@ -338,7 +417,7 @@ def test_refusal_recovery_reprompts_self_evolution_without_hardcoded_tool(tmp_pa
     assert "event: tool_call" in response.text
     assert "model built capability" in response.text
     assert "Recovered summary from tool results." in response.text
-    assert len(adapter.calls) == 3
+    assert len(adapter.calls) == 4
     retry_messages = [message for message in adapter.calls[1] if message["role"] == "system"]
     assert any("previous answer violated the self-evolution protocol" in message["content"] for message in retry_messages)
 

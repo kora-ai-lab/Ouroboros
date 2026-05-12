@@ -53,6 +53,8 @@ ENV_PATHS = [ROOT_DIR / ".env", BASE_DIR / ".env"]
 POLLINATIONS_BASE_URL = "https://gen.pollinations.ai/v1"
 LLAMA_CACHE: dict[str, Any] = {}
 MODEL_FILE_EXTENSIONS = {".gguf", ".bin", ".safetensors", ".pt", ".pth"}
+EVALUATION_DECISIONS = {"continue", "retry", "register_tool", "rollback", "final"}
+
 MODEL_OPTIONS = {
     "pollinations": [
         "openai-fast",
@@ -643,6 +645,18 @@ def init_db() -> None:
                 result TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 approved INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS evaluation_decision (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                raw_response TEXT NOT NULL,
+                timestamp TEXT NOT NULL
             )
             """
         )
@@ -1242,12 +1256,13 @@ def register_tool(
     return {"registered": name, "permanent": True}
 
 
-def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> None:
+def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
+    execution_id = str(uuid.uuid4())
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO tool_execution (id, tool_name, arguments, result, timestamp, approved) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                str(uuid.uuid4()),
+                execution_id,
                 tool_name,
                 json.dumps(arguments),
                 json.dumps(result),
@@ -1256,6 +1271,88 @@ def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict
             ),
         )
         conn.commit()
+    return execution_id
+
+
+def build_evaluation_prompt() -> str:
+    return textwrap.dedent(
+        """
+        Evaluate the immediately preceding result and choose the next step before any final answer is produced.
+        Be generic: judge only whether the result is adequate for the current task, without assuming any specific domain, data source, environment, or artifact type.
+
+        Choose exactly one decision:
+        - continue: proceed because more ordinary work is needed.
+        - retry: repeat or adjust the previous action because the result is missing, invalid, failed, or insufficient.
+        - register_tool: preserve a newly useful reusable capability before proceeding.
+        - rollback: undo or mitigate the previous action before proceeding.
+        - final: the result is sufficient to produce the final answer.
+
+        Return only JSON in this shape: {"decision":"continue|retry|register_tool|rollback|final","rationale":"brief reason"}
+        """
+    ).strip()
+
+
+def parse_evaluation_decision(raw_response: str) -> dict[str, str]:
+    decision = "continue"
+    rationale = "No rationale provided."
+    try:
+        payload = json.loads(raw_response.strip())
+        if isinstance(payload, dict):
+            candidate = str(payload.get("decision", "")).strip().lower()
+            if candidate in EVALUATION_DECISIONS:
+                decision = candidate
+            if payload.get("rationale"):
+                rationale = str(payload["rationale"]).strip()
+    except json.JSONDecodeError:
+        match = re.search(r"\b(continue|retry|register_tool|rollback|final)\b", raw_response, re.IGNORECASE)
+        if match:
+            decision = match.group(1).lower()
+        cleaned = raw_response.strip()
+        if cleaned:
+            rationale = cleaned[:500]
+    return {"decision": decision, "rationale": rationale}
+
+
+def store_evaluation_decision(session_id: str, decision: str, rationale: str, raw_response: str) -> str:
+    decision_id = str(uuid.uuid4())
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO evaluation_decision (id, session_id, decision, rationale, raw_response, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (decision_id, session_id, decision, rationale, raw_response, now_iso()),
+        )
+        conn.commit()
+    return decision_id
+
+
+async def complete_model_text(messages: list[dict[str, str]], model: str, provider: str) -> str:
+    text = ""
+    async for token in app.state.model_adapter.complete(messages, model, provider):
+        text += token
+    return text
+
+
+async def evaluate_tool_result(
+    conversation: list[dict[str, str]],
+    session_id: str,
+    model: str,
+    provider: str,
+) -> dict[str, str]:
+    conversation.append({"role": "system", "content": build_evaluation_prompt()})
+    raw_response = await complete_model_text(prune_conversation(conversation), model, provider)
+    conversation.append({"role": "assistant", "content": raw_response})
+    parsed = parse_evaluation_decision(raw_response)
+    store_evaluation_decision(session_id, parsed["decision"], parsed["rationale"], raw_response)
+    if parsed["decision"] == "retry":
+        conversation.append({"role": "system", "content": "Evaluation decision: retry. Adjust or repeat the previous action before finalizing."})
+    elif parsed["decision"] == "register_tool":
+        conversation.append({"role": "system", "content": "Evaluation decision: register_tool. Preserve the reusable capability before finalizing."})
+    elif parsed["decision"] == "rollback":
+        conversation.append({"role": "system", "content": "Evaluation decision: rollback. Undo or mitigate the previous action before finalizing."})
+    elif parsed["decision"] == "final":
+        conversation.append({"role": "system", "content": "Evaluation decision: final. Produce the final answer now."})
+    else:
+        conversation.append({"role": "system", "content": "Evaluation decision: continue. Proceed with the next appropriate step."})
+    return parsed
 
 
 async def call_model_simple(prompt: str, model: str = "openai-fast") -> str:
@@ -1774,6 +1871,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
                             yield emit_task_phase("observe", {"observation": observation})
                             conversation.append({"role": "tool", "content": json.dumps(result)})
+                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                            yield sse("evaluation", evaluation)
                             continue
                     requires_approval = bool(tool is not None and tool.get("requires_approval"))
                     policy_approved = False
@@ -1819,6 +1918,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             if len(result_str) > 10000:
                                 result_str = result_str[:10000] + "... [Result truncated]"
                             conversation.append({"role": "tool", "content": result_str})
+                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                            yield sse("evaluation", evaluation)
                             continue
                     yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     if tool_name == "execute_python":
@@ -1850,6 +1951,12 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
+<<<<<<< codex/add-evaluation-phase-after-tool-execution
+                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                    yield sse("evaluation", evaluation)
+                    if evaluation["decision"] == "final":
+                        break
+=======
                 yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
             if not task_state.done:
                 task_state.failure_count += 1
@@ -1857,6 +1964,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
                 save_task_state(task_state, DATA_DIR)
                 yield emit_task_phase("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
+>>>>>>> master
             # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id, "task_id": task_state.task_id})
         except Exception as exc:
