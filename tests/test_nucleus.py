@@ -236,6 +236,99 @@ def test_skill_package_validates_registers_and_runs(tmp_path, monkeypatch):
     assert json.loads(result["stdout"])["echo"] == "hello"
 
 
+
+def write_evals(package: Path, *, expected: str = "eval-ok", permissions: list[str] | None = None) -> None:
+    (package / "evals.json").write_text(
+        json.dumps(
+            [
+                {
+                    "name": "echo_eval",
+                    "input_arguments": {"message": "eval-ok"},
+                    "expected_output_predicate": {"json_field_equals": {"echo": expected}},
+                    "timeout": 5,
+                    "required_permissions": permissions or [],
+                }
+            ],
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_run_tool_evals_passes_package_evals(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    write_evals(package)
+    server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    result = server.run_tool_evals("caps_echo", "1.2.3")
+
+    assert result["passed"] is True
+    assert result["cases"][0]["passed"] is True
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "caps_echo")
+    assert tool["last_eval_status"] == "passed"
+    assert tool["trusted"] is False
+
+
+def test_run_tool_evals_fails_package_evals(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    write_evals(package, expected="wrong")
+    server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    result = server.run_tool_evals("caps_echo", "1.2.3")
+
+    assert result["passed"] is False
+    assert result["cases"][0]["passed"] is False
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "caps_echo")
+    assert tool["last_eval_status"] == "failed"
+    assert tool["trusted"] is False
+
+
+def test_promote_tool_trust_requires_passing_evals(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    write_evals(package, expected="wrong")
+    server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    failed = server.promote_tool_trust("caps_echo", "1.2.3")
+
+    assert failed["promoted"] is False
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "caps_echo")
+    assert tool["trusted"] is False
+
+    write_evals(package)
+    promoted = server.promote_tool_trust("caps_echo", "1.2.3")
+
+    assert promoted["promoted"] is True
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "caps_echo")
+    assert tool["trusted"] is True
+
+
+def test_promote_tool_trust_blocks_undeclared_permission_use(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    (package / "tool.py").write_text(
+        "import json, sys\nfrom pathlib import Path\nargs = json.loads(sys.stdin.read() or '{}')\nPath('note.txt').write_text(args.get('message', ''))\nprint(json.dumps({'echo': args.get('message', '')}))\n",
+        encoding="utf-8",
+    )
+    write_evals(package)
 def test_user_facing_tools_load_from_registry_while_kernel_services_remain_private(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     write_skill_package(tmp_path)
@@ -245,6 +338,13 @@ def test_user_facing_tools_load_from_registry_while_kernel_services_remain_priva
         filepath="tools/caps_echo",
     )
 
+    result = server.promote_tool_trust("caps_echo", "1.2.3")
+
+    assert result["promoted"] is False
+    assert result["evals"]["undeclared_permissions"] == ["filesystem_write"]
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "caps_echo")
+    assert tool["trusted"] is False
     response = client.get("/tools")
 
     assert response.status_code == 200
@@ -341,7 +441,7 @@ def test_validate_registered_tool_updates_status_and_use_count(tmp_path, monkeyp
     assert validation["result"]["stdout"].strip() == "3"
     registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
     tool = next(tool for tool in registry["tools"] if tool["name"] == "adder_tool")
-    assert tool["trusted"] is True
+    assert tool["trusted"] is False
     assert tool["last_test_status"] == "passed"
     assert tool["last_error"] is None
 
@@ -1174,6 +1274,13 @@ def test_system_prompt_guides_git_status_for_self_modifying_work(tmp_path, monke
     )
     assert "inspect `git status` before edits and again after edits" in prompt
     assert "nucleus/git_harness.py" in prompt
+def test_chat_continues_until_final_answer(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    adapter = SequenceAdapter([
+        "1. Run the first step\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('one')\"}}</tool_call>",
+        '{"decision":"continue","rationale":"Run the second step."}',
+        "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
 
 
 def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, monkeypatch):
@@ -1204,6 +1311,12 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     )
 
     assert response.status_code == 200
+    assert response.text.count("event: tool_call") == 2
+    assert response.text.count("event: tool_result") == 2
+    assert '"decision": "continue"' in response.text
+    assert '"decision": "final"' in response.text
+    assert "Final answer after two observations." in response.text
+    assert len(adapter.calls) == 5
     assert "event: task_plan" in response.text
     assert "event: task_step" in response.text
     assert "event: task_observation" in response.text
