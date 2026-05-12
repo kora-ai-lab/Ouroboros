@@ -160,6 +160,8 @@ BEHAVIORAL RULES — these are absolute:
 
 7. You do not ask for confirmation more than once per action. If the user has asked for something, do it.
 
+8. TOOL RESULT RESPONSE: After a tool you call completes, its result is appended to the conversation. You MUST always respond to the result — summarize what it found or confirm execution, even if you explained the expected outcome in your earlier message. A simple acknowledgment is sufficient.
+
 CURRENT CAPABILITIES:
 {tool_registry}
 
@@ -190,6 +192,7 @@ class ChatRequest(BaseModel):
     model: str = "openai-fast"
     provider: str = "pollinations"
     context_files: list[ContextFile] = Field(default_factory=list)
+    auto_approve: bool = False
 
 
 class ApprovalDecision(BaseModel):
@@ -268,13 +271,19 @@ async def stream_openai_compatible(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     
-    # Map "tool" role to "user" for maximum compatibility
+    # Map "tool" role to "user"; skip messages with empty content
     mapped_messages = []
-    for m in messages:
+    for i, m in enumerate(messages):
+        c = m.get("content", "")
         if m["role"] == "tool":
-            mapped_messages.append({"role": "user", "content": f"[TOOL RESULT]: {m['content']}"})
+            mapped_messages.append({"role": "user", "content": f"[TOOL RESULT — respond to this with a brief summary]: {c}"})
         else:
+            if not c:
+                print(f"WARNING: Empty content at messages.{i} (role={m['role']}), skipping")
+                continue
             mapped_messages.append(m)
+    if not mapped_messages:
+        raise RuntimeError("All messages had empty content — nothing to send to provider.")
 
     payload = {"model": model, "messages": mapped_messages, "stream": True}
     async with httpx.AsyncClient(timeout=None) as client:
@@ -366,7 +375,7 @@ async def stream_ollama(
     mapped_messages = []
     for m in messages:
         if m["role"] == "tool":
-            mapped_messages.append({"role": "user", "content": f"[TOOL RESULT]: {m['content']}"})
+            mapped_messages.append({"role": "user", "content": f"[TOOL RESULT — respond to this with a brief summary]: {m['content']}"})
         else:
             mapped_messages.append(m)
 
@@ -865,14 +874,47 @@ def extract_fenced_execute_python_code(info: str, body: str) -> str | None:
     return raw_code.strip()
 
 
+def _find_json_span(text: str, start: int = 0) -> tuple[int, int] | None:
+    brace_start = text.find("{", start)
+    if brace_start == -1:
+        return None
+    depth = 0
+    for i in range(brace_start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return (brace_start, i + 1)
+    return None
+
+
+def _try_parse_tool_json(text: str, json_start: int, json_end: int) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(text[json_start:json_end], strict=False)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict) and "name" in payload and "arguments" in payload:
+        return payload
+    return None
+
+
 def extract_tool_calls(text: str) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
-    for match in re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", text, re.DOTALL):
-        try:
-            payload = json.loads(match.group(1))
-        except json.JSONDecodeError:
+    seen_starts: set[int] = set()
+
+    # Match <tool_call> tags with optional </tool_call> closing
+    for match in re.finditer(r"<tool_call>", text):
+        tag_end = match.end()
+        span = _find_json_span(text, tag_end)
+        if span is None:
             continue
-        if isinstance(payload, dict) and "name" in payload and "arguments" in payload:
+        json_start, json_end = span
+        if json_start in seen_starts:
+            continue
+        seen_starts.add(json_start)
+        payload = _try_parse_tool_json(text, json_start, json_end)
+        if payload is not None:
             calls.append(payload)
 
     for match in re.finditer(r"```([^`\n]*)\n(.*?)```", text, re.DOTALL):
@@ -884,13 +926,32 @@ def extract_tool_calls(text: str) -> list[dict[str, Any]]:
 
 
 def strip_tool_calls(text: str) -> str:
-    stripped = re.sub(r"<tool_call>\s*\{.*?\}\s*</tool_call>", "", text, flags=re.DOTALL)
+    spans: list[tuple[int, int]] = []
+
+    for match in re.finditer(r"<tool_call>", text):
+        if any(s[0] <= match.start() < s[1] for s in spans):
+            continue
+        tag_end = match.end()
+        span = _find_json_span(text, tag_end)
+        if span is None:
+            continue
+        end = span[1]
+        # Include optional </tool_call> after the JSON
+        rest = text[end:]
+        close_tag = rest.find("</tool_call>")
+        if close_tag != -1 and close_tag <= 5:
+            end += close_tag + len("</tool_call>")
+        spans.append((match.start(), end))
+
+    result = text
+    for start, end in sorted(spans, reverse=True):
+        result = result[:start] + result[end:]
 
     def replace_fenced_tool(match: re.Match[str]) -> str:
         code = extract_fenced_execute_python_code(match.group(1), match.group(2))
         return "" if code is not None else match.group(0)
 
-    return re.sub(r"```([^`\n]*)\n(.*?)```", replace_fenced_tool, stripped, flags=re.DOTALL)
+    return re.sub(r"```([^`\n]*)\n(.*?)```", replace_fenced_tool, result, flags=re.DOTALL)
 
 
 def validate_tool_name(name: str) -> None:
@@ -938,79 +999,77 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
     risky_call_aliases: dict[str, str] = {}
     try:
         tree = ast.parse(code)
-    except SyntaxError as exc:
-        return {
-            "action": "block",
-            "risk_summary": f"Policy blocked execution: Python syntax error at line {exc.lineno}.",
-            "reasons": ["syntax error"],
-        }
+    except SyntaxError:
+        # Let the runtime catch syntax errors instead of blocking preemptively
+        tree = None
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                top_level = alias.name.split(".")[0]
-                module_aliases[alias.asname or top_level] = top_level
-                if alias.name in SUBPROCESS_IMPORTS or top_level in SUBPROCESS_IMPORTS:
-                    reasons.append("subprocess/process access")
-                if alias.name in NETWORK_IMPORTS or top_level in NETWORK_IMPORTS:
-                    reasons.append("network access")
-                if alias.name in BLOCKED_IMPORTS or top_level in BLOCKED_IMPORTS:
-                    blocked.append(f"blocked import: {alias.name}")
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            module_name = node.module
-            top_level = module_name.split(".")[0]
-            if module_name in SUBPROCESS_IMPORTS or top_level in SUBPROCESS_IMPORTS:
-                reasons.append("subprocess/process access")
-            if module_name in NETWORK_IMPORTS or top_level in NETWORK_IMPORTS:
-                reasons.append("network access")
-            if module_name in BLOCKED_IMPORTS or top_level in BLOCKED_IMPORTS:
-                blocked.append(f"blocked import: {module_name}")
-            if module_name == "os":
+    if tree is not None:
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name in OS_PROCESS_CALLS:
-                        risky_call_aliases[alias.asname or alias.name] = "subprocess/process access"
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            func_name = ""
-            owner = ""
-            is_attribute_call = isinstance(node.func, ast.Attribute)
-            if isinstance(node.func, ast.Name):
-                func_name = node.func.id
-                if func_name in risky_call_aliases:
-                    reasons.append(risky_call_aliases[func_name])
-            elif isinstance(node.func, ast.Attribute):
-                func_name = node.func.attr
-                if isinstance(node.func.value, ast.Name):
-                    owner = node.func.value.id
-                    owner_module = module_aliases.get(owner, owner)
-                    if owner_module == "os" and func_name in OS_PROCESS_CALLS:
+                    top_level = alias.name.split(".")[0]
+                    module_aliases[alias.asname or top_level] = top_level
+                    if alias.name in SUBPROCESS_IMPORTS or top_level in SUBPROCESS_IMPORTS:
                         reasons.append("subprocess/process access")
-            if func_name in DYNAMIC_EXECUTION_CALLS:
-                blocked.append(f"dynamic code execution via {func_name}()")
-            if func_name in WRITE_CALLS:
-                reasons.append("filesystem write or mutation")
-            if func_name == "open":
-                mode = "r"
-                mode_arg_index = 0 if is_attribute_call else 1
-                if len(node.args) > mode_arg_index and isinstance(node.args[mode_arg_index], ast.Constant) and isinstance(node.args[mode_arg_index].value, str):
-                    mode = node.args[mode_arg_index].value
-                for keyword in node.keywords:
-                    if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
-                        mode = keyword.value.value
-                if any(flag in mode for flag in ("w", "a", "x", "+")):
+                    if alias.name in NETWORK_IMPORTS or top_level in NETWORK_IMPORTS:
+                        reasons.append("network access")
+                    if alias.name in BLOCKED_IMPORTS or top_level in BLOCKED_IMPORTS:
+                        blocked.append(f"blocked import: {alias.name}")
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                module_name = node.module
+                top_level = module_name.split(".")[0]
+                if module_name in SUBPROCESS_IMPORTS or top_level in SUBPROCESS_IMPORTS:
+                    reasons.append("subprocess/process access")
+                if module_name in NETWORK_IMPORTS or top_level in NETWORK_IMPORTS:
+                    reasons.append("network access")
+                if module_name in BLOCKED_IMPORTS or top_level in BLOCKED_IMPORTS:
+                    blocked.append(f"blocked import: {module_name}")
+                if module_name == "os":
+                    for alias in node.names:
+                        if alias.name in OS_PROCESS_CALLS:
+                            risky_call_aliases[alias.asname or alias.name] = "subprocess/process access"
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func_name = ""
+                owner = ""
+                is_attribute_call = isinstance(node.func, ast.Attribute)
+                if isinstance(node.func, ast.Name):
+                    func_name = node.func.id
+                    if func_name in risky_call_aliases:
+                        reasons.append(risky_call_aliases[func_name])
+                elif isinstance(node.func, ast.Attribute):
+                    func_name = node.func.attr
+                    if isinstance(node.func.value, ast.Name):
+                        owner = node.func.value.id
+                        owner_module = module_aliases.get(owner, owner)
+                        if owner_module == "os" and func_name in OS_PROCESS_CALLS:
+                            reasons.append("subprocess/process access")
+                if func_name in DYNAMIC_EXECUTION_CALLS:
+                    blocked.append(f"dynamic code execution via {func_name}()")
+                if func_name in WRITE_CALLS:
                     reasons.append("filesystem write or mutation")
+                if func_name == "open":
+                    mode = "r"
+                    mode_arg_index = 0 if is_attribute_call else 1
+                    if len(node.args) > mode_arg_index and isinstance(node.args[mode_arg_index], ast.Constant) and isinstance(node.args[mode_arg_index].value, str):
+                        mode = node.args[mode_arg_index].value
+                    for keyword in node.keywords:
+                        if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
+                            mode = keyword.value.value
+                    if any(flag in mode for flag in ("w", "a", "x", "+")):
+                        reasons.append("filesystem write or mutation")
 
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            text = node.value
-            if text.startswith("~"):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                text = node.value
+                if text.startswith("~"):
+                    reasons.append("home-directory access")
+                path = Path(text)
+                if path.is_absolute() and not path_in_approved_roots(path):
+                    reasons.append(f"absolute path outside approved roots: {text}")
+
+            if isinstance(node, ast.Attribute) and node.attr in {"home", "expanduser"}:
                 reasons.append("home-directory access")
-            path = Path(text)
-            if path.is_absolute() and not path_in_approved_roots(path):
-                reasons.append(f"absolute path outside approved roots: {text}")
-
-        if isinstance(node, ast.Attribute) and node.attr in {"home", "expanduser"}:
-            reasons.append("home-directory access")
 
     if blocked:
         unique_blocked = sorted(set(blocked))
@@ -1081,8 +1140,9 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         cwd=ROOT_DIR,
         input=json.dumps(arguments),
         text=True,
+        encoding="utf-8",
         capture_output=True,
-        timeout=30,
+        timeout=120,
         check=False,
     )
     return {
@@ -1335,7 +1395,9 @@ async def save_memory(request: MemorySaveRequest) -> JSONResponse:
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(BASE_DIR / "index.html")
+    from starlette.responses import FileResponse as FR
+    headers = {"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"}
+    return FR(BASE_DIR / "index.html", headers=headers)
 
 
 @app.get("/tools")
@@ -1605,6 +1667,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             conversation.append({"role": "tool", "content": json.dumps(result)})
                             continue
                     requires_approval = bool(tool is not None and tool.get("requires_approval"))
+                    if request.auto_approve:
+                        requires_approval = False
                     if policy is not None and policy["action"] == "require_approval":
                         requires_approval = True
                     if requires_approval:
@@ -1668,6 +1732,10 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
+                # If the model already answered in this response (display_text non-empty),
+                # skip remaining iterations to avoid duplicating the answer.
+                if display_text.strip():
+                    break
             # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id})
         except Exception as exc:

@@ -4,120 +4,328 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ouroboros</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>
     :root {
       color-scheme: dark;
       --black: #0A0A0A;
+      --surface: #111111;
       --white: #FFFFFF;
       --gray-1: #1A1A1A;
-      --gray-2: #2A2A2A;
+      --gray-2: #222222;
       --gray-3: #6B6B6B;
       --gray-4: #ABABAB;
+      --gray-5: #333333;
+      --mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+      --sans: 'Inter', system-ui, -apple-system, sans-serif;
+      --sidebar-w: 280px;
+      --topbar-h: 56px;
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      margin: 0;
       background: var(--black);
       color: var(--white);
-      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      letter-spacing: 0;
+      font-family: var(--sans);
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
     }
 
-    button,
-    input,
-    textarea,
-    select {
-      font: inherit;
-    }
+    button, input, textarea, select { font: inherit; border-radius: 0; }
 
-    button,
-    input,
-    select,
-    textarea {
-      border-radius: 0;
-    }
-
+    /* ── LAYOUT ── */
     .app {
       display: grid;
-      grid-template-columns: 1fr 320px;
-      min-height: 100vh;
-      background: var(--black);
+      grid-template-columns: var(--sidebar-w) 1fr;
+      height: 100vh;
+      overflow: hidden;
     }
 
+    .app.sidebar-collapsed { grid-template-columns: 0 1fr; }
+    .app.sidebar-collapsed .sidebar { transform: translateX(calc(-1 * var(--sidebar-w))); opacity: 0; pointer-events: none; }
+
+    /* ── SIDEBAR (left) ── */
     .sidebar {
-      border-left: 1px solid var(--gray-2);
+      background: var(--surface);
+      border-right: 1px solid var(--gray-2);
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      height: 100vh;
+      overflow: hidden;
+      transition: transform 0.2s ease, opacity 0.2s ease;
+    }
+
+    .sidebar-header {
+      padding: 16px 16px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--gray-2);
+    }
+
+    .sidebar-header .brand {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--gray-4);
+    }
+
+    .sidebar-actions {
+      display: grid;
+      gap: 4px;
+      padding: 12px 12px 8px;
+    }
+
+    .sidebar-actions button {
+      width: 100%;
+      text-align: left;
+      padding: 8px 12px;
+      font-size: 13px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--gray-4);
+      cursor: pointer;
+      transition: background 0.12s, color 0.12s;
+    }
+
+    .sidebar-actions button:hover {
       background: var(--gray-1);
-      padding: 16px;
+      color: var(--white);
+    }
+
+    .sidebar-scroll {
       overflow-y: auto;
+      padding: 0 12px 12px;
     }
 
-    .sidebar.closed {
-      display: none;
+    .section-title {
+      color: var(--gray-3);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      margin: 16px 0 8px 4px;
     }
 
+    .memory-item {
+      padding: 10px 12px;
+      margin-bottom: 4px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: var(--gray-4);
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1.45;
+      transition: background 0.12s, border-color 0.12s;
+      width: 100%;
+      text-align: left;
+    }
+
+    .memory-item:hover { background: var(--gray-1); border-color: var(--gray-2); }
+    .memory-item.active { border-color: var(--gray-3); color: var(--white); background: var(--gray-1); }
+
+    .memory-item strong {
+      display: block;
+      color: var(--white);
+      margin-bottom: 4px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    /* ── MAIN ── */
     .main {
       display: grid;
-      grid-template-rows: auto 1fr auto;
-      min-width: 0;
+      grid-template-rows: var(--topbar-h) 1fr auto;
       height: 100vh;
+      min-width: 0;
+      overflow: hidden;
     }
 
-    .topbar,
-    .context-strip,
-    .composer {
-      border-bottom: 1px solid var(--gray-2);
-      padding: 12px 16px;
-      background: var(--black);
-    }
-
-    .composer {
-      border-top: 1px solid var(--gray-2);
-      border-bottom: 0;
-    }
-
+    /* ── TOPBAR ── */
     .topbar {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      gap: 12px;
+      padding: 0 20px;
+      border-bottom: 1px solid var(--gray-2);
+      background: var(--black);
+      height: var(--topbar-h);
     }
 
-    .brand {
-      font-size: 14px;
-      font-weight: 700;
-      text-transform: uppercase;
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
     }
+
+    .topbar-left .brand {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+    }
+
+    .sidebar-toggle {
+      background: none;
+      border: 1px solid var(--gray-2);
+      color: var(--gray-4);
+      width: 36px;
+      height: 36px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-size: 16px;
+      padding: 0;
+      min-height: 0;
+      transition: color 0.12s, border-color 0.12s;
+    }
+
+    .sidebar-toggle:hover { color: var(--white); border-color: var(--gray-3); }
 
     .controls {
       display: flex;
       align-items: center;
-      gap: 8px;
+      gap: 10px;
     }
 
-    .output {
-      overflow-y: auto;
-      padding: 24px;
-    }
-
-    .message {
-      max-width: 920px;
-      margin: 0 0 18px;
+    .controls select {
+      background: var(--gray-1);
       border: 1px solid var(--gray-2);
-      padding: 14px;
-      white-space: pre-wrap;
-      line-height: 1.5;
+      color: var(--white);
+      padding: 7px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      min-height: 0;
+      height: 36px;
+    }
+
+    .controls button {
+      background: var(--gray-1);
+      border: 1px solid var(--gray-2);
+      color: var(--gray-4);
+      padding: 7px 14px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+      min-height: 0;
+      height: 36px;
+      transition: color 0.12s, background 0.12s;
+    }
+
+    .controls button:hover { background: var(--gray-2); color: var(--white); }
+
+    /* ── TOGGLE ── */
+    .toggle-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      text-transform: uppercase;
+      color: var(--gray-3);
+      letter-spacing: 0.5px;
+      font-weight: 500;
+    }
+
+    .toggle-switch {
+      position: relative;
+      width: 32px;
+      height: 18px;
+      cursor: pointer;
+    }
+
+    .toggle-switch input { opacity: 0; width: 0; height: 0; position: absolute; }
+
+    .toggle-track {
+      position: absolute;
+      inset: 0;
+      background: var(--gray-2);
+      border: 1px solid var(--gray-3);
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .toggle-track::after {
+      content: '';
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 12px;
+      height: 12px;
+      background: var(--gray-4);
+      transition: transform 0.15s, background 0.15s;
+    }
+
+    .toggle-switch input:checked + .toggle-track {
+      background: var(--white);
+      border-color: var(--white);
+    }
+
+    .toggle-switch input:checked + .toggle-track::after {
+      transform: translateX(14px);
       background: var(--black);
     }
 
+    .toggle-label-auto {
+      color: var(--gray-3);
+      transition: color 0.15s;
+    }
+
+    .toggle-label-auto.active {
+      color: var(--white);
+      font-weight: 700;
+    }
+
+    /* ── OUTPUT ── */
+    .output {
+      overflow-y: auto;
+      padding: 24px 32px;
+      scroll-behavior: smooth;
+    }
+
+    .message {
+      max-width: 780px;
+      margin: 0 auto 20px;
+      padding: 16px 20px;
+      border-left: 2px solid var(--gray-2);
+      background: transparent;
+      white-space: pre-wrap;
+      word-break: break-word;
+      line-height: 1.65;
+      font-size: 14px;
+      animation: msgIn 0.2s ease;
+    }
+
+    @keyframes msgIn {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .message.user-msg { border-left-color: var(--gray-3); }
+    .message.assistant-msg { border-left-color: var(--white); }
+    .message.system-msg { border-left-color: var(--gray-5); }
+    .message.tool-msg { border-left-color: var(--gray-3); background: var(--surface); }
+    .message.approval-msg { border-left-color: var(--white); border: 1px solid var(--gray-3); background: var(--surface); }
+
     .role {
-      color: var(--gray-4);
-      font-size: 12px;
+      color: var(--gray-3);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 1px;
       margin-bottom: 8px;
       text-transform: uppercase;
+    }
+
+    .message.assistant-msg .role { color: var(--gray-4); }
+
+    /* ── COMPOSER ── */
+    .composer-area {
+      border-top: 1px solid var(--gray-2);
+      background: var(--black);
+      padding: 16px 32px 20px;
     }
 
     .context-strip {
@@ -125,71 +333,149 @@
       align-items: center;
       gap: 8px;
       overflow-x: auto;
-      min-height: 48px;
+      padding-bottom: 10px;
     }
 
     .chip {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 6px;
       border: 1px solid var(--gray-2);
-      padding: 6px 8px;
-      color: var(--white);
+      padding: 4px 10px;
+      color: var(--gray-4);
       background: var(--gray-1);
       white-space: nowrap;
-      font-size: 12px;
+      font-size: 11px;
+      cursor: pointer;
+      transition: border-color 0.12s;
     }
 
-    .input-row {
+    .chip:hover { border-color: var(--gray-3); color: var(--white); }
+
+    .composer {
       display: grid;
-      grid-template-columns: 1fr auto;
-      gap: 8px;
+      grid-template-columns: auto 1fr auto;
+      gap: 10px;
+      align-items: end;
     }
+
+    .file-label {
+      border: 1px solid var(--gray-2);
+      background: var(--gray-1);
+      color: var(--gray-3);
+      padding: 10px 14px;
+      cursor: pointer;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      height: 44px;
+      display: flex;
+      align-items: center;
+      transition: color 0.12s;
+    }
+
+    .file-label:hover { color: var(--white); }
+
+    input[type="file"] { display: none; }
 
     textarea {
       width: 100%;
-      min-height: 72px;
-      max-height: 220px;
-      resize: vertical;
+      min-height: 44px;
+      max-height: 200px;
+      resize: none;
       border: 1px solid var(--gray-2);
-      background: var(--gray-1);
+      background: var(--surface);
       color: var(--white);
-      padding: 12px;
+      padding: 10px 14px;
       outline: none;
+      font-size: 14px;
+      line-height: 1.5;
+      transition: border-color 0.12s;
     }
 
+    textarea:focus { border-color: var(--gray-3); }
+
+    #send {
+      background: var(--white);
+      color: var(--black);
+      border: none;
+      padding: 10px 20px;
+      font-size: 12px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      cursor: pointer;
+      height: 44px;
+      transition: opacity 0.12s;
+    }
+
+    #send:hover { opacity: 0.85; }
+    #send:disabled { opacity: 0.3; cursor: not-allowed; }
+
+    .status {
+      color: var(--gray-3);
+      font-size: 11px;
+      padding: 6px 0 0;
+      min-height: 20px;
+      letter-spacing: 0.3px;
+    }
+
+    /* ── JSON blocks ── */
+    .json-toggle {
+      cursor: pointer;
+      user-select: none;
+      padding: 6px 10px;
+      margin: 8px 0 0;
+      font-size: 11px;
+      font-family: var(--mono);
+      color: var(--gray-3);
+      background: var(--gray-1);
+      border: 1px solid var(--gray-2);
+      transition: color 0.12s;
+    }
+
+    .json-toggle:hover { color: var(--gray-4); }
+
+    .json-pre {
+      font-size: 11px;
+      font-family: var(--mono);
+      margin: 0;
+      padding: 8px 10px;
+      border: 1px solid var(--gray-2);
+      border-top: none;
+      background: var(--gray-1);
+      overflow-x: auto;
+      line-height: 1.5;
+      color: var(--gray-4);
+    }
+
+    /* ── INPUTS ── */
     input[type="password"],
     input[type="text"],
     input[type="number"] {
       width: 100%;
       border: 1px solid var(--gray-2);
-      background: var(--gray-1);
+      background: var(--surface);
       color: var(--white);
-      padding: 10px 12px;
+      padding: 9px 12px;
       outline: none;
+      font-size: 13px;
+      transition: border-color 0.12s;
     }
 
-    textarea:focus,
-    input:focus,
-    button:focus,
-    select:focus {
-      outline: 1px solid var(--white);
-      outline-offset: 2px;
-    }
+    input:focus { border-color: var(--gray-3); }
 
-    button,
-    select,
-    .file-label {
+    button:not(#send),
+    select {
       border: 1px solid var(--gray-2);
       background: var(--gray-1);
       color: var(--white);
-      padding: 10px 12px;
+      padding: 8px 12px;
       cursor: pointer;
-      min-height: 40px;
+      font-size: 13px;
     }
 
-    button:hover,
-    .file-label:hover,
+    button:not(#send):hover,
     select:hover {
       background: var(--gray-2);
     }
@@ -199,74 +485,22 @@
       cursor: not-allowed;
     }
 
-    input[type="file"] {
-      display: none;
-    }
-
-    .memory-item {
-      border: 1px solid var(--gray-2);
-      padding: 10px;
-      margin-bottom: 10px;
-      background: var(--black);
-      color: var(--gray-4);
-      cursor: pointer;
-      font-size: 13px;
-      line-height: 1.4;
-    }
-
-    .memory-item strong {
-      display: block;
-      color: var(--white);
-      margin-bottom: 6px;
-      font-size: 12px;
-    }
-
-    .memory-item.active {
-      border-color: var(--white);
-      color: var(--white);
-    }
-
-    .sidebar-controls {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin: 0 0 12px;
-    }
-
-    .sidebar-controls button:first-child {
-      grid-column: 1 / -1;
-    }
-
-    .section-title {
-      color: var(--gray-4);
-      font-size: 11px;
-      margin: 14px 0 8px;
-      text-transform: uppercase;
-    }
-
-    .status {
-      color: var(--gray-4);
-      font-size: 12px;
-      padding: 8px 0 0;
-      min-height: 24px;
-    }
-
+    /* ── SETTINGS PANEL ── */
     .settings-panel {
       position: fixed;
       inset: 0;
       display: none;
       align-items: stretch;
       justify-content: flex-end;
-      background: rgba(10, 10, 10, 0.78);
+      background: rgba(10, 10, 10, 0.82);
       z-index: 10;
+      backdrop-filter: blur(4px);
     }
 
-    .settings-panel.open {
-      display: flex;
-    }
+    .settings-panel.open { display: flex; }
 
     .settings-content {
-      width: min(520px, 100vw);
+      width: min(480px, 100vw);
       height: 100vh;
       background: var(--black);
       border-left: 1px solid var(--gray-2);
@@ -282,30 +516,25 @@
       align-content: start;
     }
 
-    .field {
-      display: grid;
-      gap: 8px;
-    }
+    .field { display: grid; gap: 6px; }
 
     .field label {
-      color: var(--gray-4);
-      font-size: 12px;
+      color: var(--gray-3);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 1px;
       text-transform: uppercase;
     }
 
     .provider-card {
       border: 1px solid var(--gray-2);
-      padding: 12px;
+      padding: 14px;
       display: grid;
       gap: 12px;
-      background: var(--gray-1);
+      background: var(--surface);
     }
 
-    .actions {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-    }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
 
     .field-grid {
       display: grid;
@@ -314,8 +543,8 @@
     }
 
     .help-text {
-      color: var(--gray-4);
-      font-size: 12px;
+      color: var(--gray-3);
+      font-size: 11px;
       line-height: 1.5;
     }
 
@@ -328,36 +557,70 @@
       text-transform: uppercase;
     }
 
+    .sidebar-controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 4px;
+      margin: 0;
+    }
+
+    .sidebar-controls button:first-child { grid-column: 1 / -1; }
+
+    /* ── RESPONSIVE ── */
     @media (max-width: 760px) {
-      .app {
-        grid-template-columns: 1fr;
-      }
-
+      :root { --sidebar-w: 240px; }
+      .app { grid-template-columns: 1fr; }
+      .app.sidebar-collapsed .sidebar { transform: translateX(-100%); }
       .sidebar {
-        max-height: 35vh;
-        border-right: 0;
-        border-bottom: 1px solid var(--gray-2);
+        position: fixed;
+        left: 0;
+        top: 0;
+        width: var(--sidebar-w);
+        z-index: 20;
       }
-
-      .controls {
-        flex-wrap: wrap;
-        justify-content: flex-end;
-      }
-
-      .input-row {
-        grid-template-columns: 1fr;
-      }
+      .output { padding: 16px; }
+      .composer-area { padding: 12px 16px 16px; }
+      .composer { grid-template-columns: 1fr auto; }
+      .file-label { display: none; }
     }
   </style>
 </head>
 <body>
-  <div class="app">
+  <div class="app sidebar-collapsed">
+    <aside id="memorySidebar" class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand">Ouroboros</div>
+        <button id="refreshMemory" type="button" style="padding:4px 10px;font-size:11px;min-height:0;height:28px;">Refresh</button>
+      </div>
+      <div class="sidebar-actions">
+        <button id="newSession" type="button">New session</button>
+        <button id="previousSession" type="button">Previous session</button>
+        <button id="nextSession" type="button">Next session</button>
+        <button id="saveSession" type="button">Save to memory</button>
+      </div>
+      <div class="sidebar-scroll">
+        <div class="section-title">Threads</div>
+        <div id="sessionList"></div>
+        <div class="section-title">Episodic Memory</div>
+        <div id="memoryList"></div>
+      </div>
+    </aside>
+
     <main class="main">
       <header class="topbar">
-        <div class="brand">Ouroboros</div>
+        <div class="topbar-left">
+          <button id="toggleMemory" type="button" class="sidebar-toggle" title="Toggle sidebar">&#9776;</button>
+          <div class="brand">Ouroboros</div>
+        </div>
         <div class="controls">
-          <button id="saveSession" type="button">Save Session</button>
-          <button id="toggleMemory" type="button">Memory</button>
+          <div class="toggle-row">
+            <span>Manual</span>
+            <label class="toggle-switch">
+              <input id="autoApproveToggle" type="checkbox">
+              <span class="toggle-track"></span>
+            </label>
+            <span id="autoApproveLabel" class="toggle-label-auto">Auto</span>
+          </div>
           <button id="openSettings" type="button">Settings</button>
           <select id="model">
             <option value="openai-fast">openai-fast</option>
@@ -373,42 +636,23 @@
       </header>
 
       <section id="output" class="output" aria-live="polite">
-        <div class="message">
+        <div class="message system-msg">
           <div class="role">System</div>
           Ouroboros nucleus is ready.
         </div>
       </section>
 
-      <section>
-        <div id="contextStrip" class="context-strip">
-          <label class="file-label" for="fileInput">Add file</label>
-          <input id="fileInput" type="file">
-        </div>
+      <section class="composer-area">
+        <div id="contextStrip" class="context-strip"></div>
         <form id="composer" class="composer">
-          <div class="input-row">
-            <textarea id="prompt" placeholder="Message Ouroboros"></textarea>
-            <button id="send" type="submit">SEND</button>
-          </div>
-          <div id="status" class="status"></div>
+          <label class="file-label" for="fileInput">+ File</label>
+          <input id="fileInput" type="file">
+          <textarea id="prompt" placeholder="Message Ouroboros..." rows="1"></textarea>
+          <button id="send" type="submit">Send</button>
         </form>
+        <div id="status" class="status"></div>
       </section>
     </main>
-
-    <aside id="memorySidebar" class="sidebar">
-      <div class="topbar" style="padding:0 0 12px;border-bottom:0;">
-        <div class="brand">Memory</div>
-        <button id="refreshMemory" type="button">Refresh</button>
-      </div>
-      <div class="sidebar-controls" aria-label="Session navigation">
-        <button id="newSession" type="button">New Session</button>
-        <button id="previousSession" type="button">Previous Session</button>
-        <button id="nextSession" type="button">Next Session</button>
-      </div>
-      <div class="section-title">Conversation Threads</div>
-      <div id="sessionList"></div>
-      <div class="section-title">Episodic Memory Snippets</div>
-      <div id="memoryList"></div>
-    </aside>
   </div>
 
   <section id="settingsPanel" class="settings-panel" aria-hidden="true">
@@ -523,6 +767,12 @@
     const newProviderModels = document.getElementById('newProviderModels');
     const newProviderModelsPath = document.getElementById('newProviderModelsPath');
     const newProviderKey = document.getElementById('newProviderKey');
+    const autoApproveToggle = document.getElementById('autoApproveToggle');
+    const autoApproveLabel = document.getElementById('autoApproveLabel');
+
+    autoApproveToggle.addEventListener('change', () => {
+      autoApproveLabel.classList.toggle('active', autoApproveToggle.checked);
+    });
 
     const messages = [];
     const contextFiles = [];
@@ -541,9 +791,18 @@
       statusNode.textContent = text;
     }
 
+    function msgClass(role) {
+      const r = role.toLowerCase();
+      if (r === 'user') return 'user-msg';
+      if (r === 'ouroboros' || r === 'assistant') return 'assistant-msg';
+      if (r === 'system') return 'system-msg';
+      if (r.includes('tool')) return 'tool-msg';
+      return '';
+    }
+
     function addMessage(role, html) {
       const node = document.createElement('div');
-      node.className = 'message';
+      node.className = `message ${msgClass(role)}`;
       node.innerHTML = `<div class="role">${role}</div><div class="content">${html}</div>`;
       output.appendChild(node);
       output.scrollTop = output.scrollHeight;
@@ -552,7 +811,7 @@
 
     function addTextMessage(role, text) {
       const node = document.createElement('div');
-      node.className = 'message';
+      node.className = `message ${msgClass(role)}`;
       const roleNode = document.createElement('div');
       roleNode.className = 'role';
       roleNode.textContent = role;
@@ -567,11 +826,15 @@
     }
 
     function renderJsonBlock(role, data) {
-      const pre = document.createElement('pre');
-      pre.textContent = JSON.stringify(data, null, 2);
-      const node = document.createElement('div');
-      node.appendChild(pre);
-      addMessage(role, node.innerHTML);
+      const id = 'jb-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+      const content = JSON.stringify(data, null, 2);
+      const escaped = content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const html =
+        '<div class="json-toggle" data-target="' + id + '">' +
+        '[\u002B] <span style="color:var(--gray-3)">raw</span>' +
+        '</div><pre id="' + id + '" class="json-pre" style="display:none">' +
+        escaped + '</pre>';
+      addMessage(role, html);
     }
 
     function addChip(item) {
@@ -593,15 +856,27 @@
       return `session-${Date.now()}`;
     }
 
+    function stripToolCalls(text) {
+      return text.replace(/<tool_call>[\s\S]*?(?:<\/tool_call>|$)/g, '');
+    }
+
     function renderLoadedMessages(loadedMessages) {
       messages.length = 0;
       output.innerHTML = '';
       for (const m of loadedMessages) {
         messages.push(m);
         if (m.role === 'user') addTextMessage('User', m.content);
-        else if (m.role === 'assistant') addTextMessage('Ouroboros', m.content);
+        else if (m.role === 'assistant') addTextMessage('Ouroboros', stripToolCalls(m.content));
         else if (m.role === 'system') addTextMessage('System', m.content);
-        else if (m.role === 'tool') addMessage('Tool result', `<pre style="font-size:11px;">${m.content}</pre>`);
+        else if (m.role === 'tool') {
+          const toolId = 'tl-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+          const escaped = m.content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+          addMessage('Tool result',
+            '<div class="json-toggle" data-target="' + toolId + '">' +
+            '[\u002B] <span style="color:var(--gray-3)">raw</span></div>' +
+            '<pre id="' + toolId + '" class="json-pre" style="display:none">' +
+            escaped + '</pre>');
+        }
       }
       if (!loadedMessages.length) addTextMessage('System', 'New session started.');
     }
@@ -667,7 +942,7 @@
           item.className = `memory-item${session.session_id === activeSessionId ? ' active' : ''}`;
           const updated = new Date(session.updated_at).toLocaleString();
           const summary = session.summary || session.session_id;
-          item.innerHTML = `<strong>${session.title || session.session_id}</strong>${updated}<br>${summary.length > 120 ? summary.substring(0, 120) + '...' : summary}`;
+          item.innerHTML = `<strong>${session.title || session.session_id}</strong><span style="font-size:10px;color:var(--gray-3);display:block;margin-bottom:6px;">${updated}</span><span style="color:var(--gray-4);line-height:1.4;">${summary.length > 100 ? summary.substring(0, 100) + '...' : summary}</span>`;
           item.addEventListener('click', async () => {
             try {
               await loadSession(session.session_id, true);
@@ -695,10 +970,15 @@
           const item = document.createElement('div');
           item.className = 'memory-item';
           
-          const created = document.createElement('strong');
+          const created = document.createElement('div');
+          created.style.fontSize = '10px';
+          created.style.color = 'var(--gray-3)';
+          created.style.marginBottom = '6px';
           created.textContent = new Date(memory.created_at).toLocaleString();
           
-          const summary = document.createElement('span');
+          const summary = document.createElement('div');
+          summary.style.color = 'var(--gray-4)';
+          summary.style.lineHeight = '1.4';
           summary.textContent = memory.summary.length > 100 ? memory.summary.substring(0, 100) + '...' : memory.summary;
           
           item.appendChild(created);
@@ -721,7 +1001,9 @@
           loadBtn.type = 'button';
           loadBtn.className = 'chip';
           loadBtn.style.marginTop = '8px';
-          loadBtn.textContent = 'LOAD THREAD';
+          loadBtn.style.width = '100%';
+          loadBtn.style.textAlign = 'center';
+          loadBtn.textContent = 'Load thread';
           loadBtn.onclick = async (e) => {
             e.stopPropagation();
             try {
@@ -979,8 +1261,7 @@
 
     function renderApprovalRequest(data) {
       const node = document.createElement('div');
-      node.className = 'message';
-      node.style.border = '1px solid var(--white)';
+      node.className = 'message approval-msg';
       const role = document.createElement('div');
       role.className = 'role';
       role.textContent = 'Approval Required';
@@ -1081,7 +1362,8 @@
           messages,
           model: modelSelect.value,
           provider: providerSelect.value || 'pollinations',
-          context_files: contextFiles
+          context_files: contextFiles,
+          auto_approve: autoApproveToggle.checked
         })
       });
 
@@ -1160,8 +1442,9 @@
     });
 
     toggleMemory.addEventListener('click', () => {
-      const isOpening = memorySidebar.classList.contains('closed');
-      memorySidebar.classList.toggle('closed');
+      const app = document.querySelector('.app');
+      const isOpening = app.classList.contains('sidebar-collapsed');
+      app.classList.toggle('sidebar-collapsed');
       if (isOpening) {
         refreshMemories();
       }
@@ -1236,6 +1519,22 @@
       setSettingsStatus('Settings saved.');
     });
     refreshMemory.addEventListener('click', refreshMemories);
+    // Delegated click for JSON block collapse/expand
+    output.addEventListener('click', function(e) {
+      const toggle = e.target.closest('.json-toggle');
+      if (!toggle) return;
+      const id = toggle.dataset.target;
+      const pre = document.getElementById(id);
+      if (!pre) return;
+      const hidden = pre.style.display === 'none';
+      pre.style.display = hidden ? '' : 'none';
+      toggle.firstChild.textContent = hidden ? '[\u002D]' : '[\u002B]';
+    });
+    // Auto-resize textarea
+    promptInput.addEventListener('input', () => {
+      promptInput.style.height = 'auto';
+      promptInput.style.height = Math.min(promptInput.scrollHeight, 200) + 'px';
+    });
     loadSettings().catch(() => {});
     startNewSession(false);
     refreshMemories();

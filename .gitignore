@@ -34,3 +34,4 @@ __pycache__
 AGENTS.md
 nucleus/kora/
 nucleus/facts.json
+nucleus/settings.json

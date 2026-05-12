@@ -50,48 +50,6 @@
         ]
       },
       "builtin": true,
-      "requires_approval": false
-    },
-    {
-      "name": "filesystem",
-      "description": "Universal file system access. Read, write, append, delete, list, create directories, copy, and move files/folders anywhere on your computer.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "action": {
-            "type": "string",
-            "enum": [
-              "read",
-              "write",
-              "append",
-              "delete",
-              "list",
-              "mkdir",
-              "copy",
-              "move"
-            ],
-            "description": "Operation to perform"
-          },
-          "path": {
-            "type": "string",
-            "description": "File or directory path (supports ~ for home directory)"
-          },
-          "content": {
-            "type": "string",
-            "description": "Content for write/append actions"
-          },
-          "target_path": {
-            "type": "string",
-            "description": "Destination path for copy/move actions"
-          }
-        },
-        "required": [
-          "action",
-          "path"
-        ]
-      },
-      "filepath": "filesystem_manager.py",
-      "builtin": false,
       "requires_approval": true
     }
   ]
