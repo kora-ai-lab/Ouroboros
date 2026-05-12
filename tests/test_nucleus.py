@@ -1,6 +1,8 @@
 import asyncio
 import json
+import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -63,8 +65,8 @@ def test_registry_loads_builtin_tools(tmp_path, monkeypatch):
     assert response.status_code == 200
     names = [tool["name"] for tool in response.json()["tools"]]
     assert "execute_python" in names
-    assert "rollback_latest_checkpoint" in names
     assert "register_tool" in names
+    assert "rollback_latest_checkpoint" not in names
 
 
 def test_execute_python_success():
@@ -170,6 +172,13 @@ print(json.dumps({'echo': args.get('message', '')}))
                 "version": "1.2.3",
                 "deprecated": False,
                 "deprecation_reason": "",
+                "permissions": {
+                    "filesystem": [],
+                    "network": [],
+                    "environment": [],
+                    "process": {"allow": False},
+                    "secrets": [],
+                },
             },
             indent=2,
         ),
@@ -180,6 +189,7 @@ print(json.dumps({'echo': args.get('message', '')}))
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 completed = subprocess.run(
@@ -319,6 +329,9 @@ def test_promote_tool_trust_blocks_undeclared_permission_use(tmp_path, monkeypat
         encoding="utf-8",
     )
     write_evals(package)
+def test_user_facing_tools_load_from_registry_while_kernel_services_remain_private(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    write_skill_package(tmp_path)
     server.register_tool(
         name="caps_echo",
         description="Echo a message from a local skill package",
@@ -332,6 +345,25 @@ def test_promote_tool_trust_blocks_undeclared_permission_use(tmp_path, monkeypat
     registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
     tool = next(tool for tool in registry["tools"] if tool["name"] == "caps_echo")
     assert tool["trusted"] is False
+    response = client.get("/tools")
+
+    assert response.status_code == 200
+    names = [tool["name"] for tool in response.json()["tools"]]
+    assert "caps_echo" in names
+    assert "execute_python" in names
+    assert "register_tool" in names
+    assert "rollback_latest_checkpoint" not in names
+    assert "read_memory" not in names
+    assert "write_memory" not in names
+    assert "enforce_python_policy" not in names
+    assert "load_task_state" not in names
+
+    dispatched = asyncio.run(server.KERNEL.dispatch_capability("caps_echo", {"message": "registry-ok"}))
+    assert dispatched["exit_code"] == 0
+    assert json.loads(dispatched["stdout"])["echo"] == "registry-ok"
+    private = asyncio.run(server.KERNEL.dispatch_capability("rollback_latest_checkpoint", {}))
+    assert "private kernel safety action" in private["error"]
+
 
 def test_skill_package_must_pass_tests_before_registration(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
@@ -492,6 +524,60 @@ def test_summarize_and_store_archives_when_provider_fails(tmp_path, monkeypatch)
     assert memories[0]["summary"] == f"Conversation session {session_id}"
 
 
+def test_enforce_memory_budget_compacts_old_sessions_and_keeps_summaries(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    settings = server.load_settings()
+    settings.update({
+        "memory_recent_days": 7,
+        "memory_max_raw_archive_mb": 0.001,
+        "memory_summary_target_tokens": 80,
+        "memory_cold_archive_compression": "zlib",
+    })
+    server.save_settings(settings)
+
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+    for index in range(12):
+        session_id = f"old-session-{index}"
+        messages = [
+            {"role": "user", "content": f"Remember durable fact Project-{index}: the migration decision must preserve queryable summaries. " * 80},
+            {"role": "assistant", "content": f"Decision recorded for Project-{index}; summary lookup keyword budgetneedle{index}. " * 80},
+        ]
+        archive = server.write_session_archive(
+            session_id,
+            messages,
+            summary=f"Project-{index} budgetneedle{index} retained summary with durable migration decision.",
+        )
+        archive["created_at"] = old_timestamp
+        archive["updated_at"] = old_timestamp
+        server.session_archive_path(session_id).write_text(json.dumps(archive, indent=2), encoding="utf-8")
+
+    recent_messages = [{"role": "user", "content": "Recent session should remain raw." * 20}]
+    server.write_session_archive("recent-session", recent_messages, summary="Recent raw summary")
+
+    result = server.enforce_memory_budget()
+
+    assert result["compacted_count"] > 0
+    recent_payload = json.loads(server.session_archive_path("recent-session").read_text(encoding="utf-8"))
+    assert recent_payload["messages"] == recent_messages
+
+    compacted_payload = json.loads(server.session_archive_path("old-session-0").read_text(encoding="utf-8"))
+    assert compacted_payload["messages"] == []
+    assert compacted_payload["raw_messages_compression"] == "zlib"
+    assert "durable_facts" in compacted_payload
+
+    with server.connect_db() as conn:
+        metadata_rows = conn.execute("SELECT * FROM memory_compaction").fetchall()
+    assert len(metadata_rows) == result["compacted_count"]
+    assert metadata_rows[0]["original_size"] > metadata_rows[0]["compressed_size"]
+    assert metadata_rows[0]["summary_path"].startswith("episodic_memory:")
+    assert metadata_rows[0]["last_accessed_at"]
+
+    restored = server.normalize_session_archive(server.session_archive_path("old-session-0"))
+    assert restored["messages"][0]["content"].startswith("Remember durable fact Project-0")
+    matches = server.retrieve_relevant("budgetneedle0 migration", limit=5)
+    assert "Project-0 budgetneedle0 retained summary" in matches
+
+
 def test_upload_text(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     response = client.post("/upload", files={"file": ("note.txt", b"hello", "text/plain")})
@@ -515,6 +601,37 @@ def test_chat_stream_uses_fake_adapter_and_saves_memory(tmp_path, monkeypatch):
     assert "Test response" in response.text
 
 
+def test_chat_stream_emits_task_protocol_events(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+        },
+    )
+
+    assert response.status_code == 200
+    for event_name in [
+        "task_started",
+        "task_plan",
+        "task_step",
+        "task_observation",
+        "task_evaluation",
+        "task_done",
+    ]:
+        assert f"event: {event_name}" in response.text
+    assert "event: delta" in response.text
+
+
+def test_chat_stream_emits_retry_event_for_self_evolution_retry(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        "I don't have internet access to search for current details.",
+        "Recovered after retry.",
+    ])
 def test_chat_evaluation_retry_performs_second_tool_call(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     first_call = json.dumps({"name": "execute_python", "arguments": {"code": "raise Exception(\"fail\")"}})
@@ -531,6 +648,10 @@ def test_chat_evaluation_retry_performs_second_tool_call(tmp_path, monkeypatch):
     response = client.post(
         "/chat",
         json={
+            "messages": [{"role": "user", "content": "Find current details"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
             "messages": [{"role": "user", "content": "run the fake task"}],
             "model": "openai-fast",
             "provider": "pollinations",
@@ -540,6 +661,16 @@ def test_chat_evaluation_retry_performs_second_tool_call(tmp_path, monkeypatch):
     )
 
     assert response.status_code == 200
+    assert "event: task_retry" in response.text
+    assert "capability_refusal" in response.text
+
+
+def test_chat_stream_emits_checkpoint_after_tool_result(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        '<tool_call>{"name":"execute_python","arguments":{"code":"print(1)"}}</tool_call>',
+        "Done with tool.",
+    ])
     assert response.text.count("event: tool_call") == 2
     assert '"decision": "retry"' in response.text
     assert '"decision": "final"' in response.text
@@ -562,6 +693,7 @@ def test_chat_evaluation_success_finalizes(tmp_path, monkeypatch):
     response = client.post(
         "/chat",
         json={
+            "messages": [{"role": "user", "content": "run a tool"}],
             "messages": [{"role": "user", "content": "run the fake task"}],
             "model": "openai-fast",
             "provider": "pollinations",
@@ -571,6 +703,9 @@ def test_chat_evaluation_success_finalizes(tmp_path, monkeypatch):
     )
 
     assert response.status_code == 200
+    assert "event: tool_call" in response.text
+    assert "event: tool_result" in response.text
+    assert "event: task_checkpoint" in response.text
     assert response.text.count("event: tool_call") == 1
     assert '"decision": "final"' in response.text
     assert "Final answer." in response.text
@@ -704,6 +839,56 @@ def test_execute_python_policy_assigns_sandbox_tiers():
     assert process_policy["process_risk"] is True
 
 
+
+
+def test_sandbox_worker_read_only_blocks_writes(tmp_path):
+    config = server.sandbox_worker.config_for_tier("read_only", workspace_root=Path.cwd())
+
+    result = asyncio.run(
+        server.sandbox_worker.run_sandboxed_python(
+            f"open({str(tmp_path / 'blocked.txt')!r}, 'w').write('blocked')",
+            config,
+        )
+    )
+
+    assert result["exit_code"] != 0
+    assert "read_only sandbox blocks filesystem writes" in result["stderr"]
+    assert result["sandbox"]["tier"] == "read_only"
+    assert result["sandbox"]["network_disabled"] is True
+    assert not (tmp_path / "blocked.txt").exists()
+
+
+def test_execute_python_workspace_write_allows_workspace_path(tmp_path, monkeypatch):
+    target = server.ROOT_DIR / "nucleus" / "data" / "workspace-write-test.txt"
+    if target.exists():
+        target.unlink()
+    code = f"from pathlib import Path\nPath({str(target)!r}).write_text('allowed', encoding='utf-8')"
+
+    try:
+        result = asyncio.run(server.execute_python(code, policy_approved=True))
+
+        assert result["exit_code"] == 0
+        assert target.read_text(encoding="utf-8") == "allowed"
+        assert result["sandbox"]["tier"] == "workspace_write"
+        assert str(server.ROOT_DIR.resolve()) in result["sandbox"]["allowed_roots"]
+    finally:
+        if target.exists():
+            target.unlink()
+
+
+def test_execute_python_host_full_requires_explicit_approval():
+    code = "import subprocess\nsubprocess.run(['true'])"
+
+    rejected = asyncio.run(server.execute_python(code))
+    approved = asyncio.run(server.execute_python(code, policy_approved=True))
+
+    assert rejected["exit_code"] == -1
+    assert rejected["policy"]["sandbox_tier"] == "host_full"
+    assert rejected["policy"]["manual_approval_required"] is False
+    assert approved["exit_code"] == 0
+    assert approved["sandbox"]["tier"] == "host_full"
+    assert approved["sandbox"]["network_disabled"] is False
+
 def test_execute_python_workspace_write_blocks_dynamic_outside_workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     target = tmp_path / "blocked.txt"
@@ -753,7 +938,10 @@ def test_checkpoint_restores_temp_file_after_mutation(tmp_path, monkeypatch):
     metadata_path = tmp_path / "data" / "checkpoints" / f"{result['checkpoint']['id']}.json"
     assert metadata_path.exists()
 
-    rollback = server.rollback_latest_checkpoint()
+    denied = server.rollback_latest_checkpoint()
+    assert "restricted" in denied["error"]
+
+    rollback = server.KERNEL.rollback_latest_checkpoint(caller="eval")
 
     assert rollback["checkpoint"]["id"] == result["checkpoint"]["id"]
     assert str(target) in rollback["restored"]
@@ -919,6 +1107,93 @@ def test_workspace_index_context_is_injected_into_system_prompt(tmp_path, monkey
     assert "WORKSPACE INDEX CONTEXT:" in prompt
     assert "plan.md" in prompt
     assert "task=task-context" in prompt
+def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "flaky_tool.py"
+    tool_path.write_text(
+        "import sys\nprint('broken', file=sys.stderr)\nsys.exit(1)\n",
+        encoding="utf-8",
+    )
+    registered = server.register_tool(
+        name="flaky_tool",
+        description="Return the provided value as JSON.",
+        parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+        filepath="tools/flaky_tool.py",
+        test_plan="Intentionally broken tool is exercised by repair retry test.",
+        test_plan="Exercise failing tool before model repair.",
+        test_plan="Intentional failure exercises repair loop.",
+        test_plan="Exercise repair loop with an intentionally failing tool.",
+    )
+    assert registered["registered"] == "flaky_tool"
+
+    patch_code = "\n".join(
+        [
+            "from pathlib import Path",
+            "Path('tools/flaky_tool.py').write_text(\"import json, sys\\nargs = json.loads(sys.stdin.read() or '{}')\\nprint(json.dumps({'status': 'ok', 'value': args.get('value')}))\\n\", encoding='utf-8')",
+        ]
+    )
+    adapter = SequenceAdapter(
+        [
+            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
+            f'<tool_call>{json.dumps({"name": "execute_python", "arguments": {"code": patch_code}})}</tool_call>',
+            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
+            "The repaired tool succeeded.",
+        ]
+    )
+    client.app.state.model_adapter = adapter
+
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
+            "auto_approve": True,
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+            "max_task_steps": 5,
+            "max_task_steps": 6,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: tool_repair" in response.text
+    assert "The repaired tool succeeded." in response.text
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
+    flaky = server.find_tool("flaky_tool")
+    assert flaky is not None
+    attempts = flaky["metadata"]["repair_attempts"]
+    assert len(attempts) == 1
+    repaired = server.run_registered_tool(flaky, {"value": "direct"})
+    assert repaired["exit_code"] == 0
+    assert json.loads(repaired["stdout"])["value"] == "direct"
+    assert "nonzero_exit" in response.text
+    assert "The repaired tool succeeded." in response.text
+    assert "second-run" in response.text
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert len(adapter.calls) == 4
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert "second-run" in response.text
+    assert len(adapter.calls) == 4
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
+
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
+    attempts = flaky["metadata"]["repair_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure"]["type"] == "nonzero_exit"
+
+    repaired = server.run_registered_tool(flaky, {"value": "direct"})
+    assert repaired["exit_code"] == 0
+    assert json.loads(repaired["stdout"])["value"] == "direct"
+
+
 def _run_git(repo: Path, *args: str) -> None:
     import subprocess
 
@@ -1006,6 +1281,15 @@ def test_chat_continues_until_final_answer(tmp_path, monkeypatch):
         '{"decision":"continue","rationale":"Run the second step."}',
         "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
         '{"decision":"final","rationale":"The result is sufficient."}',
+
+
+def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    adapter = SequenceAdapter([
+        "1. Run the first step\n2. Run the second step\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('one')\"}}</tool_call>",
+        '{"decision":"retry","rationale":"Run the second step."}',
+        "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
+        '{"decision":"final","rationale":"Both steps are complete."}',
         "Final answer after two observations.",
     ])
     client.app.state.model_adapter = adapter
@@ -1033,3 +1317,256 @@ def test_chat_continues_until_final_answer(tmp_path, monkeypatch):
     assert '"decision": "final"' in response.text
     assert "Final answer after two observations." in response.text
     assert len(adapter.calls) == 5
+    assert "event: task_plan" in response.text
+    assert "event: task_step" in response.text
+    assert "event: task_observation" in response.text
+    assert "Final answer after two observations." in response.text
+    assert len(adapter.calls) == 5
+
+    task_files = list((tmp_path / "data" / "tasks").glob("*.json"))
+    assert len(task_files) == 1
+    task_state = json.loads(task_files[0].read_text(encoding="utf-8"))
+    assert task_state["done"] is True
+    assert task_state["phase"] == "final"
+    assert len(task_state["steps"]) == 2
+    assert len(task_state["observations"]) == 2
+    assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
+
+
+
+def test_registered_tool_rejects_undeclared_filesystem_access(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    (package / "tool.py").write_text(
+        "from pathlib import Path\nprint(Path('outside.txt').read_text(encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "outside.txt").write_text("secret\n", encoding="utf-8")
+    (package / "tests.py").write_text("pass\n", encoding="utf-8")
+
+    server.register_tool(
+        name="caps_echo",
+        description="Attempts undeclared filesystem reads",
+        filepath="tools/caps_echo",
+    )
+    tool = next(tool for tool in json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))["tools"] if tool["name"] == "caps_echo")
+
+    result = server.run_registered_tool(tool, {})
+
+    assert result["exit_code"] != 0
+    assert "undeclared filesystem read access" in result["stderr"]
+    with sqlite3.connect(tmp_path / "data" / "memory.sqlite3") as conn:
+        row = conn.execute("SELECT tool_name, tool_version, result_status FROM tool_execution_audit").fetchone()
+    assert row == ("caps_echo", "1.2.3", "failed")
+
+
+def test_registered_tool_rejects_undeclared_network_access(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    (package / "tool.py").write_text(
+        "import socket\ns=socket.socket()\ns.connect(('127.0.0.1', 9))\n",
+        encoding="utf-8",
+    )
+    (package / "tests.py").write_text("pass\n", encoding="utf-8")
+
+    server.register_tool(
+        name="caps_echo",
+        description="Attempts undeclared network access",
+        filepath="tools/caps_echo",
+    )
+    tool = next(tool for tool in json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))["tools"] if tool["name"] == "caps_echo")
+
+    result = server.run_registered_tool(tool, {})
+
+    assert result["exit_code"] != 0
+    assert "undeclared network access" in result["stderr"]
+def test_parent_task_delegates_two_fake_subagents_with_isolation(tmp_path):
+    import subagents
+    from agent_loop import TaskState, save_task_state, load_task_state
+
+    parent = TaskState(goal="merge two isolated research results")
+    save_task_state(parent, tmp_path)
+    calls = []
+
+    class FakeSubagentAdapter:
+        def __init__(self, label):
+            self.responses = [
+                f"Use allowed tool only. <tool_call>{{\"name\":\"fake_tool\",\"arguments\":{{\"label\":\"{label}\"}}}}</tool_call>",
+                f"{label} final",
+            ]
+
+        async def complete(self, messages, model, provider):
+            joined = json.dumps(messages)
+            assert "parent-secret" not in joined
+            yield self.responses.pop(0)
+
+    def fake_runner(tool_name, arguments, spec):
+        calls.append({"tool_name": tool_name, "arguments": arguments, "scope": spec.memory_scope})
+        assert tool_name in spec.allowed_tools
+        assert spec.memory_scope == "provided_context_only"
+        return {"result": f"{arguments['label']}-result", "visible_context": spec.context}
+
+    specs = [
+        subagents.SubagentSpec(
+            goal="alpha",
+            context={"shared": "authorized"},
+            allowed_tools=["fake_tool"],
+            memory_scope="provided_context_only",
+            sandbox_tier="read_only",
+            max_steps=2,
+            parent_task_id=parent.task_id,
+        ),
+        subagents.SubagentSpec(
+            goal="beta",
+            context={"shared": "authorized"},
+            allowed_tools=["fake_tool"],
+            memory_scope="provided_context_only",
+            sandbox_tier="read_only",
+            max_steps=2,
+            parent_task_id=parent.task_id,
+        ),
+    ]
+    runs = [
+        subagents.run_subagent(specs[0], data_dir=tmp_path, model_adapter=FakeSubagentAdapter("alpha"), tool_runner=fake_runner),
+        subagents.run_subagent(specs[1], data_dir=tmp_path, model_adapter=FakeSubagentAdapter("beta"), tool_runner=fake_runner),
+    ]
+
+    reloaded_parent = load_task_state(tmp_path, parent.task_id)
+    assert reloaded_parent is not None
+    assert len(reloaded_parent.subagent_runs) == 2
+    merged = [run.result["answer"] for run in runs]
+    assert merged == ["alpha final", "beta final"]
+    assert [call["tool_name"] for call in calls] == ["fake_tool", "fake_tool"]
+    persisted = list((tmp_path / "subagents").glob("*.json"))
+    assert len(persisted) == 2
+
+
+def test_subagent_blocks_unauthorized_tool_and_does_not_run_it(tmp_path):
+    import subagents
+
+    class UnauthorizedToolAdapter:
+        async def complete(self, messages, model, provider):
+            yield '<tool_call>{"name":"secret_tool","arguments":{"secret":"steal"}}</tool_call>'
+
+    def forbidden_runner(tool_name, arguments, spec):
+        raise AssertionError("unauthorized tool should not execute")
+
+    spec = subagents.SubagentSpec(
+        goal="try unauthorized tool",
+        context={"authorized": "only"},
+        allowed_tools=["fake_tool"],
+        memory_scope="provided_context_only",
+        sandbox_tier="read_only",
+        max_steps=1,
+        parent_task_id="missing-parent-ok",
+    )
+    run = subagents.run_subagent(spec, data_dir=tmp_path, model_adapter=UnauthorizedToolAdapter(), tool_runner=forbidden_runner)
+
+    assert run.denied_tool_calls == [{"tool_name": "secret_tool", "arguments": {"secret": "steal"}}]
+    assert run.state.observations[0]["approved"] is False
+    assert "not allowed" in run.state.observations[0]["result"]["error"]
+def write_archive(tmp_path: Path, session_id: str, created_at: str, content: str, summary: str = "") -> Path:
+    path = tmp_path / "data" / "archive" / f"{session_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session_id": session_id,
+        "type": "conversation_thread",
+        "title": content.split("\n", 1)[0][:80],
+        "summary": summary,
+        "messages": [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": "Captured durable memory details."},
+        ],
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def test_compacts_several_synthetic_old_sessions(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    write_archive(
+        tmp_path,
+        "old-alpha",
+        "2015-02-03T00:00:00+00:00",
+        "Project Alpha with Kora Lab. We decided to keep the SQLite memory schema. TODO: follow up with migration notes.",
+    )
+    write_archive(
+        tmp_path,
+        "old-beta",
+        "2014-07-08T00:00:00+00:00",
+        "Project Beta with Ada Lovelace. Decision: selected archive compaction. Next step: test recall.",
+    )
+    write_archive(
+        tmp_path,
+        "recent-gamma",
+        "2026-05-01T00:00:00+00:00",
+        "Project Gamma is too recent to compact.",
+    )
+
+    response = client.post("/memory/compact", json={"cutoff_days": 365, "limit": 10})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["compacted_count"] == 2
+    assert {item["session_id"] for item in body["compacted"]} == {"old-alpha", "old-beta"}
+    assert (tmp_path / "data" / "archive" / "old-alpha.json").exists()
+    with server.connect_db() as conn:
+        summaries = conn.execute("SELECT session_id, durable_decisions, follow_up_tasks FROM memory_summary ORDER BY session_id").fetchall()
+        timeline = conn.execute("SELECT session_id, event_date FROM memory_timeline ORDER BY session_id").fetchall()
+    assert [row["session_id"] for row in summaries] == ["old-alpha", "old-beta"]
+    assert any("decided" in row["durable_decisions"].lower() for row in summaries)
+    assert any("follow" in row["follow_up_tasks"].lower() or "todo" in row["follow_up_tasks"].lower() for row in summaries)
+    assert [row["event_date"] for row in timeline] == ["2015-02-03", "2014-07-08"]
+
+
+def test_recall_retrieves_ten_year_old_project_by_date(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    write_archive(
+        tmp_path,
+        "ten-year-aurora",
+        "2016-04-20T00:00:00+00:00",
+        "Project Aurora with Kora Lab and Marie Curie. We decided to launch the sovereign memory prototype in 2016.",
+        summary="Project Aurora launched the sovereign memory prototype.",
+    )
+    write_archive(
+        tmp_path,
+        "nine-year-nebula",
+        "2017-04-20T00:00:00+00:00",
+        "Project Nebula explored unrelated UI work.",
+    )
+    assert client.post("/memory/compact", json={"cutoff_days": 365}).status_code == 200
+
+    response = client.post("/memory/recall", json={"query": "what did we do 10 years ago?", "limit": 3})
+
+    assert response.status_code == 200
+    memories = response.json()["memories"]
+    assert memories
+    assert memories[0]["session_id"] == "ten-year-aurora"
+    assert memories[0]["type"] in {"timeline", "summary"}
+    assert "Aurora" in memories[0]["summary"] or "Aurora" in memories[0]["title"]
+
+
+def test_system_prompt_memory_context_stays_below_budget(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    huge_body = " ".join(["Project Atlas durable sovereign memory decision follow up"] * 500)
+    write_archive(
+        tmp_path,
+        "old-atlas",
+        "2016-01-01T00:00:00+00:00",
+        huge_body,
+        summary="Project Atlas compact summary. We decided to keep only compact memories. Follow up: verify prompt budget.",
+    )
+    server.compact_memory_archives(cutoff_days=365)
+
+    prompt = server.build_system_prompt(
+        server.ChatRequest(messages=[server.ChatMessage(role="user", content="what did we do 10 years ago on Project Atlas?")])
+    )
+    start = prompt.index("RECALLED RELEVANT MEMORIES:") + len("RECALLED RELEVANT MEMORIES:")
+    end = prompt.index("WORKSPACE INDEX CONTEXT:")
+    memory_context = prompt[start:end].strip()
+
+    assert "Project Atlas compact summary" in memory_context
+    assert len(memory_context) <= server.MEMORY_PROMPT_BUDGET_CHARS + 80
+    assert huge_body not in prompt
