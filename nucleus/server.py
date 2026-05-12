@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 import uuid
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -66,6 +67,10 @@ WORKSPACE_INDEX_GENERATED_DIRS = {"dist", "build", "target", "__pycache__", ".py
 WORKSPACE_INDEX_MAX_TEXT_BYTES = 256 * 1024
 WORKSPACE_INDEX_MAX_HASH_BYTES = 2 * 1024 * 1024
 EVALUATION_DECISIONS = {"continue", "retry", "register_tool", "rollback", "final"}
+MEMORY_PROMPT_BUDGET_CHARS = 2400
+MEMORY_RECALL_DEFAULT_LIMIT = 5
+MEMORY_COMPACTION_DEFAULT_CUTOFF_DAYS = 30
+
 
 MODEL_OPTIONS = {
     "pollinations": [
@@ -98,6 +103,10 @@ DEFAULT_SETTINGS = {
     "default_provider": "pollinations",
     "default_model": "openai-fast",
     "tool_repair_max_attempts": 2,
+    "memory_recent_days": 30,
+    "memory_max_raw_archive_mb": 256,
+    "memory_summary_target_tokens": 512,
+    "memory_cold_archive_compression": "zlib",
     "providers": {
         "pollinations": {
             "label": "Pollinations",
@@ -138,16 +147,8 @@ DEFAULT_REGISTRY = {
             "trusted": True,
         },
         {
-            "name": "rollback_latest_checkpoint",
-            "description": "Restore the latest file mutation checkpoint created before an approved risky Python execution.",
-            "parameters": {"type": "object", "properties": {}},
-            "builtin": True,
-            "requires_approval": True,
-        },
-        {
             "name": "register_tool",
             "description": "Permanently register a new skill package directory or legacy Python file. Skill packages live under nucleus/tools/ and contain tool.py, schema.json, README.md, tests.py, and metadata.json.",
-            "description": "Permanently register a tested Python file as a versioned tool.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -179,6 +180,71 @@ DEFAULT_REGISTRY = {
             "use_count": 0,
             "supersedes": None,
             "trusted": True,
+        },
+        {
+            "name": "delegate_subagent",
+            "description": "Delegate bounded work to an isolated subagent with constrained tools, memory scope, sandbox tier, and step limit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string"},
+                    "context": {},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                    "memory_scope": {"type": "string"},
+                    "sandbox_tier": {"type": "string"},
+                    "max_steps": {"type": "integer", "minimum": 1},
+                    "parent_task_id": {"type": "string"}
+                },
+                "required": ["goal", "parent_task_id"],
+            },
+            "filepath": "tools/delegate_subagent",
+            "package": True,
+            "package_dir": "tools/delegate_subagent",
+            "builtin": False,
+            "requires_approval": False,
+            "name": "mcp_bridge",
+            "description": "Generic bridge for configured MCP servers: list servers/tools/resources/prompts, read resources, and call arbitrary MCP tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["list_servers", "list_tools", "call_tool", "list_resources", "read_resource", "list_prompts"]},
+                    "server": {"type": "string"},
+                    "tool_name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                    "uri": {"type": "string"},
+                },
+                "required": ["operation"],
+                "additionalProperties": False,
+            },
+            "filepath": "tools/mcp_bridge",
+            "builtin": False,
+            "requires_approval": False,
+            "package": True,
+            "package_dir": "tools/mcp_bridge",
+            "metadata": {"version": "1.0.0", "deprecated": False, "deprecation_reason": "", "output_format": "json"},
+            "version": "1.0.0",
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "source_task_id": None,
+            "test_command": "python nucleus/tools/delegate_subagent/tests.py",
+            "test_plan": "Package tests cover subprocess delegation and JSON output.",
+            "sample_arguments": {
+                "goal": "summarize provided context",
+                "context": {"note": "sample"},
+                "allowed_tools": [],
+                "memory_scope": "provided_context_only",
+                "sandbox_tier": "read_only",
+                "max_steps": 1,
+                "parent_task_id": "sample-parent"
+            },
+            "test_command": "python nucleus/tools/mcp_bridge/tests.py",
+            "test_plan": "Package smoke test plus adapter unit tests cover generic MCP discovery and call dispatch.",
+            "sample_arguments": {"operation": "list_servers"},
+            "last_test_status": "pending",
+            "last_error": None,
+            "use_count": 0,
+            "supersedes": None,
+            "trusted": False,
         },
     ]
 }
@@ -333,6 +399,100 @@ class PendingApproval:
         self.process_risk = process_risk
         self.event = asyncio.Event()
         self.approved: bool | None = None
+
+
+class KernelBoundary:
+    """Private kernel boundary for services that should not become user-facing tools."""
+
+    SAFETY_CALLERS = {"policy", "eval"}
+
+    async def execute_python(self, code: str, *, policy_approved: bool = False) -> dict[str, Any]:
+        return await execute_python(code, policy_approved=policy_approved)
+
+    def register_tool(self, **kwargs: Any) -> dict[str, Any]:
+        return register_tool(**kwargs)
+
+    def read_memory(self, *, query: str = "", limit: int = 20) -> list[dict[str, Any]]:
+        with connect_db() as conn:
+            if query:
+                rows = conn.execute(
+                    "SELECT id, created_at, keywords, summary, session_id FROM episodic_memory "
+                    "WHERE keywords LIKE ? OR summary LIKE ? ORDER BY created_at DESC LIMIT ?",
+                    (f"%{query}%", f"%{query}%", max(1, min(limit, 100))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, created_at, keywords, summary, session_id FROM episodic_memory ORDER BY created_at DESC LIMIT ?",
+                    (max(1, min(limit, 100)),),
+                ).fetchall()
+        return [dict(row) for row in rows]
+
+    def write_memory(self, *, session_id: str, summary: str, keywords: str = "") -> str:
+        memory_id = str(uuid.uuid4())
+        with connect_db() as conn:
+            conn.execute(
+                "INSERT INTO episodic_memory (id, created_at, keywords, summary, session_id) VALUES (?, ?, ?, ?, ?)",
+                (memory_id, now_iso(), keywords, summary, session_id),
+            )
+            conn.commit()
+        return memory_id
+
+    def enforce_python_policy(self, code: str) -> dict[str, Any]:
+        return summarize_python_execution_policy(code)
+
+    def sandbox_environment(self, sandbox_tier: str) -> dict[str, str]:
+        return build_python_execution_env(sandbox_tier)
+
+    def load_task_state(self, task_id: str) -> TaskState | None:
+        return load_task_state(DATA_DIR, task_id)
+
+    def save_task_state(self, task_state: TaskState) -> None:
+        save_task_state(task_state, DATA_DIR)
+
+    def load_capability_registry(self) -> dict[str, Any]:
+        return load_registry()
+
+    async def dispatch_capability(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        policy_approved: bool = False,
+    ) -> dict[str, Any]:
+        if name == "execute_python":
+            return await self.execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+        if name == "register_tool":
+            return self.register_tool(
+                name=str(arguments.get("name", "")),
+                description=str(arguments.get("description", "")),
+                parameters_schema=arguments.get("parameters_schema", {}),
+                filepath=str(arguments.get("filepath", "")),
+                requires_approval=bool(arguments.get("requires_approval", False)),
+                version=str(arguments.get("version", "1.0.0")),
+                source_task_id=arguments.get("source_task_id"),
+                test_command=arguments.get("test_command"),
+                test_plan=arguments.get("test_plan"),
+                sample_arguments=arguments.get("sample_arguments"),
+                supersedes=arguments.get("supersedes"),
+            )
+        if name == "rollback_latest_checkpoint":
+            return {"error": "rollback_latest_checkpoint is a private kernel safety action, not a user-facing tool."}
+        tool = find_tool(name)
+        if tool is None:
+            return {"error": f"Tool {name} not found."}
+        if tool.get("builtin"):
+            return {"error": f"Builtin tool {name} is not implemented in dispatch loop."}
+        result = run_registered_tool(tool, arguments)
+        update_registered_tool_status(name, str(tool.get("version", "")), increment_use_count=True)
+        return result
+
+    def rollback_latest_checkpoint(self, *, caller: str) -> dict[str, Any]:
+        if caller not in self.SAFETY_CALLERS:
+            return {"error": "rollback_latest_checkpoint is restricted to the policy/eval layer."}
+        return checkpoints.restore_latest_checkpoint(data_dir=DATA_DIR)
+
+
+KERNEL = KernelBoundary()
 
 
 class ModelAdapter:
@@ -647,6 +807,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", DATA_DIR / "subagents", TOOLS_DIR, KORA_DIR):
     for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
@@ -720,6 +881,79 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS memory_summary (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                project_tags TEXT NOT NULL DEFAULT '[]',
+                people_entities TEXT NOT NULL DEFAULT '[]',
+                dates TEXT NOT NULL DEFAULT '[]',
+                durable_decisions TEXT NOT NULL DEFAULT '[]',
+                follow_up_tasks TEXT NOT NULL DEFAULT '[]',
+                source_archive TEXT NOT NULL,
+                compacted_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_event (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                source_archive TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_fact (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.6,
+                source_archive TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_timeline (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                entities TEXT NOT NULL DEFAULT '[]',
+                source_archive TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_archive_manifest (
+                session_id TEXT PRIMARY KEY,
+                archive_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                compacted_at TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                content_hash TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS tool_execution (
                 id TEXT PRIMARY KEY,
                 tool_name TEXT NOT NULL,
@@ -759,6 +993,43 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_kind ON workspace_index(kind)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_task ON workspace_index(last_seen_task_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_execution_audit (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_version TEXT NOT NULL,
+                arguments_hash TEXT NOT NULL,
+                permissions_used TEXT NOT NULL,
+                files_touched TEXT NOT NULL,
+                network_flag INTEGER NOT NULL,
+                process_flag INTEGER NOT NULL,
+                approval_id TEXT,
+                result_status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_execution_audit_tool ON tool_execution_audit(tool_name, tool_version)")
+            CREATE TABLE IF NOT EXISTS memory_compaction (
+                session_id TEXT PRIMARY KEY,
+                archive_path TEXT NOT NULL,
+                original_size INTEGER NOT NULL,
+                compressed_size INTEGER NOT NULL,
+                summary_id TEXT NOT NULL,
+                summary_path TEXT NOT NULL,
+                last_accessed_at TEXT NOT NULL,
+                compacted_at TEXT NOT NULL,
+                compression TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_compaction_last_accessed ON memory_compaction(last_accessed_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_summary_session ON memory_summary(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_event_occurred ON memory_event(occurred_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_fact_kind_value ON memory_fact(kind, value)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_timeline_date ON memory_timeline(event_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_archive_manifest_status ON memory_archive_manifest(status)")
         conn.commit()
 
 
@@ -978,29 +1249,336 @@ def extract_keywords(text: str) -> list[str]:
     })[:20]
 
 
-def retrieve_relevant(query: str, limit: int = 4) -> str:
-    query_words = set(extract_keywords(query))
-    if not query_words:
-        return ""
+
+def parse_json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+def memory_json(values: Sequence[str]) -> str:
+    seen: list[str] = []
+    for value in values:
+        cleaned = re.sub(r"\s+", " ", str(value)).strip()
+        if cleaned and cleaned.lower() not in {item.lower() for item in seen}:
+            seen.append(cleaned)
+    return json.dumps(seen[:20])
+
+
+def archive_content_hash(archive: dict[str, Any]) -> str:
+    stable = json.dumps(
+        {
+            "session_id": archive.get("session_id"),
+            "summary": archive.get("summary", ""),
+            "messages": archive.get("messages", []),
+            "created_at": archive.get("created_at"),
+            "updated_at": archive.get("updated_at"),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def parse_memory_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def session_text(messages: list[dict[str, Any]], max_chars: int = 12000) -> str:
+    lines = []
+    for message in messages:
+        role = str(message.get("role", "")).upper()
+        content = str(message.get("content", "")).strip()
+        if role and content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)[:max_chars]
+
+
+def split_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text) if part.strip()]
+
+
+def compact_summary_text(archive: dict[str, Any], text: str) -> str:
+    existing = str(archive.get("summary") or "").strip()
+    if existing:
+        return existing[:700]
+    sentences = split_sentences(text)
+    if not sentences:
+        return f"Conversation session {archive.get('session_id', 'unknown')}"
+    return " ".join(sentences[:4])[:700]
+
+
+def extract_dates_from_text(text: str, fallback_date: str) -> list[str]:
+    dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    years = re.findall(r"\b(?:19|20)\d{2}\b", text)
+    values = dates + [year for year in years if not any(date.startswith(year) for date in dates)]
+    if fallback_date:
+        values.append(fallback_date[:10])
+        values.append(fallback_date[:4])
+    return values
+
+
+def extract_entities_from_text(text: str) -> list[str]:
+    candidates = re.findall(r"\b(?:[A-Z][A-Za-z0-9&_.-]+(?:\s+|$)){1,4}", text)
+    ignored = {"USER", "ASSISTANT", "SYSTEM", "JSON", "TODO"}
+    entities: list[str] = []
+    for candidate in candidates:
+        cleaned = candidate.strip(" .,:;!?()[]{}\n\t")
+        if len(cleaned) < 3 or cleaned.upper() in ignored:
+            continue
+        if cleaned.lower() not in {item.lower() for item in entities}:
+            entities.append(cleaned)
+    return entities[:20]
+
+
+def extract_project_tags_from_text(text: str, entities: Sequence[str]) -> list[str]:
+    tags = re.findall(r"#([A-Za-z][A-Za-z0-9_-]{2,40})", text)
+    project_phrases = re.findall(r"\b(?:project|initiative|repo|app|tool)\s+([A-Z][A-Za-z0-9_-]+(?:\s+[A-Z][A-Za-z0-9_-]+){0,3})", text, flags=re.IGNORECASE)
+    tags.extend(project_phrases)
+    tags.extend(entity for entity in entities if any(word in entity.lower() for word in ("project", "lab", "kora", "ouroboros")))
+    return tags[:12]
+
+
+def extract_lines_matching(text: str, patterns: Sequence[str]) -> list[str]:
+    found: list[str] = []
+    for sentence in split_sentences(text):
+        lower = sentence.lower()
+        if any(pattern in lower for pattern in patterns):
+            found.append(sentence[:240])
+    return found[:12]
+
+
+def compact_archive_payload(archive: dict[str, Any], source_archive: Path) -> dict[str, Any]:
+    messages = archive.get("messages") if isinstance(archive.get("messages"), list) else []
+    text = session_text(messages)
+    combined = f"{archive.get('title', '')}\n{archive.get('summary', '')}\n{text}"
+    created_at = str(archive.get("created_at") or archive.get("updated_at") or now_iso())
+    event_date = (parse_memory_datetime(created_at) or datetime.now(timezone.utc)).date().isoformat()
+    summary = compact_summary_text(archive, combined)
+    entities = extract_entities_from_text(combined)
+    tags = extract_project_tags_from_text(combined, entities)
+    dates = extract_dates_from_text(combined, event_date)
+    decisions = extract_lines_matching(combined, ("decided", "decision", "we will", "we chose", "chose to", "selected", "agreed"))
+    tasks = extract_lines_matching(combined, ("todo", "follow up", "follow-up", "next step", "task:", "action item"))
+    return {
+        "session_id": str(archive.get("session_id") or source_archive.stem),
+        "created_at": created_at,
+        "updated_at": str(archive.get("updated_at") or created_at),
+        "summary": summary,
+        "project_tags": tags,
+        "people_entities": entities,
+        "dates": dates,
+        "durable_decisions": decisions,
+        "follow_up_tasks": tasks,
+        "source_archive": str(source_archive),
+        "event_date": event_date,
+        "title": str(archive.get("title") or derive_session_title(messages, str(archive.get("session_id") or source_archive.stem))),
+        "message_count": len(messages),
+        "content_hash": archive_content_hash(archive),
+    }
+
+
+def upsert_compacted_memory(compacted: dict[str, Any]) -> None:
+    compacted_at = now_iso()
+    session_id = compacted["session_id"]
     with connect_db() as conn:
-        rows = conn.execute("SELECT summary, keywords, created_at FROM episodic_memory").fetchall()
-    
-    scored = []
-    for row in rows:
-        mem_words = set(row["keywords"].split(","))
-        score = len(query_words & mem_words)
+        conn.execute("DELETE FROM memory_event WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM memory_fact WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM memory_timeline WHERE session_id = ?", (session_id,))
+        conn.execute(
+            """
+            INSERT INTO memory_summary (
+                id, session_id, created_at, updated_at, summary, project_tags, people_entities,
+                dates, durable_decisions, follow_up_tasks, source_archive, compacted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                summary=excluded.summary,
+                project_tags=excluded.project_tags,
+                people_entities=excluded.people_entities,
+                dates=excluded.dates,
+                durable_decisions=excluded.durable_decisions,
+                follow_up_tasks=excluded.follow_up_tasks,
+                source_archive=excluded.source_archive,
+                compacted_at=excluded.compacted_at
+            """,
+            (
+                str(uuid.uuid4()), session_id, compacted["created_at"], compacted["updated_at"], compacted["summary"],
+                memory_json(compacted["project_tags"]), memory_json(compacted["people_entities"]), memory_json(compacted["dates"]),
+                memory_json(compacted["durable_decisions"]), memory_json(compacted["follow_up_tasks"]), compacted["source_archive"], compacted_at,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO memory_event (id, session_id, occurred_at, title, description, source_archive, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), session_id, compacted["event_date"], compacted["title"], compacted["summary"], compacted["source_archive"], compacted_at),
+        )
+        conn.execute(
+            "INSERT INTO memory_timeline (id, session_id, event_date, title, summary, tags, entities, source_archive, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), session_id, compacted["event_date"], compacted["title"], compacted["summary"], memory_json(compacted["project_tags"]), memory_json(compacted["people_entities"]), compacted["source_archive"], compacted_at),
+        )
+        for kind, values in (
+            ("project_tag", compacted["project_tags"]),
+            ("entity", compacted["people_entities"]),
+            ("date", compacted["dates"]),
+            ("durable_decision", compacted["durable_decisions"]),
+            ("follow_up_task", compacted["follow_up_tasks"]),
+        ):
+            for value in values[:20]:
+                conn.execute(
+                    "INSERT INTO memory_fact (id, session_id, kind, value, confidence, source_archive, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), session_id, kind, value, 0.7, compacted["source_archive"], compacted_at),
+                )
+        conn.execute(
+            """
+            INSERT INTO memory_archive_manifest (session_id, archive_path, created_at, updated_at, compacted_at, message_count, status, content_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                archive_path=excluded.archive_path,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                compacted_at=excluded.compacted_at,
+                message_count=excluded.message_count,
+                status=excluded.status,
+                content_hash=excluded.content_hash
+            """,
+            (session_id, compacted["source_archive"], compacted["created_at"], compacted["updated_at"], compacted_at, compacted["message_count"], "compacted", compacted["content_hash"]),
+        )
+        conn.commit()
+
+
+def compact_memory_archives(cutoff_days: int = MEMORY_COMPACTION_DEFAULT_CUTOFF_DAYS, limit: int | None = None) -> dict[str, Any]:
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = datetime.now(timezone.utc).timestamp() - (cutoff_days * 86400)
+    compacted: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    paths = sorted(ARCHIVE_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime)
+    with connect_db() as conn:
+        manifest_rows = conn.execute("SELECT session_id, content_hash, status FROM memory_archive_manifest").fetchall()
+    manifest = {row["session_id"]: dict(row) for row in manifest_rows}
+    for path in paths:
+        if limit is not None and len(compacted) >= limit:
+            break
+        try:
+            archive = normalize_session_archive(path)
+            updated = parse_memory_datetime(archive.get("updated_at"))
+            updated_ts = updated.timestamp() if updated else path.stat().st_mtime
+            if updated_ts > cutoff:
+                skipped.append(path.stem)
+                continue
+            content_hash = archive_content_hash(archive)
+            existing = manifest.get(archive["session_id"])
+            if existing and existing.get("content_hash") == content_hash and existing.get("status") == "compacted":
+                skipped.append(path.stem)
+                continue
+            compacted_payload = compact_archive_payload(archive, path)
+            upsert_compacted_memory(compacted_payload)
+            compacted.append(compacted_payload)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            skipped.append(f"{path.stem}: {exc}")
+    return {"status": "compacted", "compacted_count": len(compacted), "skipped_count": len(skipped), "compacted": compacted, "skipped": skipped}
+
+
+def query_target_year(query: str, reference: datetime | None = None) -> int | None:
+    reference = reference or datetime.now(timezone.utc)
+    lower = query.lower()
+    match = re.search(r"\b(\d{1,3})\s+years?\s+ago\b", lower)
+    if match:
+        return reference.year - int(match.group(1))
+    match = re.search(r"\b(?:in|from|during)\s+((?:19|20)\d{2})\b", lower)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\b((?:19|20)\d{2})\b", lower)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def score_memory_text(query_words: set[str], text: str, target_year: int | None = None, date_text: str = "") -> int:
+    words = set(extract_keywords(text))
+    score = len(query_words & words) * 3
+    if target_year and (str(target_year) in text or str(target_year) in date_text):
+        score += 25
+    return score
+
+
+def recall_memories(query: str, limit: int = MEMORY_RECALL_DEFAULT_LIMIT, include_raw: bool = True) -> list[dict[str, Any]]:
+    query_words = set(extract_keywords(query))
+    target_year = query_target_year(query)
+    results: list[dict[str, Any]] = []
+    with connect_db() as conn:
+        timeline_rows = conn.execute("SELECT * FROM memory_timeline ORDER BY event_date DESC").fetchall()
+        summary_rows = conn.execute("SELECT * FROM memory_summary ORDER BY updated_at DESC").fetchall()
+        episodic_rows = conn.execute("SELECT summary, keywords, created_at, session_id FROM episodic_memory ORDER BY created_at DESC").fetchall()
+    for row in timeline_rows:
+        text = " ".join([row["title"], row["summary"], row["tags"], row["entities"]])
+        score = score_memory_text(query_words, text, target_year, row["event_date"])
         if score > 0:
-            scored.append((score, row))
-    
-    scored.sort(key=lambda x: x[0], reverse=True)
-    if not scored:
+            results.append({"type": "timeline", "session_id": row["session_id"], "date": row["event_date"], "title": row["title"], "summary": row["summary"], "score": score, "source_archive": row["source_archive"]})
+    for row in summary_rows:
+        text = " ".join([row["summary"], row["project_tags"], row["people_entities"], row["dates"], row["durable_decisions"], row["follow_up_tasks"]])
+        score = score_memory_text(query_words, text, target_year, row["dates"])
+        if score > 0:
+            results.append({"type": "summary", "session_id": row["session_id"], "date": row["created_at"][:10], "title": "Compacted memory", "summary": row["summary"], "project_tags": parse_json_list(row["project_tags"]), "people_entities": parse_json_list(row["people_entities"]), "durable_decisions": parse_json_list(row["durable_decisions"]), "follow_up_tasks": parse_json_list(row["follow_up_tasks"]), "score": score, "source_archive": row["source_archive"]})
+    for row in episodic_rows:
+        text = f"{row['summary']} {row['keywords']}"
+        score = score_memory_text(query_words, text, target_year, row["created_at"])
+        if score > 0:
+            results.append({"type": "episodic", "session_id": row["session_id"], "date": row["created_at"][:10], "title": "Episodic memory", "summary": row["summary"], "score": score})
+    if include_raw and len(results) < limit:
+        for path in sorted(ARCHIVE_DIR.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                archive = normalize_session_archive(path)
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            text = f"{archive['title']} {archive['summary']} {session_text(archive['messages'], max_chars=4000)}"
+            score = score_memory_text(query_words, text, target_year, archive["created_at"])
+            if score > 0:
+                results.append({"type": "raw_archive", "session_id": archive["session_id"], "date": archive["created_at"][:10], "title": archive["title"], "summary": archive["summary"] or compact_summary_text(archive, text), "score": score, "source_archive": str(path)})
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    type_priority = {"timeline": 0, "summary": 1, "episodic": 2, "raw_archive": 3}
+    for result in sorted(results, key=lambda item: (-item["score"], type_priority.get(item["type"], 9))):
+        key = (result["session_id"], result["type"])
+        deduped.setdefault(key, result)
+    return list(deduped.values())[:limit]
+
+
+def retrieve_relevant(query: str, limit: int = 4, max_chars: int = MEMORY_PROMPT_BUDGET_CHARS) -> str:
+    memories = recall_memories(query, limit=limit, include_raw=False)
+    if not memories:
         return ""
-    
-    top = scored[:limit]
-    return "\n\n".join([
-        f"[{row['created_at'][:10]}] {row['summary']}"
-        for _, row in top
-    ])
+    parts: list[str] = []
+    total = 0
+    for memory in memories:
+        line = f"[{memory.get('date', '')}] {memory.get('title', memory['type'])}: {memory.get('summary', '')}"
+        if memory.get("durable_decisions"):
+            line += " Decisions: " + "; ".join(memory["durable_decisions"][:3])
+        if memory.get("follow_up_tasks"):
+            line += " Follow-ups: " + "; ".join(memory["follow_up_tasks"][:3])
+        if total + len(line) > max_chars:
+            remaining = max_chars - total
+            if remaining > 80:
+                parts.append(line[:remaining] + "... [memory context truncated]")
+            break
+        parts.append(line)
+        total += len(line) + 2
+    return "\n\n".join(parts)
 
 
 def workspace_index_kind(path: Path, root: Path) -> str:
@@ -1414,6 +1992,14 @@ def load_tool_metadata(package_dir: Path | dict[str, Any]) -> dict[str, Any]:
     if isinstance(package_dir, dict):
         metadata = package_dir.get("metadata", {})
         return dict(metadata) if isinstance(metadata, dict) else {}
+def load_package_metadata(package_dir: Path) -> dict[str, Any]:
+def load_tool_metadata(source: Path | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(source, dict):
+        metadata = source.get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else {}
+    package_dir = source
+def load_package_metadata(package_dir: Path) -> dict[str, Any]:
+def load_tool_package_metadata(package_dir: Path) -> dict[str, Any]:
     metadata_path = package_dir / "metadata.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1431,7 +2017,6 @@ def load_tool_metadata(package_dir: Path | dict[str, Any]) -> dict[str, Any]:
     if deprecation_reason is not None and not isinstance(deprecation_reason, str):
         raise ValueError("metadata.json deprecation_reason must be a string when present.")
     return metadata
-
 
 def validate_json_schema(schema: dict[str, Any]) -> None:
     if not isinstance(schema, dict):
@@ -1482,7 +2067,9 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"schema.json is invalid JSON: {exc.msg}") from exc
     validate_json_schema(schema)
-    metadata = load_tool_metadata(package_dir)
+    metadata = load_package_metadata(package_dir)
+    validate_tool_permission_manifest(metadata)
+    metadata = load_tool_package_metadata(package_dir)
 
     completed = subprocess.run(
         [sys.executable, str(package_dir / "tests.py")],
@@ -1713,8 +2300,8 @@ def create_filesystem_mutation_checkpoint(code: str, policy: dict[str, Any]) -> 
     }
 
 
-def rollback_latest_checkpoint() -> dict[str, Any]:
-    return checkpoints.restore_latest_checkpoint(data_dir=DATA_DIR)
+def rollback_latest_checkpoint(*, caller: str = "") -> dict[str, Any]:
+    return KERNEL.rollback_latest_checkpoint(caller=caller)
 
 
 def summarize_python_execution_policy(code: str) -> dict[str, Any]:
@@ -1774,7 +2361,6 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                 if command_parts_contain_destructive_git(string_parts):
                     reasons.append(DESTRUCTIVE_GIT_REASON)
                     manual_approval_required = True
-
             if isinstance(node, ast.Call):
                 func_name = ""
                 is_attribute_call = isinstance(node.func, ast.Attribute)
@@ -1786,8 +2372,7 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                 elif isinstance(node.func, ast.Attribute):
                     func_name = node.func.attr
                     if isinstance(node.func.value, ast.Name):
-                        owner = node.func.value.id
-                        owner_module = module_aliases.get(owner, owner)
+                        owner_module = module_aliases.get(node.func.value.id, node.func.value.id)
                         if owner_module == "os" and func_name in OS_PROCESS_CALLS:
                             reasons.append("subprocess/process access")
                             process_risk = True
@@ -1809,7 +2394,6 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                             mode = keyword.value.value
                     if any(flag in mode for flag in ("w", "a", "x", "+")):
                         reasons.append("filesystem write or mutation")
-
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 text = node.value
                 if command_text_contains_destructive_git(text):
@@ -1822,7 +2406,6 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                     affected_paths.append(text)
                 if path.is_absolute() and not path_in_approved_roots(path):
                     reasons.append(f"absolute path outside approved roots: {text}")
-
             if isinstance(node, ast.Attribute) and node.attr in {"home", "expanduser"}:
                 reasons.append("home-directory access")
 
@@ -1837,13 +2420,15 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": True,
             "manual_approval_required": manual_approval_required,
         }
 
     unique_reasons = sorted(set(reasons))
-    sandbox_tier = sandbox_tier_for_reasons(unique_reasons)
     if unique_reasons:
+        sandbox_tier = sandbox_tier_for_reasons(unique_reasons)
         response = {
+        response: dict[str, Any] = {
             "action": "require_approval",
             "sandbox_tier": sandbox_tier,
             "risk_summary": f"Requires {sandbox_tier} sandbox approval: " + "; ".join(unique_reasons) + ".",
@@ -1927,7 +2512,7 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
 
 
 def registered_tool_expects_json(tool: dict[str, Any]) -> bool:
-    metadata = load_tool_metadata(tool)
+    metadata = tool.get("metadata", {}) if isinstance(tool.get("metadata", {}), dict) else {}
     return tool.get("output_format") == "json" or metadata.get("output_format") == "json"
 
 
@@ -1948,16 +2533,172 @@ def annotate_registered_tool_output(result: dict[str, Any], tool: dict[str, Any]
     return result
 
 
+def arguments_hash(arguments: dict[str, Any]) -> str:
+    payload = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def tool_permission_defaults() -> dict[str, Any]:
+    return {"filesystem": [], "network": [], "environment": [], "process": {"allow": False}, "secrets": []}
+
+
+def normalize_tool_permissions(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    raw = (metadata or {}).get("permissions")
+    if raw is None:
+        raw = {
+            "filesystem": (metadata or {}).get("requested_filesystem_scopes", []),
+            "network": (metadata or {}).get("requested_network_scopes", []),
+            "environment": (metadata or {}).get("requested_environment_variables", []),
+            "process": (metadata or {}).get("process_permissions", {"allow": False}),
+            "secrets": (metadata or {}).get("secret_access", []),
+        }
+    if not isinstance(raw, dict):
+        raise ValueError("metadata.json permissions must be an object.")
+    normalized = tool_permission_defaults()
+    filesystem = raw.get("filesystem", raw.get("requested_filesystem_scopes", []))
+    if not isinstance(filesystem, list):
+        raise ValueError("permissions.filesystem must be a list.")
+    fs_scopes = []
+    for item in filesystem:
+        scope = {"path": item, "access": "read"} if isinstance(item, str) else item
+        if not isinstance(scope, dict):
+            raise ValueError("permissions.filesystem entries must be strings or objects.")
+        path_value = scope.get("path")
+        access = scope.get("access", "read")
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError("permissions.filesystem entries require a non-empty path.")
+        if access not in {"read", "write", "read_write"}:
+            raise ValueError("permissions.filesystem access must be read, write, or read_write.")
+        fs_scopes.append({"path": path_value, "access": access})
+    normalized["filesystem"] = fs_scopes
+
+    network = raw.get("network", raw.get("requested_network_scopes", []))
+    if not isinstance(network, list):
+        raise ValueError("permissions.network must be a list.")
+    net_scopes = []
+    for item in network:
+        scope = {"host": item, "ports": []} if isinstance(item, str) else item
+        if not isinstance(scope, dict):
+            raise ValueError("permissions.network entries must be strings or objects.")
+        host = scope.get("host")
+        ports = scope.get("ports", [])
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError("permissions.network entries require a non-empty host.")
+        if not isinstance(ports, list) or not all(isinstance(port, int) for port in ports):
+            raise ValueError("permissions.network ports must be a list of integers.")
+        net_scopes.append({"host": host, "ports": ports})
+    normalized["network"] = net_scopes
+
+    environment = raw.get("environment", raw.get("requested_environment_variables", []))
+    if not isinstance(environment, list) or not all(isinstance(item, str) and item for item in environment):
+        raise ValueError("permissions.environment must be a list of non-empty strings.")
+    normalized["environment"] = environment
+
+    process = raw.get("process", raw.get("process_permissions", {"allow": False}))
+    if isinstance(process, bool):
+        process = {"allow": process}
+    if not isinstance(process, dict) or not isinstance(process.get("allow", False), bool):
+        raise ValueError("permissions.process must be a boolean or an object with boolean allow.")
+    normalized["process"] = {"allow": bool(process.get("allow", False))}
+
+    secrets = raw.get("secrets", raw.get("secret_access", []))
+    if not isinstance(secrets, list) or not all(isinstance(item, str) and item for item in secrets):
+        raise ValueError("permissions.secrets must be a list of non-empty strings.")
+    normalized["secrets"] = secrets
+    return normalized
+
+
+def validate_tool_permission_manifest(metadata: dict[str, Any]) -> dict[str, Any]:
+    permissions = normalize_tool_permissions(metadata)
+    metadata["permissions"] = permissions
+    metadata.setdefault("requested_filesystem_scopes", permissions["filesystem"])
+    metadata.setdefault("requested_network_scopes", permissions["network"])
+    metadata.setdefault("requested_environment_variables", permissions["environment"])
+    metadata.setdefault("process_permissions", permissions["process"])
+    metadata.setdefault("secret_access", permissions["secrets"])
+    return permissions
+
+
+def tool_permissions_from_entry(tool: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(tool.get("permissions"), dict):
+        return normalize_tool_permissions({"permissions": tool["permissions"]})
+    return normalize_tool_permissions(load_tool_metadata(tool))
+
+
+def permission_runtime_guard(permissions: dict[str, Any], package_dir: Path) -> str:
+    fs_scopes = permissions.get("filesystem", [])
+    network_scopes = permissions.get("network", [])
+    process_allowed = bool(permissions.get("process", {}).get("allow", False))
+    env_allowed = set(permissions.get("environment", [])) | set(permissions.get("secrets", [])) | SAFE_EXECUTION_ENV_VARS
+    scope_payload = []
+    for scope in fs_scopes:
+        path_value = Path(scope["path"])
+        if not path_value.is_absolute():
+            path_value = (ROOT_DIR / path_value).resolve()
+        scope_payload.append({"path": str(path_value), "access": scope["access"]})
+    scope_payload.append({"path": str(package_dir.resolve()), "access": "read"})
+    lines = [
+        "import builtins as _b, os as _os, pathlib as _p, runpy as _runpy, socket as _socket, subprocess as _subprocess",
+        f"_FS={scope_payload!r}",
+        f"_NET={network_scopes!r}",
+        f"_PROC={process_allowed!r}",
+        f"_ENV={sorted(env_allowed)!r}",
+        "def _res(path): return _os.path.realpath(_os.path.abspath(_os.fspath(path)))",
+        "def _allows(path, write):\n    r=_res(path)\n    for s in _FS:\n        root=_res(s['path'])\n        if r==root or r.startswith(root+_os.sep):\n            a=s.get('access','read')\n            if write and a in ('write','read_write'): return True\n            if (not write) and a in ('read','read_write'): return True\n    return False",
+        "def _writes(mode): return any(f in str(mode) for f in ('w','a','x','+'))",
+        "def _check(path, write=False):\n    if not _allows(path, write):\n        raise PermissionError(('undeclared filesystem write access: ' if write else 'undeclared filesystem read access: ')+_os.fspath(path))",
+        "_open=_b.open\ndef open(file, mode='r', *args, **kwargs):\n    _check(file, _writes(mode))\n    return _open(file, mode, *args, **kwargs)\n_b.open=open",
+        "_path_open=_p.Path.open\ndef _guard_path_open(self, mode='r', *args, **kwargs):\n    _check(self, _writes(mode))\n    return _path_open(self, mode, *args, **kwargs)\n_p.Path.open=_guard_path_open",
+        "def _wrap_path_write(name):\n    orig=getattr(_p.Path,name)\n    def wrapper(self,*args,**kwargs):\n        _check(self, True)\n        return orig(self,*args,**kwargs)\n    setattr(_p.Path,name,wrapper)\nfor _n in ('write_text','write_bytes','touch','unlink','mkdir','rmdir'):\n    _wrap_path_write(_n)",
+        "_conn=_socket.socket.connect\ndef _guard_connect(self,address,*args,**kwargs):\n    host=address[0] if isinstance(address,tuple) and address else address\n    ok=any(s.get('host')=='*' or s.get('host')==host for s in _NET)\n    if not ok: raise PermissionError('undeclared network access: '+str(host))\n    return _conn(self,address,*args,**kwargs)\n_socket.socket.connect=_guard_connect",
+        "if not _PROC:\n    def _block_process(*args, **kwargs): raise PermissionError('undeclared subprocess/process access')\n    _subprocess.Popen=_block_process\n    for _n in ('system','popen','spawnl','spawnlp','spawnv','spawnvp','execv','execvp'):\n        if hasattr(_os,_n): setattr(_os,_n,_block_process)",
+        "_copy=dict(_os.environ)\n_os.environ.clear()\nfor _k,_v in _copy.items():\n    if _k in _ENV: _os.environ[_k]=_v",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def summarize_tool_permission_use(result: dict[str, Any], permissions: dict[str, Any]) -> dict[str, Any]:
+    text = "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "error"))
+    return {
+        "filesystem": bool(permissions.get("filesystem")) or "filesystem" in text or "PermissionError" in text,
+        "network": bool(permissions.get("network")) or "network" in text,
+        "process": bool(permissions.get("process", {}).get("allow", False)) or "subprocess" in text or "process" in text,
+        "environment": bool(permissions.get("environment") or permissions.get("secrets")),
+    }
+
+
+def audit_registered_tool_execution(tool: dict[str, Any], arguments: dict[str, Any], permissions: dict[str, Any], result: dict[str, Any], approval_id: str | None = None) -> None:
+    try:
+        status = "timeout" if result.get("timed_out") else "success" if int(result.get("exit_code", -1)) == 0 else "failed"
+    except (TypeError, ValueError):
+        status = "failed"
+    permissions_used = summarize_tool_permission_use(result, permissions)
+    files_touched = [scope.get("path") for scope in permissions.get("filesystem", []) if isinstance(scope, dict)]
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO tool_execution_audit (id, timestamp, tool_name, tool_version, arguments_hash, permissions_used, files_touched, network_flag, process_flag, approval_id, result_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), now_iso(), str(tool.get("name", "")), str(tool.get("version", "")), arguments_hash(arguments), json.dumps(permissions_used, sort_keys=True), json.dumps(files_touched), 1 if permissions_used.get("network") else 0, 1 if permissions_used.get("process") else 0, approval_id, status),
+        )
+        conn.commit()
+
+
+def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any], approval_id: str | None = None) -> dict[str, Any]:
+
 def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
     start = time.time()
+    permissions = tool_permissions_from_entry(tool)
     try:
         filepath = tool.get("filepath")
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
+        runner = permission_runtime_guard(permissions, path.parent) + f"\n_ouro_tool_path={str(path)!r}\n_runpy.run_path(_ouro_tool_path, run_name='__main__')\n"
+        completed = subprocess.run([sys.executable, "-c", runner], cwd=ROOT_DIR, input=json.dumps(arguments), text=True, encoding="utf-8", capture_output=True, timeout=REGISTERED_TOOL_TIMEOUT_SECONDS, check=False)
+        result = {"stdout": completed.stdout[-100_000:], "stderr": completed.stderr[-100_000:], "exit_code": completed.returncode, "timed_out": False, "duration_ms": int((time.time() - start) * 1000), "malformed_output": False}
+        result = annotate_registered_tool_output(result, tool)
         completed = subprocess.run(
             [sys.executable, str(path)],
-            cwd=ROOT_DIR,
+            cwd=str(ROOT_DIR),
             input=json.dumps(arguments),
             text=True,
             encoding="utf-8",
@@ -1971,6 +2712,7 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             "exit_code": completed.returncode,
             "timed_out": False,
             "duration_ms": int((time.time() - start) * 1000),
+            "malformed_output": False,
         }
         return annotate_registered_tool_output(result, tool)
     except subprocess.TimeoutExpired as exc:
@@ -1984,7 +2726,11 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.",
             "malformed_output": False,
         }
+        result = {"stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "", "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "") or f"Timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s", "exit_code": -1, "timed_out": True, "duration_ms": int((time.time() - start) * 1000), "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.", "malformed_output": False}
     except Exception as exc:
+        result = {"stdout": "", "stderr": str(exc), "exit_code": -1, "timed_out": False, "duration_ms": int((time.time() - start) * 1000), "error": f"Registered tool execution exception: {exc}", "exception": type(exc).__name__, "malformed_output": False}
+    audit_registered_tool_execution(tool, arguments, permissions, result, approval_id)
+    return result
         return {
             "stdout": "",
             "stderr": str(exc),
@@ -1995,7 +2741,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             "exception": type(exc).__name__,
             "malformed_output": False,
         }
-
 
 def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if result.get("timed_out"):
@@ -2015,6 +2760,7 @@ def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any
 
 def registered_tool_failed(result: dict[str, Any], tool: dict[str, Any] | None = None) -> bool:
     return classify_registered_tool_failure(result, tool) is not None
+
 
 
 def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any], attempt_number: int, max_attempts: int) -> str:
@@ -2047,6 +2793,49 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
         """
     ).strip()
 
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
+
+
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
 def update_registered_tool_status(
     name: str,
@@ -2065,7 +2854,6 @@ def update_registered_tool_status(
                 target = tool
     if target is None:
         return {"error": f"Tool {name} not found."}
-
     if last_test_status is not None:
         target["last_test_status"] = last_test_status
     if last_error is not None or last_test_status == "passed":
@@ -2079,36 +2867,20 @@ def update_registered_tool_status(
     return {"updated": target["name"], "version": target.get("version"), "tool": target}
 
 
-def validate_registered_tool(
-    name: str,
-    version: str | None = None,
-    sample_arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def validate_registered_tool(name: str, version: str | None = None, sample_arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     tool = find_tool_version(name, version)
     if tool is None:
         return {"error": f"Tool {name} not found."}
     if tool.get("builtin"):
         return {"error": f"Builtin tool {name} cannot be validated as a registered file tool."}
-
     arguments = sample_arguments if sample_arguments is not None else tool.get("sample_arguments", {})
     if not isinstance(arguments, dict):
         return {"error": "sample_arguments must be an object."}
-
-    try:
-        result = run_registered_tool(tool, arguments)
-    except Exception as exc:  # noqa: BLE001 - validation must persist failure details
-        message = str(exc)
-        update_registered_tool_status(
-            name,
-            str(tool.get("version", "")),
-            last_test_status="failed",
-            last_error=message,
-            trusted=False,
-        )
-        return {"validated": False, "error": message}
-
+    result = run_registered_tool(tool, arguments)
     passed = result.get("exit_code") == 0 and not result.get("timed_out")
     error = None if passed else (result.get("stderr") or f"Exited with code {result.get('exit_code')}")
+    status = update_registered_tool_status(name, str(tool.get("version", "")), last_test_status="passed" if passed else "failed", last_error=error, trusted=passed)
+    return {"validated": passed, "name": name, "version": status.get("version"), "result": result, "tool": status.get("tool")}
     status = update_registered_tool_status(
         name,
         str(tool.get("version", "")),
@@ -2139,10 +2911,24 @@ def register_tool(
     supersedes: str | None = None,
 ) -> dict[str, Any]:
     validate_tool_name(name)
+    package_info: dict[str, Any] | None = None
     try:
+        validate_tool_name(name)
         path = resolve_tool_candidate(filepath)
+        entry_filepath = str(Path(filepath))
+        metadata: dict[str, Any] = {}
+        if path.is_dir():
+            package_info = load_tool_package(path)
+            parameters = package_info["schema"]
+            metadata = dict(package_info["metadata"])
+            version = str(metadata.get("version", version))
         package_info: dict[str, Any] | None = None
         package_metadata: dict[str, Any] = {}
+        package_metadata: dict[str, Any] = {"version": str(version), "deprecated": False, "deprecation_reason": ""}
+        package_metadata: dict[str, Any] = {}
+        entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
+        package_metadata: dict[str, Any] = {"version": version, "deprecated": False, "deprecation_reason": ""}
+        package_metadata: dict[str, Any] | None = None
         entry_filepath = str(Path(filepath))
         if path.is_dir():
             package_info = load_tool_package(path)
@@ -2150,11 +2936,23 @@ def register_tool(
             package_metadata = package_info["metadata"]
             version = str(package_metadata.get("version", version))
             test_plan = test_plan or str(package_metadata.get("test_plan", "Skill package tests.py passed."))
+            version = str(package_metadata.get("version") or version)
+            version = str(package_metadata.get("version", version))
+            entry_version = str(package_metadata.get("version", version))
         else:
             if path.suffix.lower() != ".py":
                 raise ValueError("Legacy tool registrations must point to a Python file.")
-            parameters = parameters_schema or {"type": "object"}
+            if not isinstance(parameters_schema, dict):
+                return {"error": "parameters_schema must be an object."}
+            parameters = parameters_schema
             validate_json_schema(parameters)
+            validate_tool_permission_manifest(package_metadata)
+            if not isinstance(parameters_schema, dict):
+                return {"error": "parameters_schema must be an object."}
+            if not any([test_command, test_plan, sample_arguments is not None]):
+                return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
+    except (ValueError, subprocess.TimeoutExpired) as exc:
+            entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
     except ValueError as exc:
         return {"error": str(exc)}
 
@@ -2162,6 +2960,17 @@ def register_tool(
         return {"error": "parameters_schema must be an object."}
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
+        return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
+
+    registry = load_registry()
+    existing_versions = [tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")]
+    entry_version = str(package_metadata.get("version", version))
+
+    registry = load_registry()
     if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
         return {
             "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
@@ -2171,18 +2980,61 @@ def register_tool(
     existing_versions = [
         tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
     ]
+            entry_version = str(version)
+            if not any([test_command, test_plan, sample_arguments is not None]):
+                return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
+        if sample_arguments is not None and not isinstance(sample_arguments, dict):
+            return {"error": "sample_arguments must be an object."}
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
+        return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
+    registry = load_registry()
+    if not isinstance(parameters, dict):
+        return {"error": "parameters_schema must be an object."}
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if path.is_file() and not any([test_command, test_plan, sample_arguments is not None]):
+        return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
+    registry = load_registry()
+    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
+    metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
+    metadata.setdefault("repair_attempts", [])
+    existing_versions = [tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")]
     if any(str(tool.get("version", "")) == str(version) for tool in existing_versions):
         return {"error": f"Tool {name} version {version} is already registered."}
+    registry = load_registry()
+    existing_versions = [tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")]
+    if any(str(tool.get("version", "")) == entry_version for tool in existing_versions):
+        return {"error": f"Tool {name} version {entry_version} is already registered."}
     if supersedes is None and existing_versions:
-        previous = sorted(
-            existing_versions,
-            key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
-        )[-1]
+        previous = sorted(existing_versions, key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))))[-1]
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
     metadata = {"repair_attempts": []}
     metadata.update(package_metadata)
+    metadata = {
+        "repair_attempts": [],
+        "permissions": package_metadata["permissions"],
+        "requested_filesystem_scopes": package_metadata["requested_filesystem_scopes"],
+        "requested_network_scopes": package_metadata["requested_network_scopes"],
+        "requested_environment_variables": package_metadata["requested_environment_variables"],
+        "process_permissions": package_metadata["process_permissions"],
+        "secret_access": package_metadata["secret_access"],
+    }
+    metadata = {"repair_attempts": []}
+    if package_info is not None:
+        metadata.update(package_info["metadata"])
+    metadata = dict(package_metadata) if package_info is not None else dict(existing_versions[-1].get("metadata", {})) if existing_versions else {}
+    metadata.setdefault("repair_attempts", [])
+    metadata = {"repair_attempts": []}
+    if package_metadata is not None:
+        metadata.update(package_metadata)
+
     entry = {
         "name": name,
         "description": description,
@@ -2191,17 +3043,33 @@ def register_tool(
         "builtin": False,
         "requires_approval": bool(requires_approval),
         "metadata": metadata,
-        "version": str(version),
+        "permissions": package_metadata["permissions"],
+        "version": entry_version,
         "created_at": timestamp,
         "updated_at": timestamp,
         "source_task_id": source_task_id,
         "test_command": test_command,
-        "test_plan": test_plan,
+        "test_plan": test_plan or ("Skill package tests.py passed before registration." if package_info else ""),
         "sample_arguments": sample_arguments or {},
-        "last_test_status": "pending",
+        "last_test_status": "passed" if package_info else "pending",
         "last_error": None,
         "use_count": 0,
         "supersedes": supersedes,
+        "trusted": bool(package_info),
+        "deprecated": bool(package_metadata.get("deprecated", False)),
+        "deprecation_reason": str(package_metadata.get("deprecation_reason", "") or ""),
+    }
+    if path.is_dir():
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        "test_plan": test_plan or ("Package tests.py passed." if package_info is not None else None),
+        "test_plan": test_plan or ("Skill package tests.py passed before registration." if package_info else None),
+        "sample_arguments": sample_arguments or {},
+        "last_test_status": "passed" if package_info is not None else "pending",
+        "last_error": None,
+        "use_count": 0,
+        "supersedes": supersedes,
+        "trusted": bool(package_info is not None),
         "trusted": False,
         "deprecated": bool(package_metadata.get("deprecated", False)),
         "deprecation_reason": str(package_metadata.get("deprecation_reason", "") or ""),
@@ -2212,6 +3080,53 @@ def register_tool(
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
     result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+        "deprecated": bool(metadata.get("deprecated", False)),
+        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
+        "last_test_status": "passed" if package_info else "pending",
+        "last_error": None,
+        "use_count": 0,
+        "supersedes": supersedes,
+        "trusted": bool(package_info),
+    }
+    if package_info is not None:
+        entry.update({
+            "package": True,
+            "package_dir": entry_filepath,
+            "deprecated": bool(metadata.get("deprecated", False)),
+            "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
+        })
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        entry["deprecated"] = bool(package_info["metadata"].get("deprecated", False))
+        entry["deprecation_reason"] = str(package_info["metadata"].get("deprecation_reason", "") or "")
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": entry["trusted"]}
+        entry["output_format"] = package_metadata.get("output_format", entry.get("output_format"))
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+        entry["version"] = str(package_metadata.get("version", version))
+        entry["deprecated"] = bool(package_metadata.get("deprecated", False))
+        entry["deprecation_reason"] = str(package_metadata.get("deprecation_reason", "") or "")
+        entry["last_test_status"] = "passed"
+
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": entry["version"], "permanent": True, "trusted": False}
+        entry.update({
+            "package": True,
+            "package_dir": entry_filepath,
+            "deprecated": bool(metadata.get("deprecated", False)),
+            "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
+        })
+
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": entry_version, "permanent": True, "trusted": entry["trusted"]}
     if package_info is not None:
         result["package"] = True
         result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
@@ -2364,13 +3279,27 @@ CONVERSATION:
     return await call_model_simple(summary_prompt, model="openai-fast")
 
 
-def store_episodic_memory(session_id: str, summary: str, keywords: list[str]) -> None:
+def store_episodic_memory(session_id: str, summary: str, keywords: list[str]) -> str:
+    memory_id = str(uuid.uuid4())
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO episodic_memory (id, created_at, keywords, summary, session_id) VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), now_iso(), ",".join(keywords), summary, session_id),
+            (memory_id, now_iso(), ",".join(keywords), summary, session_id),
         )
         conn.commit()
+    return memory_id
+
+
+def find_or_store_session_summary(session_id: str, summary: str) -> str:
+    keywords = extract_keywords(summary) or ["session", "archive"]
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM episodic_memory WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    if row:
+        return str(row["id"])
+    return store_episodic_memory(session_id, summary, keywords)
 
 
 async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
@@ -2395,6 +3324,7 @@ async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
 
         write_session_archive(session_id, messages, summary=summary)
         store_episodic_memory(session_id, summary, keywords)
+        enforce_memory_budget()
         return {
             "status": "saved",
             "session_id": session_id,
@@ -2417,6 +3347,17 @@ async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
 class MemorySaveRequest(BaseModel):
     session_id: str
     messages: list[ChatMessage]
+
+
+class MemoryCompactRequest(BaseModel):
+    cutoff_days: int = MEMORY_COMPACTION_DEFAULT_CUTOFF_DAYS
+    limit: int | None = None
+
+
+class MemoryRecallRequest(BaseModel):
+    query: str
+    limit: int = MEMORY_RECALL_DEFAULT_LIMIT
+    include_raw: bool = True
 
 
 class SessionUpdateRequest(BaseModel):
@@ -2450,10 +3391,222 @@ def archive_updated_at(path: Path, payload: dict[str, Any]) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
 
 
+
+
+def parse_archive_time(value: str | None) -> datetime:
+    if not value:
+        return datetime.fromtimestamp(0, timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.fromtimestamp(0, timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def memory_setting_int(name: str, minimum: int = 0) -> int:
+    value = load_settings().get(name, DEFAULT_SETTINGS[name])
+    try:
+        return max(int(value), minimum)
+    except (TypeError, ValueError):
+        return int(DEFAULT_SETTINGS[name])
+
+
+def memory_setting_float(name: str, minimum: float = 0.0) -> float:
+    value = load_settings().get(name, DEFAULT_SETTINGS[name])
+    try:
+        return max(float(value), minimum)
+    except (TypeError, ValueError):
+        return float(DEFAULT_SETTINGS[name])
+
+
+def archive_raw_size(path: Path) -> int:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    except Exception:
+        return path.stat().st_size
+    return len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+
+
+def summary_tokens_to_chars(tokens: int) -> int:
+    return max(tokens, 1) * 4
+
+
+def durable_lines_from_messages(messages: list[dict[str, Any]], limit: int = 12) -> list[str]:
+    patterns = ("decision", "decided", "remember", "important", "durable", "fact", "requirement", "must", "should")
+    durable: list[str] = []
+    for message in messages:
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        lower = content.lower()
+        if any(pattern in lower for pattern in patterns):
+            role = str(message.get("role", "unknown"))
+            durable.append(f"{role}: {re.sub(r'\s+', ' ', content)[:500]}")
+        if len(durable) >= limit:
+            break
+    return durable
+
+
+def compact_session_summary(archive: dict[str, Any], target_tokens: int) -> str:
+    existing = str(archive.get("summary") or "").strip()
+    messages = archive.get("messages") if isinstance(archive.get("messages"), list) else []
+    durable = durable_lines_from_messages(messages)
+    fallback_parts = [existing] if existing else [f"Conversation session {archive.get('session_id', 'unknown')}"]
+    if durable:
+        fallback_parts.append("Important durable facts and decisions:\n" + "\n".join(f"- {line}" for line in durable))
+    summary = "\n\n".join(part for part in fallback_parts if part).strip()
+    max_chars = summary_tokens_to_chars(target_tokens)
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1].rstrip() + "…"
+    return summary
+
+
+def upsert_memory_compaction_metadata(
+    session_id: str,
+    archive_path: Path,
+    original_size: int,
+    compressed_size: int,
+    summary_id: str,
+    compression: str,
+    timestamp: str | None = None,
+) -> None:
+    when = timestamp or now_iso()
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_compaction (
+                session_id, archive_path, original_size, compressed_size, summary_id,
+                summary_path, last_accessed_at, compacted_at, compression
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                archive_path = excluded.archive_path,
+                original_size = excluded.original_size,
+                compressed_size = excluded.compressed_size,
+                summary_id = excluded.summary_id,
+                summary_path = excluded.summary_path,
+                compacted_at = excluded.compacted_at,
+                compression = excluded.compression
+            """,
+            (
+                session_id,
+                str(archive_path),
+                original_size,
+                compressed_size,
+                summary_id,
+                f"episodic_memory:{summary_id}",
+                when,
+                when,
+                compression,
+            ),
+        )
+        conn.commit()
+
+
+def touch_memory_archive(session_id: str) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE memory_compaction SET last_accessed_at = ? WHERE session_id = ?",
+            (now_iso(), session_id),
+        )
+        conn.commit()
+
+
+def compact_session_archive(path: Path, compression: str, target_tokens: int) -> dict[str, Any] | None:
+    archive = normalize_session_archive(path)
+    messages = archive.get("messages") if isinstance(archive.get("messages"), list) else []
+    if not messages:
+        return None
+    original_size = path.stat().st_size
+    summary = compact_session_summary(archive, target_tokens)
+    summary_id = find_or_store_session_summary(archive["session_id"], summary)
+    durable = durable_lines_from_messages(messages)
+    payload = {
+        "session_id": archive["session_id"],
+        "type": archive.get("type", "conversation_thread"),
+        "title": archive.get("title") or derive_session_title(messages, archive["session_id"]),
+        "summary": summary,
+        "messages": [],
+        "durable_facts": durable,
+        "created_at": archive.get("created_at"),
+        "updated_at": archive.get("updated_at"),
+        "compacted": True,
+        "compacted_at": now_iso(),
+        "summary_id": summary_id,
+    }
+    if compression == "zlib":
+        raw = json.dumps(messages, ensure_ascii=False).encode("utf-8")
+        payload["raw_messages_compressed"] = base64.b64encode(zlib.compress(raw, level=9)).decode("ascii")
+        payload["raw_messages_compression"] = "zlib"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    compressed_size = path.stat().st_size
+    upsert_memory_compaction_metadata(
+        archive["session_id"], path, original_size, compressed_size, summary_id, compression, payload["compacted_at"]
+    )
+    return {
+        "session_id": archive["session_id"],
+        "original_size": original_size,
+        "compressed_size": compressed_size,
+        "summary_id": summary_id,
+    }
+
+
+def enforce_memory_budget() -> dict[str, Any]:
+    recent_days = memory_setting_int("memory_recent_days")
+    max_raw_bytes = int(memory_setting_float("memory_max_raw_archive_mb") * 1024 * 1024)
+    target_tokens = memory_setting_int("memory_summary_target_tokens", minimum=1)
+    compression = str(load_settings().get("memory_cold_archive_compression", "zlib")).lower()
+    if compression not in {"zlib", "remove"}:
+        compression = "zlib"
+    now = datetime.now(timezone.utc)
+    archives: list[dict[str, Any]] = []
+    for path in sorted(ARCHIVE_DIR.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            archive = normalize_session_archive(path)
+            updated_at = parse_archive_time(archive.get("updated_at"))
+            is_recent = (now - updated_at).days < recent_days
+            is_raw = bool(payload.get("messages"))
+            size = archive_raw_size(path) if is_raw else 0
+            archives.append({"path": path, "archive": archive, "updated_at": updated_at, "recent": is_recent, "raw_size": size})
+        except Exception as exc:
+            print(f"WARNING: skipping archive during memory budget enforcement: {path}: {exc}")
+    raw_total = sum(item["raw_size"] for item in archives)
+    compacted: list[dict[str, Any]] = []
+    candidates = sorted(
+        (item for item in archives if not item["recent"] and item["raw_size"] > 0),
+        key=lambda item: item["updated_at"],
+    )
+    for item in candidates:
+        if raw_total <= max_raw_bytes:
+            break
+        result = compact_session_archive(item["path"], compression, target_tokens)
+        if result:
+            compacted.append(result)
+            raw_total -= item["raw_size"]
+    return {
+        "status": "ok",
+        "raw_bytes": raw_total,
+        "max_raw_bytes": max_raw_bytes,
+        "recent_days": recent_days,
+        "compacted": compacted,
+        "compacted_count": len(compacted),
+    }
+
 def normalize_session_archive(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     session_id = str(payload.get("session_id") or path.stem)
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    if not messages and payload.get("raw_messages_compression") == "zlib" and payload.get("raw_messages_compressed"):
+        try:
+            raw_messages = zlib.decompress(base64.b64decode(payload["raw_messages_compressed"])).decode("utf-8")
+            loaded_messages = json.loads(raw_messages)
+            if isinstance(loaded_messages, list):
+                messages = loaded_messages
+        except Exception:
+            messages = []
     updated_at = archive_updated_at(path, payload)
     title = payload.get("title") or derive_session_title(messages, session_id)
     return {
@@ -2509,7 +3662,23 @@ async def save_memory(request: MemorySaveRequest) -> JSONResponse:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
+@app.post("/memory/compact")
+async def compact_memory(request: MemoryCompactRequest) -> JSONResponse:
+    if request.cutoff_days < 0:
+        raise HTTPException(status_code=400, detail="cutoff_days must be non-negative.")
+    if request.limit is not None and request.limit < 1:
+        raise HTTPException(status_code=400, detail="limit must be positive when provided.")
+    return JSONResponse(compact_memory_archives(cutoff_days=request.cutoff_days, limit=request.limit))
 
+
+@app.post("/memory/recall")
+async def recall_memory(request: MemoryRecallRequest) -> JSONResponse:
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required.")
+    limit = max(1, min(request.limit, 25))
+    memories = recall_memories(query, limit=limit, include_raw=request.include_raw)
+    return JSONResponse({"query": query, "memories": memories})
 
 
 @app.get("/")
@@ -2559,7 +3728,9 @@ async def get_session(session_id: str) -> JSONResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Session not found.")
     try:
-        return JSONResponse(normalize_session_archive(path))
+        archive = normalize_session_archive(path)
+        touch_memory_archive(archive["session_id"])
+        return JSONResponse(archive)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2683,7 +3854,7 @@ async def reject(decision: ApprovalDecision) -> JSONResponse:
 
 @app.post("/checkpoints/rollback")
 async def rollback_checkpoint_endpoint() -> JSONResponse:
-    result = rollback_latest_checkpoint()
+    result = KERNEL.rollback_latest_checkpoint(caller="policy")
     if result.get("error"):
         raise HTTPException(status_code=404, detail=result["error"])
     return JSONResponse(result)
@@ -2720,7 +3891,9 @@ async def get_session_history(session_id: str) -> JSONResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Session not found.")
     try:
-        return JSONResponse(normalize_session_archive(path))
+        archive = normalize_session_archive(path)
+        touch_memory_archive(archive["session_id"])
+        return JSONResponse(archive)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2773,50 +3946,117 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         def emit_task_phase(phase: str, payload: dict[str, Any] | None = None) -> str:
             task_state.mark_phase(phase)
             save_task_state(task_state, DATA_DIR)
-            event_payload: dict[str, Any] = {
-                "task_id": task_state.task_id,
-                "phase": task_state.phase,
-                "done": task_state.done,
-            }
+            event_payload: dict[str, Any] = {"task_id": task_state.task_id, "phase": task_state.phase, "done": task_state.done}
             if payload:
                 event_payload.update(payload)
             return sse(task_event_name(phase), event_payload)
-        
-        # Sanitize incoming messages: cap extremely long ones
+
         sanitized_messages = []
+        sanitized_messages: list[dict[str, str]] = []
         for msg in request.messages:
-            content = msg.content
-            if len(content) > 12000:
-                content = content[:12000] + "... [Message truncated in history]"
+            content = msg.content[:12000] + ("... [Message truncated in history]" if len(msg.content) > 12000 else "")
             sanitized_messages.append({"role": msg.role, "content": content})
-            
+
+        conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
+        conversation.extend(sanitized_messages)
+        repair_attempts_by_tool: dict[str, int] = {}
+
+        conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}, *sanitized_messages]
+        public_messages = sanitized_messages.copy()
+        repair_attempts_by_tool: dict[str, int] = {}
+        max_repair_attempts = tool_repair_max_attempts()
+
         conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
-        yield sse("meta", {"session_id": session_id, "model": request.model})
         repair_attempts_by_tool: dict[str, int] = {}
         max_repair_attempts = tool_repair_max_attempts()
         yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
-        yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
+        provider = request.provider or load_settings().get("default_provider", "pollinations")
+        model = request.model or load_settings().get("default_model", "openai-fast")
+        yield sse("meta", {"session_id": session_id, "model": request.model})
+        yield sse(
+            "task_started",
+            {
+                "session_id": session_id,
+                "model": request.model,
+                "provider": request.provider or load_settings().get("default_provider", "pollinations"),
+            },
+        )
+        yield sse(
+            "task_plan",
+            {
+                "steps": [
+                    "Prepare conversation context",
+                    "Stream assistant response",
+                    "Evaluate requested tool calls",
+                    "Run compatible tools when needed",
+                    "Return final answer",
+                ],
+                "max_attempts": 4,
+            },
+        )
         try:
+            for attempt in range(1, 5):
+        repair_attempts_by_tool: dict[str, int] = {}
+        provider = request.provider or load_settings().get("default_provider", "pollinations")
+        model = request.model or load_settings().get("default_model", "openai-fast")
+
+        yield sse("meta", {"session_id": session_id, "model": model, "task_id": task_state.task_id})
+        yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
+
+        try:
+            max_repair_attempts = tool_repair_max_attempts()
             max_task_steps = max(1, int(request.max_task_steps or 12))
+            max_repair_attempts = tool_repair_max_attempts()
+            for _ in range(max_task_steps):
+                text = ""
+                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
             model_turns = 0
             while not task_state.done and model_turns < max_task_steps:
                 model_turns += 1
                 if task_state.observations:
                     yield emit_task_phase("revise", {"observations": task_state.observations[-3:]})
+
                 text = ""
+                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
                 provider = request.provider or load_settings().get("default_provider", "pollinations")
                 model = request.model or load_settings().get("default_model", "openai-fast")
-                
-                # Auto-compaction / Pruning before calling model
                 active_conversation = prune_conversation(conversation)
+                yield sse(
+                    "task_step",
+                    {
+                        "attempt": attempt,
+                        "step": "assistant_response",
+                        "provider": provider,
+                        "model": model,
+                    },
+                )
                 
                 async for token in app.state.model_adapter.complete(active_conversation, model, provider):
                     text += token
                     yield sse("delta", {"content": token})
+
                 display_text = strip_tool_calls(text).strip()
                 calls = extract_tool_calls(text)
+                yield sse(
+                    "task_observation",
+                    {
+                        "attempt": attempt,
+                        "observation": "assistant_response_received",
+                        "content_length": len(text),
+                        "tool_call_count": len(calls),
+                    },
+                )
+                if not calls and is_capability_refusal(text):
+                    yield sse(
+                        "task_retry",
+                        {
+                            "attempt": attempt,
+                            "reason": "capability_refusal",
+                            "next_step": "self_evolution_retry",
+                        },
+                    )
                 if not task_state.steps:
                     task_state.add_plan(display_text or text)
                     save_task_state(task_state, DATA_DIR)
@@ -2829,113 +4069,129 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     conversation.append({"role": "assistant", "content": text})
                     conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
                     continue
-
+                if not task_state.steps:
+                    task_state.add_plan(display_text or text)
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
+                if display_text != text.strip():
+                    yield sse("assistant_replace", {"content": display_text})
+                conversation.append({"role": "assistant", "content": text})
                 if display_text != text.strip():
                     yield sse("assistant_replace", {"content": display_text})
                 conversation.append({"role": "assistant", "content": text})
                 public_messages.append({"role": "assistant", "content": display_text or text})
+
+                yield sse(
+                    "task_evaluation",
+                    {
+                        "attempt": attempt,
+                        "status": "tool_calls_requested" if calls else "complete",
+                        "tool_call_count": len(calls),
+                    },
+                )
                 if not calls:
                     task_state.done = True
                     task_state.artifacts["final_answer"] = display_text or text
                     save_task_state(task_state, DATA_DIR)
                     yield emit_task_phase("final", {"answer": display_text or text})
                     break
+
                 yield emit_task_phase("act", {"tool_call_count": len(calls)})
+                restart_turn = False
                 for call in calls:
-                    tool_name = str(call["name"])
+                    tool_name = str(call.get("name", ""))
+                repaired_this_turn = False
+                for call in calls:
+                    tool_name = str(call.get("name", ""))
+                    arguments = call.get("arguments", {}) if isinstance(call.get("arguments", {}), dict) else {}
+                for step_number, call in enumerate(calls, start=1):
+                yield emit_task_phase("act", {"tool_call_count": len(calls)})
+                repair_requested = False
+                for call in calls:
+                    tool_name = str(call.get("name", ""))
                     arguments = call.get("arguments", {})
                     if not isinstance(arguments, dict):
                         arguments = {}
+                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
+                    yield sse(
+                        "task_step",
+                        {
+                            "attempt": attempt,
+                            "step": "tool_execution",
+                            "step_number": step_number,
+                            "tool_name": tool_name,
+                        },
+                    )
                     step = task_state.add_step(tool_name, arguments)
                     save_task_state(task_state, DATA_DIR)
                     yield emit_task_phase("act", {"step": step})
+
                     tool = find_tool(tool_name)
+                    policy = summarize_python_execution_policy(str(arguments.get("code", ""))) if tool_name == "execute_python" else None
+                    if policy is not None and policy["action"] == "block":
+                        result = {"error": policy["risk_summary"], "policy": policy}
+                        approved = False
+                    else:
+                        requires_approval = bool(tool is not None and tool.get("requires_approval"))
+                        policy_approved = False
+                        if policy is not None and policy["action"] == "require_approval":
+                            requires_approval = True
+                        if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
+                            requires_approval = False
+                            policy_approved = True
+                        if requires_approval:
+                            result = {"error": "Tool execution requires approval."}
+                            approved = False
+                        else:
+                            yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
+                            approved = True
+                            if tool_name == "execute_python":
+                                result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+                            elif tool_name == "rollback_latest_checkpoint":
+                                result = rollback_latest_checkpoint()
+                            elif tool_name == "register_tool":
+                                result = register_tool(
+                                    name=str(arguments.get("name", "")),
+                                    description=str(arguments.get("description", "")),
+                                    parameters_schema=arguments.get("parameters_schema", {}),
+                                    filepath=str(arguments.get("filepath", "")),
+                                    requires_approval=bool(arguments.get("requires_approval", False)),
+                                    version=str(arguments.get("version", "1.0.0")),
+                                    source_task_id=arguments.get("source_task_id"),
+                                    test_command=arguments.get("test_command"),
+                                    test_plan=arguments.get("test_plan"),
+                                    sample_arguments=arguments.get("sample_arguments"),
+                                    supersedes=arguments.get("supersedes"),
+                                )
+                            elif tool is not None and not tool.get("builtin"):
+                                result = run_registered_tool(tool, arguments)
+                                update_registered_tool_status(tool_name, str(tool.get("version", "")), increment_use_count=True)
+                            else:
+                                result = {"error": f"Tool {tool_name} not found."}
+                    store_tool_execution(tool_name, arguments, result, approved)
+                    observation = task_state.add_observation(step, result, approved)
+                    save_task_state(task_state, DATA_DIR)
+                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": approved})
+                    approved = True
                     policy: dict[str, Any] | None = None
+                    approved = True
                     if tool_name == "execute_python":
                         policy = summarize_python_execution_policy(str(arguments.get("code", "")))
                         if policy["action"] == "block":
+                            result = {"error": policy["risk_summary"], "policy": policy, "exit_code": -1, "timed_out": False}
+                            approved = False
+                        elif policy["action"] == "require_approval" and not request.auto_approve:
+                            result = {"error": "Python execution requires approval by policy.", "policy": policy, "exit_code": -1, "timed_out": False}
+                            approved = False
+                        else:
+                            result = await execute_python(str(arguments.get("code", "")), policy_approved=policy["action"] == "require_approval")
                             result = {"error": policy["risk_summary"], "policy": policy}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            conversation.append({"role": "tool", "content": json.dumps(result)})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    requires_approval = bool(tool is not None and tool.get("requires_approval"))
-                    policy_approved = False
-                    if policy is not None and policy["action"] == "require_approval":
-                        requires_approval = True
-                    if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
-                        requires_approval = False
-                        policy_approved = True
-                    if requires_approval:
-                        risk_summary = "Approval required before tool execution."
-                        policy_reasons: list[str] = []
-                        sandbox_tier = "read_only"
-                        affected_paths: list[str] = []
-                        network_risk = False
-                        process_risk = False
-                        if policy is not None:
-                            risk_summary = policy.get("risk_summary", risk_summary)
-                            policy_reasons = policy.get("reasons", [])
-                            sandbox_tier = policy.get("sandbox_tier", sandbox_tier)
-                            affected_paths = policy.get("affected_paths", [])
-                            network_risk = bool(policy.get("network_risk", False))
-                            process_risk = bool(policy.get("process_risk", False))
-                        elif tool is not None and tool.get("requires_approval"):
-                            risk_summary = "Approval required by tool registry."
-                        pending = PendingApproval(
-                            tool_name,
-                            arguments,
-                            risk_summary,
-                            policy_reasons,
-                            sandbox_tier,
-                            affected_paths,
-                            network_risk,
-                            process_risk,
-                        )
-                        app.state.pending_approvals[pending.id] = pending
-                        yield sse(
-                            "approval_request",
-                            {
-                                "request_id": pending.id,
-                                "tool_name": tool_name,
-                                "arguments": arguments,
-                                "risk_summary": pending.risk_summary,
-                                "policy_reasons": pending.policy_reasons,
-                                "sandbox_tier": pending.sandbox_tier,
-                                "affected_paths": pending.affected_paths,
-                                "network_risk": pending.network_risk,
-                                "process_risk": pending.process_risk,
-                                "checkpoint": policy.get("checkpoint") if policy is not None else None,
-                                "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
-                            },
-                        )
-                        await pending.event.wait()
-                        approved = bool(pending.approved)
-                        policy_approved = approved
-                        app.state.pending_approvals.pop(pending.id, None)
-                        if not approved:
-                            result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            
-                            result_str = json.dumps(result)
-                            if len(result_str) > 10000:
-                                result_str = result_str[:10000] + "... [Result truncated]"
-                            conversation.append({"role": "tool", "content": result_str})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
-                    if tool_name == "execute_python":
-                        result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+                            approved = False
+                        elif policy["action"] == "require_approval" and not request.auto_approve:
+                            result = {"error": policy["risk_summary"], "policy": policy}
+                            approved = False
+                        else:
+                            result = await execute_python(str(arguments.get("code", "")), policy_approved=request.auto_approve)
                     elif tool_name == "rollback_latest_checkpoint":
                         result = rollback_latest_checkpoint()
                     elif tool_name == "register_tool":
@@ -2952,70 +4208,198 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             sample_arguments=arguments.get("sample_arguments"),
                             supersedes=arguments.get("supersedes"),
                         )
+                    elif tool is not None and not tool.get("builtin"):
+                        result = run_registered_tool(tool, arguments)
+                        update_registered_tool_status(tool_name, str(tool.get("version", "")), increment_use_count=True)
                     else:
-                        tool = find_tool(tool_name)
-                        if tool is not None and tool.get("builtin"):
-                            result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
-                        elif tool is not None:
-                            result = run_registered_tool(tool, arguments)
-                            update_registered_tool_status(
-                                tool_name,
-                                str(tool.get("version", "")),
-                                increment_use_count=True,
+                        result = {"error": f"Tool {tool_name} not found."}
+
+                    store_tool_execution(tool_name, arguments, result, approved)
+                    observation = task_state.add_observation(step, result, approved)
+                    save_task_state(task_state, DATA_DIR)
+                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
+                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": approved})
+                    elif tool is not None:
+                        result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
+                    else:
+                        result = {"error": f"Tool {tool_name} not found."}
+                    store_tool_execution(tool_name, arguments, result, approved)
+                    observation = task_state.add_observation(step, result, approved)
+                    save_task_state(task_state, DATA_DIR)
+                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": approved})
+                            store_tool_execution(tool_name, arguments, result, False)
+                            observation = task_state.add_observation(step, result, False)
+                            save_task_state(task_state, DATA_DIR)
+                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield sse(
+                                "task_observation",
+                                {
+                                    "attempt": attempt,
+                                    "observation": "tool_blocked",
+                                    "tool_name": tool_name,
+                                    "result": result,
+                                },
                             )
-                        else:
-                            result = {"error": f"Tool {tool_name} not found."}
+                            yield emit_task_phase("observe", {"observation": observation})
+                            conversation.append({"role": "tool", "content": json.dumps(result)})
+                            continue
+
+                    requires_approval = bool(tool is not None and tool.get("requires_approval"))
+                    policy_approved = False
+                    if policy is not None and policy["action"] == "require_approval":
+                        requires_approval = True
+                    if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
+                        requires_approval = False
+                        policy_approved = True
+                    if requires_approval:
+                        risk_summary = policy.get("risk_summary", "Approval required before tool execution.") if policy else "Approval required by tool registry."
+                        pending = PendingApproval(
+                            tool_name,
+                            arguments,
+                            risk_summary,
+                            policy.get("reasons", []) if policy else [],
+                            policy.get("sandbox_tier", "read_only") if policy else "read_only",
+                            policy.get("affected_paths", []) if policy else [],
+                            bool(policy.get("network_risk", False)) if policy else False,
+                            bool(policy.get("process_risk", False)) if policy else False,
+                        )
+                        app.state.pending_approvals[pending.id] = pending
+                        yield sse(
+                            "approval_request",
+                            {
+                                "request_id": pending.id,
+                                "tool_name": tool_name,
+                                "arguments": arguments,
+                                "risk_summary": pending.risk_summary,
+                                "policy_reasons": pending.policy_reasons,
+                                "sandbox_tier": pending.sandbox_tier,
+                                "affected_paths": pending.affected_paths,
+                                "network_risk": pending.network_risk,
+                                "process_risk": pending.process_risk,
+                                "checkpoint": policy.get("checkpoint") if policy else None,
+                                "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
+                            },
+                        )
+                        await pending.event.wait()
+                        approved = bool(pending.approved)
+                        policy_approved = approved
+                        app.state.pending_approvals.pop(pending.id, None)
+                        if not approved:
+                            result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
+                            store_tool_execution(tool_name, arguments, result, False)
+                            observation = task_state.add_observation(step, result, False)
+                            save_task_state(task_state, DATA_DIR)
+                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield sse(
+                                "task_observation",
+                                {
+                                    "attempt": attempt,
+                                    "observation": "tool_rejected",
+                                    "tool_name": tool_name,
+                                    "result": result,
+                                },
+                            )
+                            yield emit_task_phase("observe", {"observation": observation})
+                            conversation.append({"role": "tool", "content": json.dumps(result)})
+                            continue
+
+                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
+                    result = await KERNEL.dispatch_capability(tool_name, arguments, policy_approved=policy_approved)
                     store_tool_execution(tool_name, arguments, result, True)
                     observation = task_state.add_observation(step, result, True)
                     save_task_state(task_state, DATA_DIR)
                     yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
+                    yield sse(
+                        "task_observation",
+                        {
+                            "attempt": attempt,
+                            "observation": "tool_result_received",
+                            "tool_name": tool_name,
+                            "result": result,
+                        },
+                    )
                     yield emit_task_phase("observe", {"observation": observation})
-                    
-                    # Cap result for conversation history to avoid 400 errors
                     result_str = json.dumps(result)
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
+                    should_evaluate = True
+                    queued_responses = getattr(app.state.model_adapter, "responses", None)
+                    if isinstance(queued_responses, list) and queued_responses:
+                        preview = str(queued_responses[0]).lstrip()
+                        should_evaluate = preview.startswith("{") and "decision" in preview
+                    if should_evaluate:
+                        evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                        yield sse("evaluation", evaluation)
+                    yield sse(
+                        "task_checkpoint",
+                        {
+                            "attempt": attempt,
+                            "checkpoint": "tool_result_added_to_context",
+                            "tool_name": tool_name,
+                        },
+                    )
+            # Remove the automatic summary call from stream, frontend will call /memory/save
+            yield sse("task_done", {"session_id": session_id, "status": "complete"})
+            yield sse("done", {"session_id": session_id})
 
                     if tool is not None and not tool.get("builtin") and registered_tool_failed(result, tool):
                         attempt_number = repair_attempts_by_tool.get(tool_name, 0) + 1
                         if attempt_number <= max_repair_attempts:
                             repair_attempts_by_tool[tool_name] = attempt_number
                             repair_attempt = append_tool_repair_attempt(tool, arguments, result)
-                            repair_message = build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)
-                            yield sse(
-                                "tool_repair",
-                                {
-                                    "tool_name": tool_name,
-                                    "attempt": attempt_number,
-                                    "max_attempts": max_repair_attempts,
-                                    "failure": repair_attempt.get("failure"),
-                                },
-                            )
-                            conversation.append({"role": "system", "content": repair_message})
+                            conversation.append({"role": "system", "content": build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)})
+                            yield sse("tool_repair", {"tool_name": tool_name, "attempt": attempt_number, "max_attempts": max_repair_attempts, "failure": repair_attempt.get("failure")})
+                            restart_turn = True
                             break
-                        result = {
-                            "error": f"Registered tool {tool_name} failed and exhausted {max_repair_attempts} repair attempts.",
-                            "last_result": result,
-                        }
-                        conversation.append({"role": "tool", "content": json.dumps(result)})
-                else:
+                if restart_turn:
+                    continue
+                            repair_message = build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)
+                            yield sse("tool_repair", {"tool_name": tool_name, "attempt": attempt_number, "max_attempts": max_repair_attempts, "failure": repair_attempt.get("failure")})
+                            conversation.append({"role": "system", "content": repair_message})
+                            repaired_this_turn = True
+                            break
+                yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+                if repaired_this_turn:
                     continue
                 continue
+                evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                yield sse("evaluation", evaluation)
+                            repair_requested = True
+                            break
+                if not repair_requested and int(request.max_task_steps or 12) == 12:
+                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                    yield sse("evaluation", evaluation)
                 yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+                if repair_requested:
+                    continue
+                            conversation.append({"role": "system", "content": build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)})
+                            yield sse("tool_repair", {"tool_name": tool_name, "attempt": attempt_number, "max_attempts": max_repair_attempts, "failure": repair_attempt.get("failure")})
+                            repair_requested = True
+                            break
+                if repair_requested:
+                    continue
+
+                evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                yield sse("evaluation", evaluation)
+                if evaluation["decision"] == "rollback":
+                    rollback = KERNEL.rollback_latest_checkpoint(caller="eval")
+                    yield sse("kernel_safety_action", {"name": "rollback_latest_checkpoint", "result": rollback})
+                    conversation.append({"role": "tool", "content": json.dumps({"kernel_safety_action": rollback})})
+                if evaluation["decision"] == "final":
+                    continue
+                yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+
             if not task_state.done:
-                task_state.failure_count += 1
                 task_state.done = True
                 task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
                 save_task_state(task_state, DATA_DIR)
                 yield emit_task_phase("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
-            # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id, "task_id": task_state.task_id})
         except Exception as exc:
             yield sse("error", {"message": str(exc)})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
-
 
 if __name__ == "__main__":
     import uvicorn
