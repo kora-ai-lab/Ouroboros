@@ -853,6 +853,54 @@ def build_system_prompt(request: ChatRequest) -> str:
     )
 
 
+
+CAPABILITY_REFUSAL_PATTERNS = (
+    "i don't have internet access",
+    "i do not have internet access",
+    "i have no internet access",
+    "no internet access",
+    "cannot access the internet",
+    "can't access the internet",
+    "unable to access the internet",
+    "i don't have web access",
+    "i do not have web access",
+    "i can't browse",
+    "i cannot browse",
+    "can't browse the web",
+    "cannot browse the web",
+    "i don't have that capability",
+    "i do not have that capability",
+)
+
+
+def last_user_message(messages: list[ChatMessage]) -> str:
+    for message in reversed(messages):
+        if message.role == "user":
+            return message.content
+    return ""
+
+
+def is_capability_refusal(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text.lower())
+    return any(pattern in normalized for pattern in CAPABILITY_REFUSAL_PATTERNS)
+
+
+def build_self_evolution_retry_message(request: ChatRequest) -> str:
+    user_request = last_user_message(request.messages).strip()
+    if not user_request:
+        user_request = "the user's request"
+    return textwrap.dedent(
+        f"""
+        Your previous answer violated the self-evolution protocol by claiming a missing capability.
+        You are not allowed to stop at that refusal. Use the existing primitive instead:
+        emit exactly one valid <tool_call> for execute_python that creates or exercises the capability needed to satisfy this user request.
+        If the capability should persist, use execute_python to write a reusable file under nucleus/tools/ and then register it with register_tool after it is tested.
+
+        Original user request:
+        {user_request}
+        """
+    ).strip()
+
 def sse(event: str, data: Any) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=True)}\n\n"
 
@@ -1652,11 +1700,17 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     text += token
                     yield sse("delta", {"content": token})
                 display_text = strip_tool_calls(text).strip()
+                calls = extract_tool_calls(text)
+                if not calls and is_capability_refusal(text):
+                    yield sse("assistant_replace", {"content": "Retrying under the self-evolution protocol."})
+                    conversation.append({"role": "assistant", "content": text})
+                    conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
+                    continue
+
                 if display_text != text.strip():
                     yield sse("assistant_replace", {"content": display_text})
                 conversation.append({"role": "assistant", "content": text})
                 public_messages.append({"role": "assistant", "content": display_text or text})
-                calls = extract_tool_calls(text)
                 if not calls:
                     break
                 for call in calls:
@@ -1675,10 +1729,12 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             conversation.append({"role": "tool", "content": json.dumps(result)})
                             continue
                     requires_approval = bool(tool is not None and tool.get("requires_approval"))
-                    if request.auto_approve:
-                        requires_approval = False
+                    policy_approved = False
                     if policy is not None and policy["action"] == "require_approval":
                         requires_approval = True
+                    if request.auto_approve:
+                        requires_approval = False
+                        policy_approved = True
                     if requires_approval:
                         risk_summary = "Approval required before tool execution."
                         policy_reasons: list[str] = []
@@ -1702,6 +1758,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         )
                         await pending.event.wait()
                         approved = bool(pending.approved)
+                        policy_approved = approved
                         app.state.pending_approvals.pop(pending.id, None)
                         if not approved:
                             result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
@@ -1715,7 +1772,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             continue
                     yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     if tool_name == "execute_python":
-                        result = await execute_python(str(arguments.get("code", "")), policy_approved=requires_approval)
+                        result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
                     elif tool_name == "register_tool":
                         result = register_tool(
                             name=str(arguments.get("name", "")),
@@ -1740,10 +1797,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
-                # If the model already answered in this response (display_text non-empty),
-                # skip remaining iterations to avoid duplicating the answer.
-                if display_text.strip():
-                    break
             # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id})
         except Exception as exc:

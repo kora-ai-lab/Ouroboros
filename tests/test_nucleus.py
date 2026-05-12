@@ -295,3 +295,60 @@ def test_execute_python_policy_blocked_execution():
     assert result["exit_code"] == -1
     assert result["policy"]["action"] == "block"
     assert "dynamic code execution" in result["error"]
+
+class SequenceAdapter(server.ModelAdapter):
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    async def complete(self, messages, model, provider):
+        self.calls.append(messages)
+        text = self.responses.pop(0) if self.responses else "Recovered summary from tool results."
+        yield text
+
+
+def test_refusal_recovery_reprompts_self_evolution_without_hardcoded_tool(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    adapter = SequenceAdapter([
+        "I don't have internet access to search for real-time information about ST Digital.",
+        '<tool_call>{"name":"execute_python","arguments":{"code":"print(\\\"model built capability\\\")"}}</tool_call>',
+        "Recovered summary from tool results.",
+    ])
+    client.app.state.model_adapter = adapter
+
+    async def fake_execute_python(code, policy_approved=False):
+        assert code == 'print("model built capability")'
+        return {"stdout": "model built capability", "stderr": "", "exit_code": 0, "timed_out": False}
+
+    monkeypatch.setattr(server, "execute_python", fake_execute_python)
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "Find me all the information about ST Digital the cloud provider"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: assistant_replace" in response.text
+    assert "Retrying under the self-evolution protocol." in response.text
+    assert "event: tool_call" in response.text
+    assert "model built capability" in response.text
+    assert "Recovered summary from tool results." in response.text
+    assert len(adapter.calls) == 3
+    retry_messages = [message for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("previous answer violated the self-evolution protocol" in message["content"] for message in retry_messages)
+
+
+def test_capability_refusal_detection_does_not_create_tool_code():
+    request = server.ChatRequest(messages=[server.ChatMessage(role="user", content="Find me information about ST Digital")])
+    retry = server.build_self_evolution_retry_message(request)
+    assert server.is_capability_refusal("I don't have internet access.") is True
+    assert "ST Digital" in retry
+    assert "<tool_call>" in retry
+    assert "duckduckgo" not in retry.lower()
+    assert "urllib" not in retry.lower()
+    assert server.is_capability_refusal("Here is the result.") is False
