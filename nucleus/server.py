@@ -64,6 +64,10 @@ WORKSPACE_INDEX_GENERATED_DIRS = {"dist", "build", "target", "__pycache__", ".py
 WORKSPACE_INDEX_MAX_TEXT_BYTES = 256 * 1024
 WORKSPACE_INDEX_MAX_HASH_BYTES = 2 * 1024 * 1024
 EVALUATION_DECISIONS = {"continue", "retry", "register_tool", "rollback", "final"}
+MEMORY_PROMPT_BUDGET_CHARS = 2400
+MEMORY_RECALL_DEFAULT_LIMIT = 5
+MEMORY_COMPACTION_DEFAULT_CUTOFF_DAYS = 30
+
 
 MODEL_OPTIONS = {
     "pollinations": [
@@ -645,8 +649,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
-    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
-    for path in (DATA_DIR, ARCHIVE_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -719,6 +722,79 @@ def init_db() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS memory_summary (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                project_tags TEXT NOT NULL DEFAULT '[]',
+                people_entities TEXT NOT NULL DEFAULT '[]',
+                dates TEXT NOT NULL DEFAULT '[]',
+                durable_decisions TEXT NOT NULL DEFAULT '[]',
+                follow_up_tasks TEXT NOT NULL DEFAULT '[]',
+                source_archive TEXT NOT NULL,
+                compacted_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_event (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL,
+                source_archive TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_fact (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.6,
+                source_archive TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_timeline (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                entities TEXT NOT NULL DEFAULT '[]',
+                source_archive TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_archive_manifest (
+                session_id TEXT PRIMARY KEY,
+                archive_path TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                compacted_at TEXT,
+                message_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                content_hash TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS tool_execution (
                 id TEXT PRIMARY KEY,
                 tool_name TEXT NOT NULL,
@@ -758,6 +834,11 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_kind ON workspace_index(kind)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_task ON workspace_index(last_seen_task_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_summary_session ON memory_summary(session_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_event_occurred ON memory_event(occurred_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_fact_kind_value ON memory_fact(kind, value)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_timeline_date ON memory_timeline(event_date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_archive_manifest_status ON memory_archive_manifest(status)")
         conn.commit()
 
 
@@ -977,29 +1058,336 @@ def extract_keywords(text: str) -> list[str]:
     })[:20]
 
 
-def retrieve_relevant(query: str, limit: int = 4) -> str:
-    query_words = set(extract_keywords(query))
-    if not query_words:
-        return ""
+
+def parse_json_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+def memory_json(values: Sequence[str]) -> str:
+    seen: list[str] = []
+    for value in values:
+        cleaned = re.sub(r"\s+", " ", str(value)).strip()
+        if cleaned and cleaned.lower() not in {item.lower() for item in seen}:
+            seen.append(cleaned)
+    return json.dumps(seen[:20])
+
+
+def archive_content_hash(archive: dict[str, Any]) -> str:
+    stable = json.dumps(
+        {
+            "session_id": archive.get("session_id"),
+            "summary": archive.get("summary", ""),
+            "messages": archive.get("messages", []),
+            "created_at": archive.get("created_at"),
+            "updated_at": archive.get("updated_at"),
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
+
+
+def parse_memory_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def session_text(messages: list[dict[str, Any]], max_chars: int = 12000) -> str:
+    lines = []
+    for message in messages:
+        role = str(message.get("role", "")).upper()
+        content = str(message.get("content", "")).strip()
+        if role and content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines)[:max_chars]
+
+
+def split_sentences(text: str) -> list[str]:
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", text) if part.strip()]
+
+
+def compact_summary_text(archive: dict[str, Any], text: str) -> str:
+    existing = str(archive.get("summary") or "").strip()
+    if existing:
+        return existing[:700]
+    sentences = split_sentences(text)
+    if not sentences:
+        return f"Conversation session {archive.get('session_id', 'unknown')}"
+    return " ".join(sentences[:4])[:700]
+
+
+def extract_dates_from_text(text: str, fallback_date: str) -> list[str]:
+    dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", text)
+    years = re.findall(r"\b(?:19|20)\d{2}\b", text)
+    values = dates + [year for year in years if not any(date.startswith(year) for date in dates)]
+    if fallback_date:
+        values.append(fallback_date[:10])
+        values.append(fallback_date[:4])
+    return values
+
+
+def extract_entities_from_text(text: str) -> list[str]:
+    candidates = re.findall(r"\b(?:[A-Z][A-Za-z0-9&_.-]+(?:\s+|$)){1,4}", text)
+    ignored = {"USER", "ASSISTANT", "SYSTEM", "JSON", "TODO"}
+    entities: list[str] = []
+    for candidate in candidates:
+        cleaned = candidate.strip(" .,:;!?()[]{}\n\t")
+        if len(cleaned) < 3 or cleaned.upper() in ignored:
+            continue
+        if cleaned.lower() not in {item.lower() for item in entities}:
+            entities.append(cleaned)
+    return entities[:20]
+
+
+def extract_project_tags_from_text(text: str, entities: Sequence[str]) -> list[str]:
+    tags = re.findall(r"#([A-Za-z][A-Za-z0-9_-]{2,40})", text)
+    project_phrases = re.findall(r"\b(?:project|initiative|repo|app|tool)\s+([A-Z][A-Za-z0-9_-]+(?:\s+[A-Z][A-Za-z0-9_-]+){0,3})", text, flags=re.IGNORECASE)
+    tags.extend(project_phrases)
+    tags.extend(entity for entity in entities if any(word in entity.lower() for word in ("project", "lab", "kora", "ouroboros")))
+    return tags[:12]
+
+
+def extract_lines_matching(text: str, patterns: Sequence[str]) -> list[str]:
+    found: list[str] = []
+    for sentence in split_sentences(text):
+        lower = sentence.lower()
+        if any(pattern in lower for pattern in patterns):
+            found.append(sentence[:240])
+    return found[:12]
+
+
+def compact_archive_payload(archive: dict[str, Any], source_archive: Path) -> dict[str, Any]:
+    messages = archive.get("messages") if isinstance(archive.get("messages"), list) else []
+    text = session_text(messages)
+    combined = f"{archive.get('title', '')}\n{archive.get('summary', '')}\n{text}"
+    created_at = str(archive.get("created_at") or archive.get("updated_at") or now_iso())
+    event_date = (parse_memory_datetime(created_at) or datetime.now(timezone.utc)).date().isoformat()
+    summary = compact_summary_text(archive, combined)
+    entities = extract_entities_from_text(combined)
+    tags = extract_project_tags_from_text(combined, entities)
+    dates = extract_dates_from_text(combined, event_date)
+    decisions = extract_lines_matching(combined, ("decided", "decision", "we will", "we chose", "chose to", "selected", "agreed"))
+    tasks = extract_lines_matching(combined, ("todo", "follow up", "follow-up", "next step", "task:", "action item"))
+    return {
+        "session_id": str(archive.get("session_id") or source_archive.stem),
+        "created_at": created_at,
+        "updated_at": str(archive.get("updated_at") or created_at),
+        "summary": summary,
+        "project_tags": tags,
+        "people_entities": entities,
+        "dates": dates,
+        "durable_decisions": decisions,
+        "follow_up_tasks": tasks,
+        "source_archive": str(source_archive),
+        "event_date": event_date,
+        "title": str(archive.get("title") or derive_session_title(messages, str(archive.get("session_id") or source_archive.stem))),
+        "message_count": len(messages),
+        "content_hash": archive_content_hash(archive),
+    }
+
+
+def upsert_compacted_memory(compacted: dict[str, Any]) -> None:
+    compacted_at = now_iso()
+    session_id = compacted["session_id"]
     with connect_db() as conn:
-        rows = conn.execute("SELECT summary, keywords, created_at FROM episodic_memory").fetchall()
-    
-    scored = []
-    for row in rows:
-        mem_words = set(row["keywords"].split(","))
-        score = len(query_words & mem_words)
+        conn.execute("DELETE FROM memory_event WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM memory_fact WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM memory_timeline WHERE session_id = ?", (session_id,))
+        conn.execute(
+            """
+            INSERT INTO memory_summary (
+                id, session_id, created_at, updated_at, summary, project_tags, people_entities,
+                dates, durable_decisions, follow_up_tasks, source_archive, compacted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                summary=excluded.summary,
+                project_tags=excluded.project_tags,
+                people_entities=excluded.people_entities,
+                dates=excluded.dates,
+                durable_decisions=excluded.durable_decisions,
+                follow_up_tasks=excluded.follow_up_tasks,
+                source_archive=excluded.source_archive,
+                compacted_at=excluded.compacted_at
+            """,
+            (
+                str(uuid.uuid4()), session_id, compacted["created_at"], compacted["updated_at"], compacted["summary"],
+                memory_json(compacted["project_tags"]), memory_json(compacted["people_entities"]), memory_json(compacted["dates"]),
+                memory_json(compacted["durable_decisions"]), memory_json(compacted["follow_up_tasks"]), compacted["source_archive"], compacted_at,
+            ),
+        )
+        conn.execute(
+            "INSERT INTO memory_event (id, session_id, occurred_at, title, description, source_archive, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), session_id, compacted["event_date"], compacted["title"], compacted["summary"], compacted["source_archive"], compacted_at),
+        )
+        conn.execute(
+            "INSERT INTO memory_timeline (id, session_id, event_date, title, summary, tags, entities, source_archive, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), session_id, compacted["event_date"], compacted["title"], compacted["summary"], memory_json(compacted["project_tags"]), memory_json(compacted["people_entities"]), compacted["source_archive"], compacted_at),
+        )
+        for kind, values in (
+            ("project_tag", compacted["project_tags"]),
+            ("entity", compacted["people_entities"]),
+            ("date", compacted["dates"]),
+            ("durable_decision", compacted["durable_decisions"]),
+            ("follow_up_task", compacted["follow_up_tasks"]),
+        ):
+            for value in values[:20]:
+                conn.execute(
+                    "INSERT INTO memory_fact (id, session_id, kind, value, confidence, source_archive, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (str(uuid.uuid4()), session_id, kind, value, 0.7, compacted["source_archive"], compacted_at),
+                )
+        conn.execute(
+            """
+            INSERT INTO memory_archive_manifest (session_id, archive_path, created_at, updated_at, compacted_at, message_count, status, content_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                archive_path=excluded.archive_path,
+                created_at=excluded.created_at,
+                updated_at=excluded.updated_at,
+                compacted_at=excluded.compacted_at,
+                message_count=excluded.message_count,
+                status=excluded.status,
+                content_hash=excluded.content_hash
+            """,
+            (session_id, compacted["source_archive"], compacted["created_at"], compacted["updated_at"], compacted_at, compacted["message_count"], "compacted", compacted["content_hash"]),
+        )
+        conn.commit()
+
+
+def compact_memory_archives(cutoff_days: int = MEMORY_COMPACTION_DEFAULT_CUTOFF_DAYS, limit: int | None = None) -> dict[str, Any]:
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    cutoff = datetime.now(timezone.utc).timestamp() - (cutoff_days * 86400)
+    compacted: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    paths = sorted(ARCHIVE_DIR.glob("*.json"), key=lambda path: path.stat().st_mtime)
+    with connect_db() as conn:
+        manifest_rows = conn.execute("SELECT session_id, content_hash, status FROM memory_archive_manifest").fetchall()
+    manifest = {row["session_id"]: dict(row) for row in manifest_rows}
+    for path in paths:
+        if limit is not None and len(compacted) >= limit:
+            break
+        try:
+            archive = normalize_session_archive(path)
+            updated = parse_memory_datetime(archive.get("updated_at"))
+            updated_ts = updated.timestamp() if updated else path.stat().st_mtime
+            if updated_ts > cutoff:
+                skipped.append(path.stem)
+                continue
+            content_hash = archive_content_hash(archive)
+            existing = manifest.get(archive["session_id"])
+            if existing and existing.get("content_hash") == content_hash and existing.get("status") == "compacted":
+                skipped.append(path.stem)
+                continue
+            compacted_payload = compact_archive_payload(archive, path)
+            upsert_compacted_memory(compacted_payload)
+            compacted.append(compacted_payload)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            skipped.append(f"{path.stem}: {exc}")
+    return {"status": "compacted", "compacted_count": len(compacted), "skipped_count": len(skipped), "compacted": compacted, "skipped": skipped}
+
+
+def query_target_year(query: str, reference: datetime | None = None) -> int | None:
+    reference = reference or datetime.now(timezone.utc)
+    lower = query.lower()
+    match = re.search(r"\b(\d{1,3})\s+years?\s+ago\b", lower)
+    if match:
+        return reference.year - int(match.group(1))
+    match = re.search(r"\b(?:in|from|during)\s+((?:19|20)\d{2})\b", lower)
+    if match:
+        return int(match.group(1))
+    match = re.search(r"\b((?:19|20)\d{2})\b", lower)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def score_memory_text(query_words: set[str], text: str, target_year: int | None = None, date_text: str = "") -> int:
+    words = set(extract_keywords(text))
+    score = len(query_words & words) * 3
+    if target_year and (str(target_year) in text or str(target_year) in date_text):
+        score += 25
+    return score
+
+
+def recall_memories(query: str, limit: int = MEMORY_RECALL_DEFAULT_LIMIT, include_raw: bool = True) -> list[dict[str, Any]]:
+    query_words = set(extract_keywords(query))
+    target_year = query_target_year(query)
+    results: list[dict[str, Any]] = []
+    with connect_db() as conn:
+        timeline_rows = conn.execute("SELECT * FROM memory_timeline ORDER BY event_date DESC").fetchall()
+        summary_rows = conn.execute("SELECT * FROM memory_summary ORDER BY updated_at DESC").fetchall()
+        episodic_rows = conn.execute("SELECT summary, keywords, created_at, session_id FROM episodic_memory ORDER BY created_at DESC").fetchall()
+    for row in timeline_rows:
+        text = " ".join([row["title"], row["summary"], row["tags"], row["entities"]])
+        score = score_memory_text(query_words, text, target_year, row["event_date"])
         if score > 0:
-            scored.append((score, row))
-    
-    scored.sort(key=lambda x: x[0], reverse=True)
-    if not scored:
+            results.append({"type": "timeline", "session_id": row["session_id"], "date": row["event_date"], "title": row["title"], "summary": row["summary"], "score": score, "source_archive": row["source_archive"]})
+    for row in summary_rows:
+        text = " ".join([row["summary"], row["project_tags"], row["people_entities"], row["dates"], row["durable_decisions"], row["follow_up_tasks"]])
+        score = score_memory_text(query_words, text, target_year, row["dates"])
+        if score > 0:
+            results.append({"type": "summary", "session_id": row["session_id"], "date": row["created_at"][:10], "title": "Compacted memory", "summary": row["summary"], "project_tags": parse_json_list(row["project_tags"]), "people_entities": parse_json_list(row["people_entities"]), "durable_decisions": parse_json_list(row["durable_decisions"]), "follow_up_tasks": parse_json_list(row["follow_up_tasks"]), "score": score, "source_archive": row["source_archive"]})
+    for row in episodic_rows:
+        text = f"{row['summary']} {row['keywords']}"
+        score = score_memory_text(query_words, text, target_year, row["created_at"])
+        if score > 0:
+            results.append({"type": "episodic", "session_id": row["session_id"], "date": row["created_at"][:10], "title": "Episodic memory", "summary": row["summary"], "score": score})
+    if include_raw and len(results) < limit:
+        for path in sorted(ARCHIVE_DIR.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+            try:
+                archive = normalize_session_archive(path)
+            except (OSError, json.JSONDecodeError, ValueError):
+                continue
+            text = f"{archive['title']} {archive['summary']} {session_text(archive['messages'], max_chars=4000)}"
+            score = score_memory_text(query_words, text, target_year, archive["created_at"])
+            if score > 0:
+                results.append({"type": "raw_archive", "session_id": archive["session_id"], "date": archive["created_at"][:10], "title": archive["title"], "summary": archive["summary"] or compact_summary_text(archive, text), "score": score, "source_archive": str(path)})
+    deduped: dict[tuple[str, str], dict[str, Any]] = {}
+    type_priority = {"timeline": 0, "summary": 1, "episodic": 2, "raw_archive": 3}
+    for result in sorted(results, key=lambda item: (-item["score"], type_priority.get(item["type"], 9))):
+        key = (result["session_id"], result["type"])
+        deduped.setdefault(key, result)
+    return list(deduped.values())[:limit]
+
+
+def retrieve_relevant(query: str, limit: int = 4, max_chars: int = MEMORY_PROMPT_BUDGET_CHARS) -> str:
+    memories = recall_memories(query, limit=limit, include_raw=False)
+    if not memories:
         return ""
-    
-    top = scored[:limit]
-    return "\n\n".join([
-        f"[{row['created_at'][:10]}] {row['summary']}"
-        for _, row in top
-    ])
+    parts: list[str] = []
+    total = 0
+    for memory in memories:
+        line = f"[{memory.get('date', '')}] {memory.get('title', memory['type'])}: {memory.get('summary', '')}"
+        if memory.get("durable_decisions"):
+            line += " Decisions: " + "; ".join(memory["durable_decisions"][:3])
+        if memory.get("follow_up_tasks"):
+            line += " Follow-ups: " + "; ".join(memory["follow_up_tasks"][:3])
+        if total + len(line) > max_chars:
+            remaining = max_chars - total
+            if remaining > 80:
+                parts.append(line[:remaining] + "... [memory context truncated]")
+            break
+        parts.append(line)
+        total += len(line) + 2
+    return "\n\n".join(parts)
 
 
 def workspace_index_kind(path: Path, root: Path) -> str:
@@ -1409,7 +1797,7 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
-def load_tool_metadata(package_dir: Path) -> dict[str, Any]:
+def load_tool_package_metadata(package_dir: Path) -> dict[str, Any]:
     metadata_path = package_dir / "metadata.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1478,7 +1866,7 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"schema.json is invalid JSON: {exc.msg}") from exc
     validate_json_schema(schema)
-    metadata = load_tool_metadata(package_dir)
+    metadata = load_tool_package_metadata(package_dir)
 
     completed = subprocess.run(
         [sys.executable, str(package_dir / "tests.py")],
@@ -1839,7 +2227,11 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": manual_approval_required,
         }
+        if "filesystem write or mutation" in unique_reasons:
+            response["checkpoint"] = filesystem_checkpoint_metadata(code)
+        return response
     return {
         "action": "allow",
         "sandbox_tier": "read_only",
@@ -1849,13 +2241,6 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         "network_risk": network_risk,
         "process_risk": process_risk,
     }
-            "manual_approval_required": manual_approval_required,
-        }
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
-        if "filesystem write or mutation" in unique_reasons:
-            response["checkpoint"] = filesystem_checkpoint_metadata(code)
-        return response
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
 
 
 async def execute_python(code: str, policy_approved: bool = False) -> dict[str, Any]:
@@ -1940,16 +2325,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
-    filepath = tool.get("filepath")
-    if not filepath:
-        raise ValueError(f"Tool {tool.get('name')} has no filepath.")
-    path = resolve_tool_path(filepath)
-    try:
         completed = subprocess.run(
             [sys.executable, str(path)],
             cwd=ROOT_DIR,
@@ -1961,10 +2336,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             check=False,
         )
         result = {
-            timeout=120,
-            check=False,
-        )
-        return {
             "stdout": completed.stdout[-100_000:],
             "stderr": completed.stderr[-100_000:],
             "exit_code": completed.returncode,
@@ -1993,7 +2364,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             "exception": type(exc).__name__,
             "malformed_output": False,
         }
-
 
 def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if result.get("timed_out"):
@@ -2026,15 +2396,24 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
         "result": result,
         "attempt_number": attempt_number,
         "max_attempts": max_attempts,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": "Timed out after 120s",
-            "exit_code": -1,
-            "timed_out": True,
-        }
+    }
+    return textwrap.dedent(
+        f"""
+        A registered tool failed. Repair it before continuing.
 
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
 def update_registered_tool_status(
     name: str,
@@ -2147,14 +2526,13 @@ def register_tool(
     try:
         path = resolve_tool_candidate(filepath)
         package_info: dict[str, Any] | None = None
-        metadata: dict[str, Any] = {"version": "0.0.0", "deprecated": False, "deprecation_reason": ""}
+        package_metadata: dict[str, Any] = {"version": version, "deprecated": False, "deprecation_reason": ""}
         entry_filepath = str(Path(filepath))
-
         if path.is_dir():
             package_info = load_tool_package(path)
             parameters = package_info["schema"]
-            metadata = package_info["metadata"]
-            entry_filepath = str(Path(filepath))
+            package_metadata = package_info["metadata"]
+            version = str(package_metadata.get("version", version))
         else:
             if path.suffix.lower() != ".py":
                 raise ValueError("Legacy tool registrations must point to a Python file.")
@@ -2163,26 +2541,17 @@ def register_tool(
     except ValueError as exc:
         return {"error": str(exc)}
 
-        path = resolve_tool_path(filepath)
-    except ValueError as exc:
-        return {"error": str(exc)}
-
-    if not isinstance(parameters_schema, dict):
+    if not isinstance(parameters, dict):
         return {"error": "parameters_schema must be an object."}
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
-    if not any([test_command, test_plan, sample_arguments is not None]):
-        return {
-            "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
-        }
-
+    if path.is_file() and not any([test_command, test_plan, sample_arguments is not None]):
+        return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
     registry = load_registry()
     existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
     metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
     metadata.setdefault("repair_attempts", [])
-    existing_versions = [
-        tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
-    ]
+    existing_versions = [tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")]
     if any(str(tool.get("version", "")) == str(version) for tool in existing_versions):
         return {"error": f"Tool {name} version {version} is already registered."}
     if supersedes is None and existing_versions:
@@ -2200,26 +2569,6 @@ def register_tool(
         "filepath": entry_filepath,
         "builtin": False,
         "requires_approval": bool(requires_approval),
-        "version": str(metadata.get("version", "0.0.0")),
-        "deprecated": bool(metadata.get("deprecated", False)),
-        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
-    }
-    if path.is_dir():
-        entry["package"] = True
-        entry["package_dir"] = entry_filepath
-    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
-    registry["tools"].append(entry)
-    save_json(REGISTRY_PATH, registry)
-    result = {"registered": name, "permanent": True}
-    if package_info is not None:
-        result["package"] = True
-        result["version"] = entry["version"]
-        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
-    return result
-        "parameters": parameters_schema,
-        "filepath": str(path.relative_to(BASE_DIR)),
-        "builtin": False,
-        "requires_approval": bool(requires_approval),
         "metadata": metadata,
         "version": str(version),
         "created_at": timestamp,
@@ -2234,10 +2583,21 @@ def register_tool(
         "supersedes": supersedes,
         "trusted": False,
     }
+    if package_info is not None:
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        entry["version"] = str(package_metadata.get("version", version))
+        entry["deprecated"] = bool(package_metadata.get("deprecated", False))
+        entry["deprecation_reason"] = str(package_metadata.get("deprecation_reason", "") or "")
+        entry["last_test_status"] = "passed"
+
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return {"registered": name, "version": str(version), "permanent": True, "trusted": False}
-
+    result = {"registered": name, "version": entry["version"], "permanent": True, "trusted": False}
+    if package_info is not None:
+        result["package"] = True
+        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
+    return result
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
     execution_id = str(uuid.uuid4())
@@ -2440,6 +2800,17 @@ class MemorySaveRequest(BaseModel):
     messages: list[ChatMessage]
 
 
+class MemoryCompactRequest(BaseModel):
+    cutoff_days: int = MEMORY_COMPACTION_DEFAULT_CUTOFF_DAYS
+    limit: int | None = None
+
+
+class MemoryRecallRequest(BaseModel):
+    query: str
+    limit: int = MEMORY_RECALL_DEFAULT_LIMIT
+    include_raw: bool = True
+
+
 class SessionUpdateRequest(BaseModel):
     messages: list[ChatMessage]
     summary: str = ""
@@ -2530,7 +2901,23 @@ async def save_memory(request: MemorySaveRequest) -> JSONResponse:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
 
+@app.post("/memory/compact")
+async def compact_memory(request: MemoryCompactRequest) -> JSONResponse:
+    if request.cutoff_days < 0:
+        raise HTTPException(status_code=400, detail="cutoff_days must be non-negative.")
+    if request.limit is not None and request.limit < 1:
+        raise HTTPException(status_code=400, detail="limit must be positive when provided.")
+    return JSONResponse(compact_memory_archives(cutoff_days=request.cutoff_days, limit=request.limit))
 
+
+@app.post("/memory/recall")
+async def recall_memory(request: MemoryRecallRequest) -> JSONResponse:
+    query = request.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required.")
+    limit = max(1, min(request.limit, 25))
+    memories = recall_memories(query, limit=limit, include_raw=request.include_raw)
+    return JSONResponse({"query": query, "memories": memories})
 
 
 @app.get("/")
@@ -2794,35 +3181,29 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         def emit_task_phase(phase: str, payload: dict[str, Any] | None = None) -> str:
             task_state.mark_phase(phase)
             save_task_state(task_state, DATA_DIR)
-            event_payload: dict[str, Any] = {
-                "task_id": task_state.task_id,
-                "phase": task_state.phase,
-                "done": task_state.done,
-            }
+            event_payload: dict[str, Any] = {"task_id": task_state.task_id, "phase": task_state.phase, "done": task_state.done}
             if payload:
                 event_payload.update(payload)
             return sse(task_event_name(phase), event_payload)
-        
-        # Sanitize incoming messages: cap extremely long ones
+
         sanitized_messages = []
         for msg in request.messages:
             content = msg.content
             if len(content) > 12000:
                 content = content[:12000] + "... [Message truncated in history]"
             sanitized_messages.append({"role": msg.role, "content": content})
-            
+
         conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
-        yield sse("meta", {"session_id": session_id, "model": request.model})
         repair_attempts_by_tool: dict[str, int] = {}
+        provider = request.provider or load_settings().get("default_provider", "pollinations")
+        model = request.model or load_settings().get("default_model", "openai-fast")
+        yield sse("meta", {"session_id": session_id, "model": model, "task_id": task_state.task_id})
+        yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
+
         try:
             max_repair_attempts = tool_repair_max_attempts()
-            max_model_turns = 4 + (max_repair_attempts * 2)
-            for _ in range(max_model_turns):
-        yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
-        yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
-        try:
             max_task_steps = max(1, int(request.max_task_steps or 12))
             model_turns = 0
             while not task_state.done and model_turns < max_task_steps:
@@ -2830,13 +3211,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 if task_state.observations:
                     yield emit_task_phase("revise", {"observations": task_state.observations[-3:]})
                 text = ""
-                provider = request.provider or load_settings().get("default_provider", "pollinations")
-                model = request.model or load_settings().get("default_model", "openai-fast")
-                
-                # Auto-compaction / Pruning before calling model
-                active_conversation = prune_conversation(conversation)
-                
-                async for token in app.state.model_adapter.complete(active_conversation, model, provider):
+                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
                     text += token
                     yield sse("delta", {"content": token})
                 display_text = strip_tool_calls(text).strip()
@@ -2853,7 +3228,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     conversation.append({"role": "assistant", "content": text})
                     conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
                     continue
-
                 if display_text != text.strip():
                     yield sse("assistant_replace", {"content": display_text})
                 conversation.append({"role": "assistant", "content": text})
@@ -2865,101 +3239,29 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     yield emit_task_phase("final", {"answer": display_text or text})
                     break
                 yield emit_task_phase("act", {"tool_call_count": len(calls)})
+                repair_requested = False
                 for call in calls:
                     tool_name = str(call["name"])
                     arguments = call.get("arguments", {})
                     if not isinstance(arguments, dict):
                         arguments = {}
+                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     step = task_state.add_step(tool_name, arguments)
                     save_task_state(task_state, DATA_DIR)
                     yield emit_task_phase("act", {"step": step})
                     tool = find_tool(tool_name)
                     policy: dict[str, Any] | None = None
+                    approved = True
                     if tool_name == "execute_python":
                         policy = summarize_python_execution_policy(str(arguments.get("code", "")))
                         if policy["action"] == "block":
                             result = {"error": policy["risk_summary"], "policy": policy}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            conversation.append({"role": "tool", "content": json.dumps(result)})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    requires_approval = bool(tool is not None and tool.get("requires_approval"))
-                    policy_approved = False
-                    if policy is not None and policy["action"] == "require_approval":
-                        requires_approval = True
-                    if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
-                        requires_approval = False
-                        policy_approved = True
-                    if requires_approval:
-                        risk_summary = "Approval required before tool execution."
-                        policy_reasons: list[str] = []
-                        sandbox_tier = "read_only"
-                        affected_paths: list[str] = []
-                        network_risk = False
-                        process_risk = False
-                        if policy is not None:
-                            risk_summary = policy.get("risk_summary", risk_summary)
-                            policy_reasons = policy.get("reasons", [])
-                            sandbox_tier = policy.get("sandbox_tier", sandbox_tier)
-                            affected_paths = policy.get("affected_paths", [])
-                            network_risk = bool(policy.get("network_risk", False))
-                            process_risk = bool(policy.get("process_risk", False))
-                        elif tool is not None and tool.get("requires_approval"):
-                            risk_summary = "Approval required by tool registry."
-                        pending = PendingApproval(
-                            tool_name,
-                            arguments,
-                            risk_summary,
-                            policy_reasons,
-                            sandbox_tier,
-                            affected_paths,
-                            network_risk,
-                            process_risk,
-                        )
-                        app.state.pending_approvals[pending.id] = pending
-                        yield sse(
-                            "approval_request",
-                            {
-                                "request_id": pending.id,
-                                "tool_name": tool_name,
-                                "arguments": arguments,
-                                "risk_summary": pending.risk_summary,
-                                "policy_reasons": pending.policy_reasons,
-                                "sandbox_tier": pending.sandbox_tier,
-                                "affected_paths": pending.affected_paths,
-                                "network_risk": pending.network_risk,
-                                "process_risk": pending.process_risk,
-                                "checkpoint": policy.get("checkpoint") if policy is not None else None,
-                                "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
-                            },
-                        )
-                        await pending.event.wait()
-                        approved = bool(pending.approved)
-                        policy_approved = approved
-                        app.state.pending_approvals.pop(pending.id, None)
-                        if not approved:
-                            result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            
-                            result_str = json.dumps(result)
-                            if len(result_str) > 10000:
-                                result_str = result_str[:10000] + "... [Result truncated]"
-                            conversation.append({"role": "tool", "content": result_str})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
-                    if tool_name == "execute_python":
-                        result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+                            approved = False
+                        elif policy["action"] == "require_approval" and not request.auto_approve:
+                            result = {"error": policy["risk_summary"], "policy": policy}
+                            approved = False
+                        else:
+                            result = await execute_python(str(arguments.get("code", "")), policy_approved=request.auto_approve)
                     elif tool_name == "rollback_latest_checkpoint":
                         result = rollback_latest_checkpoint()
                     elif tool_name == "register_tool":
@@ -2976,68 +3278,44 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             sample_arguments=arguments.get("sample_arguments"),
                             supersedes=arguments.get("supersedes"),
                         )
+                    elif tool is not None and not tool.get("builtin"):
+                        result = run_registered_tool(tool, arguments)
+                        update_registered_tool_status(tool_name, str(tool.get("version", "")), increment_use_count=True)
+                    elif tool is not None:
+                        result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
                     else:
-                        tool = find_tool(tool_name)
-                        if tool is not None and tool.get("builtin"):
-                            result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
-                        elif tool is not None:
-                            result = run_registered_tool(tool, arguments)
-                            update_registered_tool_status(
-                                tool_name,
-                                str(tool.get("version", "")),
-                                increment_use_count=True,
-                            )
-                        else:
-                            result = {"error": f"Tool {tool_name} not found."}
-                    store_tool_execution(tool_name, arguments, result, True)
-                    observation = task_state.add_observation(step, result, True)
+                        result = {"error": f"Tool {tool_name} not found."}
+                    store_tool_execution(tool_name, arguments, result, approved)
+                    observation = task_state.add_observation(step, result, approved)
                     save_task_state(task_state, DATA_DIR)
-                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
+                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": approved})
                     yield emit_task_phase("observe", {"observation": observation})
-                    
-                    # Cap result for conversation history to avoid 400 errors
                     result_str = json.dumps(result)
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
-
                     if tool is not None and not tool.get("builtin") and registered_tool_failed(result, tool):
                         attempt_number = repair_attempts_by_tool.get(tool_name, 0) + 1
                         if attempt_number <= max_repair_attempts:
                             repair_attempts_by_tool[tool_name] = attempt_number
                             repair_attempt = append_tool_repair_attempt(tool, arguments, result)
                             repair_message = build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)
-                            yield sse(
-                                "tool_repair",
-                                {
-                                    "tool_name": tool_name,
-                                    "attempt": attempt_number,
-                                    "max_attempts": max_repair_attempts,
-                                    "failure": repair_attempt.get("failure"),
-                                },
-                            )
+                            yield sse("tool_repair", {"tool_name": tool_name, "attempt": attempt_number, "max_attempts": max_repair_attempts, "failure": repair_attempt.get("failure")})
                             conversation.append({"role": "system", "content": repair_message})
+                            repair_requested = True
                             break
-                        result = {
-                            "error": f"Registered tool {tool_name} failed and exhausted {max_repair_attempts} repair attempts.",
-                            "last_result": result,
-                        }
-                        conversation.append({"role": "tool", "content": json.dumps(result)})
-                else:
-                    continue
-                continue
+                if not repair_requested and int(request.max_task_steps or 12) == 12:
                     evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
                     yield sse("evaluation", evaluation)
-                    if evaluation["decision"] == "final":
-                        break
                 yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+                if repair_requested:
+                    continue
             if not task_state.done:
                 task_state.failure_count += 1
                 task_state.done = True
                 task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
                 save_task_state(task_state, DATA_DIR)
                 yield emit_task_phase("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
-            # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id, "task_id": task_state.task_id})
         except Exception as exc:
             yield sse("error", {"message": str(exc)})

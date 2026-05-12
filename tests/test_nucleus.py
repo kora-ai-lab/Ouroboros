@@ -824,6 +824,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         description="Return the provided value as JSON.",
         parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         filepath="tools/flaky_tool.py",
+        test_plan="Exercise repair loop with an intentionally failing tool.",
     )
     assert registered["registered"] == "flaky_tool"
 
@@ -847,6 +848,34 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         "/chat",
         json={
             "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+            "max_task_steps": 6,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: tool_repair" in response.text
+    assert "nonzero_exit" in response.text
+    assert "The repaired tool succeeded." in response.text
+    assert "second-run" in response.text
+    assert len(adapter.calls) == 4
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
+
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
+    attempts = flaky["metadata"]["repair_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure"]["type"] == "nonzero_exit"
+
+    repaired = server.run_registered_tool(flaky, {"value": "direct"})
+    assert repaired["exit_code"] == 0
+    assert json.loads(repaired["stdout"])["value"] == "direct"
+
 
 def _run_git(repo: Path, *args: str) -> None:
     import subprocess
@@ -928,6 +957,8 @@ def test_system_prompt_guides_git_status_for_self_modifying_work(tmp_path, monke
     )
     assert "inspect `git status` before edits and again after edits" in prompt
     assert "nucleus/git_harness.py" in prompt
+
+
 def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     adapter = SequenceAdapter([
@@ -954,24 +985,6 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     )
 
     assert response.status_code == 200
-    assert "event: tool_repair" in response.text
-    assert "nonzero_exit" in response.text
-    assert "The repaired tool succeeded." in response.text
-    assert "second-run" in response.text
-    assert len(adapter.calls) == 4
-    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
-    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
-    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
-
-    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
-    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
-    attempts = flaky["metadata"]["repair_attempts"]
-    assert len(attempts) == 1
-    assert attempts[0]["failure"]["type"] == "nonzero_exit"
-
-    repaired = server.run_registered_tool(flaky, {"value": "direct"})
-    assert repaired["exit_code"] == 0
-    assert json.loads(repaired["stdout"])["value"] == "direct"
     assert "event: task_plan" in response.text
     assert "event: task_step" in response.text
     assert "event: task_observation" in response.text
@@ -987,3 +1000,109 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     assert len(task_state["steps"]) == 2
     assert len(task_state["observations"]) == 2
     assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
+
+def write_archive(tmp_path: Path, session_id: str, created_at: str, content: str, summary: str = "") -> Path:
+    path = tmp_path / "data" / "archive" / f"{session_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "session_id": session_id,
+        "type": "conversation_thread",
+        "title": content.split("\n", 1)[0][:80],
+        "summary": summary,
+        "messages": [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": "Captured durable memory details."},
+        ],
+        "created_at": created_at,
+        "updated_at": created_at,
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return path
+
+
+def test_compacts_several_synthetic_old_sessions(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    write_archive(
+        tmp_path,
+        "old-alpha",
+        "2015-02-03T00:00:00+00:00",
+        "Project Alpha with Kora Lab. We decided to keep the SQLite memory schema. TODO: follow up with migration notes.",
+    )
+    write_archive(
+        tmp_path,
+        "old-beta",
+        "2014-07-08T00:00:00+00:00",
+        "Project Beta with Ada Lovelace. Decision: selected archive compaction. Next step: test recall.",
+    )
+    write_archive(
+        tmp_path,
+        "recent-gamma",
+        "2026-05-01T00:00:00+00:00",
+        "Project Gamma is too recent to compact.",
+    )
+
+    response = client.post("/memory/compact", json={"cutoff_days": 365, "limit": 10})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["compacted_count"] == 2
+    assert {item["session_id"] for item in body["compacted"]} == {"old-alpha", "old-beta"}
+    assert (tmp_path / "data" / "archive" / "old-alpha.json").exists()
+    with server.connect_db() as conn:
+        summaries = conn.execute("SELECT session_id, durable_decisions, follow_up_tasks FROM memory_summary ORDER BY session_id").fetchall()
+        timeline = conn.execute("SELECT session_id, event_date FROM memory_timeline ORDER BY session_id").fetchall()
+    assert [row["session_id"] for row in summaries] == ["old-alpha", "old-beta"]
+    assert any("decided" in row["durable_decisions"].lower() for row in summaries)
+    assert any("follow" in row["follow_up_tasks"].lower() or "todo" in row["follow_up_tasks"].lower() for row in summaries)
+    assert [row["event_date"] for row in timeline] == ["2015-02-03", "2014-07-08"]
+
+
+def test_recall_retrieves_ten_year_old_project_by_date(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    write_archive(
+        tmp_path,
+        "ten-year-aurora",
+        "2016-04-20T00:00:00+00:00",
+        "Project Aurora with Kora Lab and Marie Curie. We decided to launch the sovereign memory prototype in 2016.",
+        summary="Project Aurora launched the sovereign memory prototype.",
+    )
+    write_archive(
+        tmp_path,
+        "nine-year-nebula",
+        "2017-04-20T00:00:00+00:00",
+        "Project Nebula explored unrelated UI work.",
+    )
+    assert client.post("/memory/compact", json={"cutoff_days": 365}).status_code == 200
+
+    response = client.post("/memory/recall", json={"query": "what did we do 10 years ago?", "limit": 3})
+
+    assert response.status_code == 200
+    memories = response.json()["memories"]
+    assert memories
+    assert memories[0]["session_id"] == "ten-year-aurora"
+    assert memories[0]["type"] in {"timeline", "summary"}
+    assert "Aurora" in memories[0]["summary"] or "Aurora" in memories[0]["title"]
+
+
+def test_system_prompt_memory_context_stays_below_budget(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    huge_body = " ".join(["Project Atlas durable sovereign memory decision follow up"] * 500)
+    write_archive(
+        tmp_path,
+        "old-atlas",
+        "2016-01-01T00:00:00+00:00",
+        huge_body,
+        summary="Project Atlas compact summary. We decided to keep only compact memories. Follow up: verify prompt budget.",
+    )
+    server.compact_memory_archives(cutoff_days=365)
+
+    prompt = server.build_system_prompt(
+        server.ChatRequest(messages=[server.ChatMessage(role="user", content="what did we do 10 years ago on Project Atlas?")])
+    )
+    start = prompt.index("RECALLED RELEVANT MEMORIES:") + len("RECALLED RELEVANT MEMORIES:")
+    end = prompt.index("WORKSPACE INDEX CONTEXT:")
+    memory_context = prompt[start:end].strip()
+
+    assert "Project Atlas compact summary" in memory_context
+    assert len(memory_context) <= server.MEMORY_PROMPT_BUDGET_CHARS + 80
+    assert huge_body not in prompt
