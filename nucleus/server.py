@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import base64
+import hashlib
 import inspect
 import json
 import os
@@ -51,6 +52,13 @@ ENV_PATHS = [ROOT_DIR / ".env", BASE_DIR / ".env"]
 POLLINATIONS_BASE_URL = "https://gen.pollinations.ai/v1"
 LLAMA_CACHE: dict[str, Any] = {}
 MODEL_FILE_EXTENSIONS = {".gguf", ".bin", ".safetensors", ".pt", ".pth"}
+WORKSPACE_INDEX_TEXT_EXTENSIONS = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".txt", ".toml",
+    ".yaml", ".yml", ".html", ".css", ".rs", ".sql", ".sh", ".env",
+}
+WORKSPACE_INDEX_GENERATED_DIRS = {"dist", "build", "target", "__pycache__", ".pytest_cache", ".ruff_cache", "node_modules"}
+WORKSPACE_INDEX_MAX_TEXT_BYTES = 256 * 1024
+WORKSPACE_INDEX_MAX_HASH_BYTES = 2 * 1024 * 1024
 MODEL_OPTIONS = {
     "pollinations": [
         "openai-fast",
@@ -179,6 +187,9 @@ PERMANENT FACTS ABOUT KHEIR AND KORA:
 RECALLED RELEVANT MEMORIES:
 {recalled_memories}
 
+WORKSPACE INDEX CONTEXT:
+{workspace_index_context}
+
 KORA KNOWLEDGE BASE:
 {kora_context}
 """
@@ -228,6 +239,22 @@ class ProviderUpdate(BaseModel):
 class LocalModelScanRequest(BaseModel):
     roots: list[str] = Field(default_factory=list)
     max_results: int = 200
+
+
+class WorkspaceIndexScanRequest(BaseModel):
+    roots: list[str] = Field(default_factory=list)
+    task_id: str | None = None
+    max_files: int = 500
+
+
+class WorkspaceIndexEntry(BaseModel):
+    path: str
+    kind: str
+    size: int
+    mtime: float
+    hash: str | None = None
+    summary: str = ""
+    last_seen_task_id: str | None = None
 
 
 class PendingApproval:
@@ -643,6 +670,22 @@ def init_db() -> None:
             """
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_keywords ON episodic_memory(keywords)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS workspace_index (
+                path TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime REAL NOT NULL,
+                hash TEXT,
+                summary TEXT NOT NULL DEFAULT '',
+                last_seen_task_id TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_kind ON workspace_index(kind)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_task ON workspace_index(last_seen_task_id)")
         conn.commit()
 
 
@@ -813,6 +856,186 @@ def retrieve_relevant(query: str, limit: int = 4) -> str:
     ])
 
 
+def workspace_index_kind(path: Path, root: Path) -> str:
+    base = root.parent if root.is_file() else root
+    try:
+        rel_parts = {part.lower() for part in path.relative_to(base).parts[:-1]}
+    except ValueError:
+        rel_parts = set()
+    suffix = path.suffix.lower()
+    if rel_parts & WORKSPACE_INDEX_GENERATED_DIRS:
+        return "generated"
+    if suffix in MODEL_FILE_EXTENSIONS:
+        return "artifact"
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".ico", ".icns", ".svg", ".pdf", ".zip"}:
+        return "artifact"
+    if suffix in {".md", ".txt", ".rst"}:
+        return "doc"
+    if suffix in WORKSPACE_INDEX_TEXT_EXTENSIONS:
+        return "source"
+    return "file"
+
+
+def is_workspace_index_binary(path: Path, size: int) -> bool:
+    if path.suffix.lower() not in WORKSPACE_INDEX_TEXT_EXTENSIONS and path.suffix.lower() not in {".rst"}:
+        return True
+    if size > WORKSPACE_INDEX_MAX_TEXT_BYTES:
+        return True
+    try:
+        chunk = path.read_bytes()[:4096]
+    except OSError:
+        return True
+    if b"\0" in chunk:
+        return True
+    try:
+        chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return True
+    return False
+
+
+def workspace_index_hash(path: Path, size: int, binary_or_huge: bool) -> str | None:
+    if binary_or_huge or size > WORKSPACE_INDEX_MAX_HASH_BYTES:
+        return None
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def fallback_file_summary(path: Path, kind: str, size: int, binary_or_huge: bool) -> str:
+    if binary_or_huge:
+        return f"{kind} file; content skipped because it is binary or too large ({size} bytes)."
+    try:
+        text = path.read_text(encoding="utf-8")[:4000]
+    except (OSError, UnicodeDecodeError):
+        return f"{kind} file; content could not be decoded."
+    first_lines = [line.strip() for line in text.splitlines() if line.strip()][:3]
+    if not first_lines:
+        return f"Empty {kind} file."
+    return f"{kind} file: " + " ".join(first_lines)[:220]
+
+
+async def summarize_file_with_current_model(path: Path, kind: str, size: int, binary_or_huge: bool) -> str:
+    if binary_or_huge:
+        return fallback_file_summary(path, kind, size, binary_or_huge)
+    try:
+        content = path.read_text(encoding="utf-8")[:6000]
+    except (OSError, UnicodeDecodeError):
+        return fallback_file_summary(path, kind, size, True)
+    prompt = f"""
+Create a compact one-sentence summary (max 28 words) for this workspace file.
+Mention the file's purpose and important symbols or topics. Do not add preamble.
+
+Path: {path.name}
+Kind: {kind}
+Content:
+{content}
+"""
+    try:
+        summary = (await call_model_simple(prompt, model=load_settings().get("default_model", "openai-fast"))).strip()
+    except Exception:
+        summary = fallback_file_summary(path, kind, size, binary_or_huge)
+    return " ".join(summary.split())[:300]
+
+
+def workspace_index_entry_to_dict(entry: WorkspaceIndexEntry) -> dict[str, Any]:
+    if hasattr(entry, "model_dump"):
+        return entry.model_dump()
+    return entry.dict()
+
+
+async def scan_workspace_index(roots: list[str] | None = None, task_id: str | None = None, max_files: int = 500) -> dict[str, Any]:
+    selected_roots = [Path(root).expanduser() for root in (roots or [ROOT_DIR])]
+    indexed = 0
+    skipped = 0
+    entries: list[WorkspaceIndexEntry] = []
+    with connect_db() as conn:
+        for root in selected_roots:
+            if not root.exists():
+                skipped += 1
+                continue
+            root = root.resolve()
+            candidates = [root] if root.is_file() else sorted(root.rglob("*"))
+            for path in candidates:
+                if indexed >= max_files:
+                    break
+                if not path.is_file():
+                    continue
+                rel_parts = set(path.relative_to(root).parts[:-1]) if root in path.parents else set()
+                if any(part in {".git", "node_modules", "target"} for part in rel_parts):
+                    skipped += 1
+                    continue
+                try:
+                    stat = path.stat()
+                except OSError:
+                    skipped += 1
+                    continue
+                kind = workspace_index_kind(path, root)
+                binary_or_huge = is_workspace_index_binary(path, stat.st_size)
+                digest = workspace_index_hash(path, stat.st_size, binary_or_huge)
+                summary = await summarize_file_with_current_model(path, kind, stat.st_size, binary_or_huge)
+                entry = WorkspaceIndexEntry(
+                    path=str(path),
+                    kind=kind,
+                    size=stat.st_size,
+                    mtime=stat.st_mtime,
+                    hash=digest,
+                    summary=summary,
+                    last_seen_task_id=task_id,
+                )
+                conn.execute(
+                    """
+                    INSERT INTO workspace_index (path, kind, size, mtime, hash, summary, last_seen_task_id, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(path) DO UPDATE SET
+                        kind=excluded.kind,
+                        size=excluded.size,
+                        mtime=excluded.mtime,
+                        hash=excluded.hash,
+                        summary=excluded.summary,
+                        last_seen_task_id=excluded.last_seen_task_id,
+                        updated_at=excluded.updated_at
+                    """,
+                    (entry.path, entry.kind, entry.size, entry.mtime, entry.hash, entry.summary, entry.last_seen_task_id, now_iso()),
+                )
+                entries.append(entry)
+                indexed += 1
+            if indexed >= max_files:
+                break
+        conn.commit()
+    return {"indexed": indexed, "skipped": skipped, "entries": [workspace_index_entry_to_dict(entry) for entry in entries]}
+
+
+def retrieve_workspace_index_context(query: str, limit: int = 8, max_chars: int = 1800) -> str:
+    query_words = set(extract_keywords(query))
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT path, kind, size, summary, last_seen_task_id FROM workspace_index ORDER BY updated_at DESC LIMIT 200"
+        ).fetchall()
+    if not rows:
+        return "No workspace index entries available."
+    scored: list[tuple[int, sqlite3.Row]] = []
+    for row in rows:
+        haystack = f"{Path(row['path']).name} {row['kind']} {row['summary']}".lower()
+        score = sum(1 for word in query_words if word in haystack)
+        scored.append((score, row))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = [row for score, row in scored if score > 0][:limit] or [row for _, row in scored[:limit]]
+    lines = []
+    for row in selected:
+        task = f" task={row['last_seen_task_id']}" if row["last_seen_task_id"] else ""
+        lines.append(f"- {row['path']} [{row['kind']}, {row['size']} bytes{task}]: {row['summary']}")
+    context = "\n".join(lines)
+    if len(context) > max_chars:
+        context = context[:max_chars] + "... [workspace index truncated]"
+    return context
+
+
 def build_system_prompt(request: ChatRequest) -> str:
     facts = json.dumps(load_json(FACTS_PATH, DEFAULT_FACTS), indent=2)
     registry = json.dumps(load_registry(), indent=2)
@@ -849,6 +1072,7 @@ def build_system_prompt(request: ChatRequest) -> str:
         tool_registry=registry,
         facts=facts,
         recalled_memories=recalled_text,
+        workspace_index_context=retrieve_workspace_index_context(first_query),
         kora_context=kora_context,
     )
 
@@ -1579,6 +1803,23 @@ async def scan_local_models(request: LocalModelScanRequest) -> JSONResponse:
             "models": scan_local_model_files(request.roots, request.max_results),
         }
     )
+
+
+@app.post("/workspace-index/scan")
+async def scan_workspace_index_endpoint(request: WorkspaceIndexScanRequest) -> JSONResponse:
+    result = await scan_workspace_index(request.roots, request.task_id, request.max_files)
+    return JSONResponse(result)
+
+
+@app.get("/workspace-index")
+async def get_workspace_index(q: str = "", limit: int = 50) -> JSONResponse:
+    with connect_db() as conn:
+        rows = conn.execute(
+            "SELECT path, kind, size, mtime, hash, summary, last_seen_task_id FROM workspace_index ORDER BY updated_at DESC LIMIT ?",
+            (max(1, min(limit, 200)),),
+        ).fetchall()
+    entries = [dict(row) for row in rows]
+    return JSONResponse({"entries": entries, "context": retrieve_workspace_index_context(q, limit=min(limit, 20))})
 
 
 @app.post("/approve")
