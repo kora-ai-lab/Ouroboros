@@ -739,6 +739,56 @@ def test_execute_python_policy_assigns_sandbox_tiers():
     assert process_policy["process_risk"] is True
 
 
+
+
+def test_sandbox_worker_read_only_blocks_writes(tmp_path):
+    config = server.sandbox_worker.config_for_tier("read_only", workspace_root=Path.cwd())
+
+    result = asyncio.run(
+        server.sandbox_worker.run_sandboxed_python(
+            f"open({str(tmp_path / 'blocked.txt')!r}, 'w').write('blocked')",
+            config,
+        )
+    )
+
+    assert result["exit_code"] != 0
+    assert "read_only sandbox blocks filesystem writes" in result["stderr"]
+    assert result["sandbox"]["tier"] == "read_only"
+    assert result["sandbox"]["network_disabled"] is True
+    assert not (tmp_path / "blocked.txt").exists()
+
+
+def test_execute_python_workspace_write_allows_workspace_path(tmp_path, monkeypatch):
+    target = server.ROOT_DIR / "nucleus" / "data" / "workspace-write-test.txt"
+    if target.exists():
+        target.unlink()
+    code = f"from pathlib import Path\nPath({str(target)!r}).write_text('allowed', encoding='utf-8')"
+
+    try:
+        result = asyncio.run(server.execute_python(code, policy_approved=True))
+
+        assert result["exit_code"] == 0
+        assert target.read_text(encoding="utf-8") == "allowed"
+        assert result["sandbox"]["tier"] == "workspace_write"
+        assert str(server.ROOT_DIR.resolve()) in result["sandbox"]["allowed_roots"]
+    finally:
+        if target.exists():
+            target.unlink()
+
+
+def test_execute_python_host_full_requires_explicit_approval():
+    code = "import subprocess\nsubprocess.run(['true'])"
+
+    rejected = asyncio.run(server.execute_python(code))
+    approved = asyncio.run(server.execute_python(code, policy_approved=True))
+
+    assert rejected["exit_code"] == -1
+    assert rejected["policy"]["sandbox_tier"] == "host_full"
+    assert rejected["policy"]["manual_approval_required"] is False
+    assert approved["exit_code"] == 0
+    assert approved["sandbox"]["tier"] == "host_full"
+    assert approved["sandbox"]["network_disabled"] is False
+
 def test_execute_python_workspace_write_blocks_dynamic_outside_workspace(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     target = tmp_path / "blocked.txt"
@@ -969,6 +1019,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         description="Return the provided value as JSON.",
         parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         filepath="tools/flaky_tool.py",
+        test_plan="Intentionally broken tool is exercised by repair retry test.",
         test_plan="Exercise failing tool before model repair.",
         test_plan="Intentional failure exercises repair loop.",
         test_plan="Exercise repair loop with an intentionally failing tool.",
@@ -995,6 +1046,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         "/chat",
         json={
             "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
+            "auto_approve": True,
             "model": "openai-fast",
             "provider": "pollinations",
             "context_files": [],
@@ -1006,6 +1058,17 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
 
     assert response.status_code == 200
     assert "event: tool_repair" in response.text
+    assert "The repaired tool succeeded." in response.text
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
+    flaky = server.find_tool("flaky_tool")
+    assert flaky is not None
+    attempts = flaky["metadata"]["repair_attempts"]
+    assert len(attempts) == 1
+    repaired = server.run_registered_tool(flaky, {"value": "direct"})
+    assert repaired["exit_code"] == 0
+    assert json.loads(repaired["stdout"])["value"] == "direct"
     assert "nonzero_exit" in response.text
     assert "The repaired tool succeeded." in response.text
     assert "second-run" in response.text

@@ -26,6 +26,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import checkpoints
+import sandbox_worker
 from agent_loop import TaskState, load_task_state, save_task_state, task_event_name
 
 
@@ -43,6 +44,7 @@ app = FastAPI(title="Ouroboros Nucleus", lifespan=lifespan)
 
 
 BASE_DIR = Path(__file__).resolve().parent
+SANDBOX_WORKER_PATH = BASE_DIR / "sandbox_worker.py"
 ROOT_DIR = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 ARCHIVE_DIR = DATA_DIR / "archive"
@@ -1986,6 +1988,10 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
+def load_tool_metadata(package_dir: Path | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(package_dir, dict):
+        metadata = package_dir.get("metadata", {})
+        return dict(metadata) if isinstance(metadata, dict) else {}
 def load_package_metadata(package_dir: Path) -> dict[str, Any]:
 def load_tool_metadata(source: Path | dict[str, Any]) -> dict[str, Any]:
     if isinstance(source, dict):
@@ -2347,7 +2353,11 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.List, ast.Tuple)):
-                string_parts = [element.value for element in node.elts if isinstance(element, ast.Constant) and isinstance(element.value, str)]
+                string_parts = [
+                    element.value
+                    for element in node.elts
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str)
+                ]
                 if command_parts_contain_destructive_git(string_parts):
                     reasons.append(DESTRUCTIVE_GIT_REASON)
                     manual_approval_required = True
@@ -2373,7 +2383,11 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                 if func_name == "open":
                     mode = "r"
                     mode_arg_index = 0 if is_attribute_call else 1
-                    if len(node.args) > mode_arg_index and isinstance(node.args[mode_arg_index], ast.Constant) and isinstance(node.args[mode_arg_index].value, str):
+                    if (
+                        len(node.args) > mode_arg_index
+                        and isinstance(node.args[mode_arg_index], ast.Constant)
+                        and isinstance(node.args[mode_arg_index].value, str)
+                    ):
                         mode = node.args[mode_arg_index].value
                     for keyword in node.keywords:
                         if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
@@ -2448,47 +2462,51 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
         return {"error": "Python execution requires approval by policy.", "policy": policy, "exit_code": -1, "timed_out": False}
 
     sandbox_tier = policy.get("sandbox_tier", "read_only")
-    guarded_code = python_sandbox_guard(sandbox_tier) + "\n" + code
     checkpoint_metadata = create_filesystem_mutation_checkpoint(code, policy) if policy_approved else None
-
+    payload = {
+        "code": code,
+        "tier": sandbox_tier,
+        "workspace_root": str(ROOT_DIR.resolve()),
+        "timeout_seconds": 30,
+        "output_limit_bytes": 100_000,
+    }
     start = time.time()
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", guarded_code,
+        sys.executable,
+        str(SANDBOX_WORKER_PATH),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.PIPE,
         cwd=str(ROOT_DIR.resolve()),
-        env=build_python_execution_env(sandbox_tier),
+        env=sandbox_worker.build_python_execution_env(
+            sandbox_worker.config_for_tier(sandbox_tier, workspace_root=ROOT_DIR)
+        ),
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=30
-        )
+    stdout, stderr = await proc.communicate(json.dumps(payload).encode("utf-8"))
+    if proc.returncode == 0 and stdout:
+        try:
+            result = json.loads(stdout.decode("utf-8"))
+        except json.JSONDecodeError:
+            result = {
+                "stdout": stdout.decode("utf-8", errors="replace")[-100_000:],
+                "stderr": stderr.decode("utf-8", errors="replace")[-100_000:],
+                "exit_code": proc.returncode,
+                "timed_out": False,
+                "duration_ms": int((time.time() - start) * 1000),
+                "isolation_degraded": True,
+            }
+    else:
         result = {
-            "stdout": stdout.decode()[-100_000:],
-            "stderr": stderr.decode()[-100_000:],
+            "stdout": stdout.decode("utf-8", errors="replace")[-100_000:],
+            "stderr": stderr.decode("utf-8", errors="replace")[-100_000:],
             "exit_code": proc.returncode,
             "timed_out": False,
-            "duration_ms": int((time.time() - start) * 1000)
+            "duration_ms": int((time.time() - start) * 1000),
+            "isolation_degraded": True,
         }
-        if checkpoint_metadata is not None:
-            result["checkpoint"] = checkpoint_metadata
-        return result
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except OSError:
-            pass
-        result = {
-            "stdout": "",
-            "stderr": "Timed out after 30s",
-            "exit_code": -1,
-            "timed_out": True,
-            "duration_ms": int((time.time() - start) * 1000)
-        }
-        if checkpoint_metadata is not None:
-            result["checkpoint"] = checkpoint_metadata
-        return result
-
+    if checkpoint_metadata is not None:
+        result["checkpoint"] = checkpoint_metadata
+    return result
 
 
 
@@ -2698,6 +2716,16 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         }
         return annotate_registered_tool_output(result, tool)
     except subprocess.TimeoutExpired as exc:
+        return {
+            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
+            "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "")
+            or f"Timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s",
+            "exit_code": -1,
+            "timed_out": True,
+            "duration_ms": int((time.time() - start) * 1000),
+            "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.",
+            "malformed_output": False,
+        }
         result = {"stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "", "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "") or f"Timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s", "exit_code": -1, "timed_out": True, "duration_ms": int((time.time() - start) * 1000), "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.", "malformed_output": False}
     except Exception as exc:
         result = {"stdout": "", "stderr": str(exc), "exit_code": -1, "timed_out": False, "duration_ms": int((time.time() - start) * 1000), "error": f"Registered tool execution exception: {exc}", "exception": type(exc).__name__, "malformed_output": False}
@@ -2750,6 +2778,20 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
     return textwrap.dedent(
         f"""
         A registered tool failed. Repair it before continuing.
+
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
         Generic repair instruction:
         1. Inspect the tool file and its registry metadata.
@@ -2881,6 +2923,7 @@ def register_tool(
             metadata = dict(package_info["metadata"])
             version = str(metadata.get("version", version))
         package_info: dict[str, Any] | None = None
+        package_metadata: dict[str, Any] = {}
         package_metadata: dict[str, Any] = {"version": str(version), "deprecated": False, "deprecation_reason": ""}
         package_metadata: dict[str, Any] = {}
         entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
@@ -2892,6 +2935,7 @@ def register_tool(
             parameters = package_info["schema"]
             package_metadata = package_info["metadata"]
             version = str(package_metadata.get("version", version))
+            test_plan = test_plan or str(package_metadata.get("test_plan", "Skill package tests.py passed."))
             version = str(package_metadata.get("version") or version)
             version = str(package_metadata.get("version", version))
             entry_version = str(package_metadata.get("version", version))
@@ -2912,6 +2956,11 @@ def register_tool(
     except ValueError as exc:
         return {"error": str(exc)}
 
+    if not isinstance(parameters, dict):
+        return {"error": "parameters_schema must be an object."}
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
     if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
@@ -2966,6 +3015,8 @@ def register_tool(
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
+    metadata = {"repair_attempts": []}
+    metadata.update(package_metadata)
     metadata = {
         "repair_attempts": [],
         "permissions": package_metadata["permissions"],
@@ -3020,6 +3071,15 @@ def register_tool(
         "supersedes": supersedes,
         "trusted": bool(package_info is not None),
         "trusted": False,
+        "deprecated": bool(package_metadata.get("deprecated", False)),
+        "deprecation_reason": str(package_metadata.get("deprecation_reason", "") or ""),
+    }
+    if path.is_dir():
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
         "deprecated": bool(metadata.get("deprecated", False)),
         "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
         "last_test_status": "passed" if package_info else "pending",
@@ -3910,6 +3970,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
         repair_attempts_by_tool: dict[str, int] = {}
+        max_repair_attempts = tool_repair_max_attempts()
         yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
         provider = request.provider or load_settings().get("default_provider", "pollinations")
         model = request.model or load_settings().get("default_model", "openai-fast")
