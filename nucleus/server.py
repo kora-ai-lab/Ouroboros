@@ -24,6 +24,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import checkpoints
+from agent_loop import TaskState, load_task_state, save_task_state, task_event_name
 
 
 @asynccontextmanager
@@ -54,6 +55,8 @@ ENV_PATHS = [ROOT_DIR / ".env", BASE_DIR / ".env"]
 POLLINATIONS_BASE_URL = "https://gen.pollinations.ai/v1"
 LLAMA_CACHE: dict[str, Any] = {}
 MODEL_FILE_EXTENSIONS = {".gguf", ".bin", ".safetensors", ".pt", ".pth"}
+EVALUATION_DECISIONS = {"continue", "retry", "register_tool", "rollback", "final"}
+
 MODEL_OPTIONS = {
     "pollinations": [
         "openai-fast",
@@ -211,6 +214,8 @@ class ChatRequest(BaseModel):
     provider: str = "pollinations"
     context_files: list[ContextFile] = Field(default_factory=list)
     auto_approve: bool = False
+    task_id: str | None = None
+    max_task_steps: int = 12
 
 
 class ApprovalDecision(BaseModel):
@@ -570,6 +575,7 @@ def now_iso() -> str:
 
 def ensure_layout() -> None:
     for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -649,6 +655,18 @@ def init_db() -> None:
                 result TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 approved INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS evaluation_decision (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                raw_response TEXT NOT NULL,
+                timestamp TEXT NOT NULL
             )
             """
         )
@@ -1302,12 +1320,13 @@ def register_tool(
     return {"registered": name, "permanent": True}
 
 
-def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> None:
+def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
+    execution_id = str(uuid.uuid4())
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO tool_execution (id, tool_name, arguments, result, timestamp, approved) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                str(uuid.uuid4()),
+                execution_id,
                 tool_name,
                 json.dumps(arguments),
                 json.dumps(result),
@@ -1316,6 +1335,88 @@ def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict
             ),
         )
         conn.commit()
+    return execution_id
+
+
+def build_evaluation_prompt() -> str:
+    return textwrap.dedent(
+        """
+        Evaluate the immediately preceding result and choose the next step before any final answer is produced.
+        Be generic: judge only whether the result is adequate for the current task, without assuming any specific domain, data source, environment, or artifact type.
+
+        Choose exactly one decision:
+        - continue: proceed because more ordinary work is needed.
+        - retry: repeat or adjust the previous action because the result is missing, invalid, failed, or insufficient.
+        - register_tool: preserve a newly useful reusable capability before proceeding.
+        - rollback: undo or mitigate the previous action before proceeding.
+        - final: the result is sufficient to produce the final answer.
+
+        Return only JSON in this shape: {"decision":"continue|retry|register_tool|rollback|final","rationale":"brief reason"}
+        """
+    ).strip()
+
+
+def parse_evaluation_decision(raw_response: str) -> dict[str, str]:
+    decision = "continue"
+    rationale = "No rationale provided."
+    try:
+        payload = json.loads(raw_response.strip())
+        if isinstance(payload, dict):
+            candidate = str(payload.get("decision", "")).strip().lower()
+            if candidate in EVALUATION_DECISIONS:
+                decision = candidate
+            if payload.get("rationale"):
+                rationale = str(payload["rationale"]).strip()
+    except json.JSONDecodeError:
+        match = re.search(r"\b(continue|retry|register_tool|rollback|final)\b", raw_response, re.IGNORECASE)
+        if match:
+            decision = match.group(1).lower()
+        cleaned = raw_response.strip()
+        if cleaned:
+            rationale = cleaned[:500]
+    return {"decision": decision, "rationale": rationale}
+
+
+def store_evaluation_decision(session_id: str, decision: str, rationale: str, raw_response: str) -> str:
+    decision_id = str(uuid.uuid4())
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO evaluation_decision (id, session_id, decision, rationale, raw_response, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (decision_id, session_id, decision, rationale, raw_response, now_iso()),
+        )
+        conn.commit()
+    return decision_id
+
+
+async def complete_model_text(messages: list[dict[str, str]], model: str, provider: str) -> str:
+    text = ""
+    async for token in app.state.model_adapter.complete(messages, model, provider):
+        text += token
+    return text
+
+
+async def evaluate_tool_result(
+    conversation: list[dict[str, str]],
+    session_id: str,
+    model: str,
+    provider: str,
+) -> dict[str, str]:
+    conversation.append({"role": "system", "content": build_evaluation_prompt()})
+    raw_response = await complete_model_text(prune_conversation(conversation), model, provider)
+    conversation.append({"role": "assistant", "content": raw_response})
+    parsed = parse_evaluation_decision(raw_response)
+    store_evaluation_decision(session_id, parsed["decision"], parsed["rationale"], raw_response)
+    if parsed["decision"] == "retry":
+        conversation.append({"role": "system", "content": "Evaluation decision: retry. Adjust or repeat the previous action before finalizing."})
+    elif parsed["decision"] == "register_tool":
+        conversation.append({"role": "system", "content": "Evaluation decision: register_tool. Preserve the reusable capability before finalizing."})
+    elif parsed["decision"] == "rollback":
+        conversation.append({"role": "system", "content": "Evaluation decision: rollback. Undo or mitigate the previous action before finalizing."})
+    elif parsed["decision"] == "final":
+        conversation.append({"role": "system", "content": "Evaluation decision: final. Produce the final answer now."})
+    else:
+        conversation.append({"role": "system", "content": "Evaluation decision: continue. Proceed with the next appropriate step."})
+    return parsed
 
 
 async def call_model_simple(prompt: str, model: str = "openai-fast") -> str:
@@ -1746,6 +1847,25 @@ def prune_conversation(messages: list[dict[str, str]], max_chars: int = 32000) -
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
         session_id = str(uuid.uuid4())
+        goal = last_user_message(request.messages)
+        task_state = load_task_state(DATA_DIR, request.task_id) if request.task_id else None
+        if task_state is None:
+            task_state = TaskState(task_id=request.task_id or str(uuid.uuid4()), goal=goal)
+        elif goal:
+            task_state.goal = goal
+        save_task_state(task_state, DATA_DIR)
+
+        def emit_task_phase(phase: str, payload: dict[str, Any] | None = None) -> str:
+            task_state.mark_phase(phase)
+            save_task_state(task_state, DATA_DIR)
+            event_payload: dict[str, Any] = {
+                "task_id": task_state.task_id,
+                "phase": task_state.phase,
+                "done": task_state.done,
+            }
+            if payload:
+                event_payload.update(payload)
+            return sse(task_event_name(phase), event_payload)
         
         # Sanitize incoming messages: cap extremely long ones
         sanitized_messages = []
@@ -1758,9 +1878,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
-        yield sse("meta", {"session_id": session_id, "model": request.model})
+        yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
+        yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
         try:
-            for _ in range(4):
+            max_task_steps = max(1, int(request.max_task_steps or 12))
+            model_turns = 0
+            while not task_state.done and model_turns < max_task_steps:
+                model_turns += 1
+                if task_state.observations:
+                    yield emit_task_phase("revise", {"observations": task_state.observations[-3:]})
                 text = ""
                 provider = request.provider or load_settings().get("default_provider", "pollinations")
                 model = request.model or load_settings().get("default_model", "openai-fast")
@@ -1773,8 +1899,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     yield sse("delta", {"content": token})
                 display_text = strip_tool_calls(text).strip()
                 calls = extract_tool_calls(text)
+                if not task_state.steps:
+                    task_state.add_plan(display_text or text)
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
                 if not calls and is_capability_refusal(text):
+                    task_state.failure_count += 1
+                    save_task_state(task_state, DATA_DIR)
                     yield sse("assistant_replace", {"content": "Retrying under the self-evolution protocol."})
+                    yield emit_task_phase("revise", {"reason": "capability_refusal", "failure_count": task_state.failure_count})
                     conversation.append({"role": "assistant", "content": text})
                     conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
                     continue
@@ -1784,12 +1917,20 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 conversation.append({"role": "assistant", "content": text})
                 public_messages.append({"role": "assistant", "content": display_text or text})
                 if not calls:
+                    task_state.done = True
+                    task_state.artifacts["final_answer"] = display_text or text
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("final", {"answer": display_text or text})
                     break
+                yield emit_task_phase("act", {"tool_call_count": len(calls)})
                 for call in calls:
                     tool_name = str(call["name"])
                     arguments = call.get("arguments", {})
                     if not isinstance(arguments, dict):
                         arguments = {}
+                    step = task_state.add_step(tool_name, arguments)
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("act", {"step": step})
                     tool = find_tool(tool_name)
                     policy: dict[str, Any] | None = None
                     if tool_name == "execute_python":
@@ -1797,8 +1938,13 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         if policy["action"] == "block":
                             result = {"error": policy["risk_summary"], "policy": policy}
                             store_tool_execution(tool_name, arguments, result, False)
+                            observation = task_state.add_observation(step, result, False)
+                            save_task_state(task_state, DATA_DIR)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield emit_task_phase("observe", {"observation": observation})
                             conversation.append({"role": "tool", "content": json.dumps(result)})
+                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                            yield sse("evaluation", evaluation)
                             continue
                     requires_approval = bool(tool is not None and tool.get("requires_approval"))
                     policy_approved = False
@@ -1836,12 +1982,17 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         if not approved:
                             result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
                             store_tool_execution(tool_name, arguments, result, False)
+                            observation = task_state.add_observation(step, result, False)
+                            save_task_state(task_state, DATA_DIR)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield emit_task_phase("observe", {"observation": observation})
                             
                             result_str = json.dumps(result)
                             if len(result_str) > 10000:
                                 result_str = result_str[:10000] + "... [Result truncated]"
                             conversation.append({"role": "tool", "content": result_str})
+                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                            yield sse("evaluation", evaluation)
                             continue
                     yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     if tool_name == "execute_python":
@@ -1865,15 +2016,29 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         else:
                             result = {"error": f"Tool {tool_name} not found."}
                     store_tool_execution(tool_name, arguments, result, True)
+                    observation = task_state.add_observation(step, result, True)
+                    save_task_state(task_state, DATA_DIR)
                     yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
+                    yield emit_task_phase("observe", {"observation": observation})
                     
                     # Cap result for conversation history to avoid 400 errors
                     result_str = json.dumps(result)
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
+                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                    yield sse("evaluation", evaluation)
+                    if evaluation["decision"] == "final":
+                        break
+                yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+            if not task_state.done:
+                task_state.failure_count += 1
+                task_state.done = True
+                task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
+                save_task_state(task_state, DATA_DIR)
+                yield emit_task_phase("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
             # Remove the automatic summary call from stream, frontend will call /memory/save
-            yield sse("done", {"session_id": session_id})
+            yield sse("done", {"session_id": session_id, "task_id": task_state.task_id})
         except Exception as exc:
             yield sse("error", {"message": str(exc)})
 
