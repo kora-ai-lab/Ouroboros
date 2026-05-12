@@ -1,10 +1,10 @@
 pub mod migrations;
 
 use rusqlite::Connection;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::AppHandle;
 use tauri::Manager;
-use std::path::PathBuf;
 
 pub struct Database {
     pub conn: Mutex<Connection>,
@@ -54,6 +54,9 @@ impl Database {
         }
         if current_version < 4 {
             migrations::v4::apply(&conn)?;
+        }
+        if current_version < 5 {
+            migrations::v5::apply(&conn)?;
         }
 
         Ok(())
