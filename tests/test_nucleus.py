@@ -63,8 +63,8 @@ def test_registry_loads_builtin_tools(tmp_path, monkeypatch):
     assert response.status_code == 200
     names = [tool["name"] for tool in response.json()["tools"]]
     assert "execute_python" in names
-    assert "rollback_latest_checkpoint" in names
     assert "register_tool" in names
+    assert "rollback_latest_checkpoint" not in names
 
 
 def test_execute_python_success():
@@ -224,6 +224,35 @@ def test_skill_package_validates_registers_and_runs(tmp_path, monkeypatch):
     result = server.run_registered_tool(tool, {"message": "hello"})
     assert result["exit_code"] == 0
     assert json.loads(result["stdout"])["echo"] == "hello"
+
+
+def test_user_facing_tools_load_from_registry_while_kernel_services_remain_private(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    write_skill_package(tmp_path)
+    server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    response = client.get("/tools")
+
+    assert response.status_code == 200
+    names = [tool["name"] for tool in response.json()["tools"]]
+    assert "caps_echo" in names
+    assert "execute_python" in names
+    assert "register_tool" in names
+    assert "rollback_latest_checkpoint" not in names
+    assert "read_memory" not in names
+    assert "write_memory" not in names
+    assert "enforce_python_policy" not in names
+    assert "load_task_state" not in names
+
+    dispatched = asyncio.run(server.KERNEL.dispatch_capability("caps_echo", {"message": "registry-ok"}))
+    assert dispatched["exit_code"] == 0
+    assert json.loads(dispatched["stdout"])["echo"] == "registry-ok"
+    private = asyncio.run(server.KERNEL.dispatch_capability("rollback_latest_checkpoint", {}))
+    assert "private kernel safety action" in private["error"]
 
 
 def test_skill_package_must_pass_tests_before_registration(tmp_path, monkeypatch):
@@ -408,6 +437,37 @@ def test_chat_stream_uses_fake_adapter_and_saves_memory(tmp_path, monkeypatch):
     assert "Test response" in response.text
 
 
+def test_chat_stream_emits_task_protocol_events(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+        },
+    )
+
+    assert response.status_code == 200
+    for event_name in [
+        "task_started",
+        "task_plan",
+        "task_step",
+        "task_observation",
+        "task_evaluation",
+        "task_done",
+    ]:
+        assert f"event: {event_name}" in response.text
+    assert "event: delta" in response.text
+
+
+def test_chat_stream_emits_retry_event_for_self_evolution_retry(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        "I don't have internet access to search for current details.",
+        "Recovered after retry.",
+    ])
 def test_chat_evaluation_retry_performs_second_tool_call(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     first_call = json.dumps({"name": "execute_python", "arguments": {"code": "raise Exception(\"fail\")"}})
@@ -424,6 +484,10 @@ def test_chat_evaluation_retry_performs_second_tool_call(tmp_path, monkeypatch):
     response = client.post(
         "/chat",
         json={
+            "messages": [{"role": "user", "content": "Find current details"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
             "messages": [{"role": "user", "content": "run the fake task"}],
             "model": "openai-fast",
             "provider": "pollinations",
@@ -433,6 +497,16 @@ def test_chat_evaluation_retry_performs_second_tool_call(tmp_path, monkeypatch):
     )
 
     assert response.status_code == 200
+    assert "event: task_retry" in response.text
+    assert "capability_refusal" in response.text
+
+
+def test_chat_stream_emits_checkpoint_after_tool_result(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        '<tool_call>{"name":"execute_python","arguments":{"code":"print(1)"}}</tool_call>',
+        "Done with tool.",
+    ])
     assert response.text.count("event: tool_call") == 2
     assert '"decision": "retry"' in response.text
     assert '"decision": "final"' in response.text
@@ -455,6 +529,7 @@ def test_chat_evaluation_success_finalizes(tmp_path, monkeypatch):
     response = client.post(
         "/chat",
         json={
+            "messages": [{"role": "user", "content": "run a tool"}],
             "messages": [{"role": "user", "content": "run the fake task"}],
             "model": "openai-fast",
             "provider": "pollinations",
@@ -464,6 +539,9 @@ def test_chat_evaluation_success_finalizes(tmp_path, monkeypatch):
     )
 
     assert response.status_code == 200
+    assert "event: tool_call" in response.text
+    assert "event: tool_result" in response.text
+    assert "event: task_checkpoint" in response.text
     assert response.text.count("event: tool_call") == 1
     assert '"decision": "final"' in response.text
     assert "Final answer." in response.text
@@ -646,7 +724,10 @@ def test_checkpoint_restores_temp_file_after_mutation(tmp_path, monkeypatch):
     metadata_path = tmp_path / "data" / "checkpoints" / f"{result['checkpoint']['id']}.json"
     assert metadata_path.exists()
 
-    rollback = server.rollback_latest_checkpoint()
+    denied = server.rollback_latest_checkpoint()
+    assert "restricted" in denied["error"]
+
+    rollback = server.KERNEL.rollback_latest_checkpoint(caller="eval")
 
     assert rollback["checkpoint"]["id"] == result["checkpoint"]["id"]
     assert str(target) in rollback["restored"]
