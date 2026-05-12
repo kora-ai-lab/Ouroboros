@@ -31,6 +31,7 @@ class TaskState(BaseModel):
     steps: list[dict[str, Any]] = Field(default_factory=list)
     observations: list[dict[str, Any]] = Field(default_factory=list)
     artifacts: dict[str, Any] = Field(default_factory=dict)
+    subagent_runs: list[dict[str, Any]] = Field(default_factory=list)
     failure_count: int = 0
     done: bool = False
     created_at: str = Field(default_factory=now_iso)
@@ -59,6 +60,10 @@ class TaskState(BaseModel):
         self.steps.append(step)
         self.updated_at = now_iso()
         return step
+
+    def add_subagent_run(self, run: dict[str, Any]) -> None:
+        self.subagent_runs.append(run)
+        self.updated_at = now_iso()
 
     def add_observation(self, step: dict[str, Any], result: dict[str, Any], approved: bool) -> dict[str, Any]:
         step["status"] = "completed" if approved else "rejected"
