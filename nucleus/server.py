@@ -178,6 +178,40 @@ DEFAULT_REGISTRY = {
             "supersedes": None,
             "trusted": True,
         },
+        {
+            "name": "mcp_bridge",
+            "description": "Generic bridge for configured MCP servers: list servers/tools/resources/prompts, read resources, and call arbitrary MCP tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["list_servers", "list_tools", "call_tool", "list_resources", "read_resource", "list_prompts"]},
+                    "server": {"type": "string"},
+                    "tool_name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                    "uri": {"type": "string"},
+                },
+                "required": ["operation"],
+                "additionalProperties": False,
+            },
+            "filepath": "tools/mcp_bridge",
+            "builtin": False,
+            "requires_approval": False,
+            "package": True,
+            "package_dir": "tools/mcp_bridge",
+            "metadata": {"version": "1.0.0", "deprecated": False, "deprecation_reason": "", "output_format": "json"},
+            "version": "1.0.0",
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "source_task_id": None,
+            "test_command": "python nucleus/tools/mcp_bridge/tests.py",
+            "test_plan": "Package smoke test plus adapter unit tests cover generic MCP discovery and call dispatch.",
+            "sample_arguments": {"operation": "list_servers"},
+            "last_test_status": "pending",
+            "last_error": None,
+            "use_count": 0,
+            "supersedes": None,
+            "trusted": False,
+        },
     ]
 }
 
@@ -645,8 +679,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
-    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
-    for path in (DATA_DIR, ARCHIVE_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -1409,7 +1442,11 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
-def load_tool_metadata(package_dir: Path) -> dict[str, Any]:
+def load_tool_metadata(source: Path | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(source, dict):
+        metadata = source.get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else {}
+    package_dir = source
     metadata_path = package_dir / "metadata.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1427,7 +1464,6 @@ def load_tool_metadata(package_dir: Path) -> dict[str, Any]:
     if deprecation_reason is not None and not isinstance(deprecation_reason, str):
         raise ValueError("metadata.json deprecation_reason must be a string when present.")
     return metadata
-
 
 def validate_json_schema(schema: dict[str, Any]) -> None:
     if not isinstance(schema, dict):
@@ -1839,7 +1875,11 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": manual_approval_required,
         }
+        if "filesystem write or mutation" in unique_reasons:
+            response["checkpoint"] = filesystem_checkpoint_metadata(code)
+        return response
     return {
         "action": "allow",
         "sandbox_tier": "read_only",
@@ -1848,14 +1888,8 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         "affected_paths": unique_paths,
         "network_risk": network_risk,
         "process_risk": process_risk,
+        "manual_approval_required": False,
     }
-            "manual_approval_required": manual_approval_required,
-        }
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
-        if "filesystem write or mutation" in unique_reasons:
-            response["checkpoint"] = filesystem_checkpoint_metadata(code)
-        return response
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
 
 
 async def execute_python(code: str, policy_approved: bool = False) -> dict[str, Any]:
@@ -1940,16 +1974,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
-    filepath = tool.get("filepath")
-    if not filepath:
-        raise ValueError(f"Tool {tool.get('name')} has no filepath.")
-    path = resolve_tool_path(filepath)
-    try:
         completed = subprocess.run(
             [sys.executable, str(path)],
             cwd=ROOT_DIR,
@@ -1961,10 +1985,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             check=False,
         )
         result = {
-            timeout=120,
-            check=False,
-        )
-        return {
             "stdout": completed.stdout[-100_000:],
             "stderr": completed.stderr[-100_000:],
             "exit_code": completed.returncode,
@@ -1993,7 +2013,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             "exception": type(exc).__name__,
             "malformed_output": False,
         }
-
 
 def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if result.get("timed_out"):
@@ -2026,15 +2045,24 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
         "result": result,
         "attempt_number": attempt_number,
         "max_attempts": max_attempts,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": "Timed out after 120s",
-            "exit_code": -1,
-            "timed_out": True,
-        }
+    }
+    return textwrap.dedent(
+        f"""
+        A registered tool failed. Repair it before continuing.
 
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
 def update_registered_tool_status(
     name: str,
@@ -2144,42 +2172,32 @@ def register_tool(
     supersedes: str | None = None,
 ) -> dict[str, Any]:
     validate_tool_name(name)
+    package_info: dict[str, Any] | None = None
     try:
         path = resolve_tool_candidate(filepath)
-        package_info: dict[str, Any] | None = None
-        metadata: dict[str, Any] = {"version": "0.0.0", "deprecated": False, "deprecation_reason": ""}
         entry_filepath = str(Path(filepath))
-
         if path.is_dir():
             package_info = load_tool_package(path)
             parameters = package_info["schema"]
-            metadata = package_info["metadata"]
-            entry_filepath = str(Path(filepath))
+            package_metadata = package_info["metadata"]
+            version = str(package_metadata.get("version", version))
         else:
             if path.suffix.lower() != ".py":
                 raise ValueError("Legacy tool registrations must point to a Python file.")
             parameters = parameters_schema or {"type": "object"}
             validate_json_schema(parameters)
+            entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
     except ValueError as exc:
         return {"error": str(exc)}
 
-        path = resolve_tool_path(filepath)
-    except ValueError as exc:
-        return {"error": str(exc)}
-
-    if not isinstance(parameters_schema, dict):
-        return {"error": "parameters_schema must be an object."}
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
-    if not any([test_command, test_plan, sample_arguments is not None]):
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
         return {
             "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
         }
 
     registry = load_registry()
-    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
-    metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
-    metadata.setdefault("repair_attempts", [])
     existing_versions = [
         tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
     ]
@@ -2193,31 +2211,14 @@ def register_tool(
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
+    metadata = {"repair_attempts": []}
+    if package_info is not None:
+        metadata.update(package_info["metadata"])
     entry = {
         "name": name,
         "description": description,
         "parameters": parameters,
         "filepath": entry_filepath,
-        "builtin": False,
-        "requires_approval": bool(requires_approval),
-        "version": str(metadata.get("version", "0.0.0")),
-        "deprecated": bool(metadata.get("deprecated", False)),
-        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
-    }
-    if path.is_dir():
-        entry["package"] = True
-        entry["package_dir"] = entry_filepath
-    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
-    registry["tools"].append(entry)
-    save_json(REGISTRY_PATH, registry)
-    result = {"registered": name, "permanent": True}
-    if package_info is not None:
-        result["package"] = True
-        result["version"] = entry["version"]
-        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
-    return result
-        "parameters": parameters_schema,
-        "filepath": str(path.relative_to(BASE_DIR)),
         "builtin": False,
         "requires_approval": bool(requires_approval),
         "metadata": metadata,
@@ -2226,18 +2227,26 @@ def register_tool(
         "updated_at": timestamp,
         "source_task_id": source_task_id,
         "test_command": test_command,
-        "test_plan": test_plan,
+        "test_plan": test_plan or ("Package tests.py passed." if package_info is not None else None),
         "sample_arguments": sample_arguments or {},
-        "last_test_status": "pending",
+        "last_test_status": "passed" if package_info is not None else "pending",
         "last_error": None,
         "use_count": 0,
         "supersedes": supersedes,
-        "trusted": False,
+        "trusted": bool(package_info is not None),
     }
+    if package_info is not None:
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        entry["deprecated"] = bool(package_info["metadata"].get("deprecated", False))
+        entry["deprecation_reason"] = str(package_info["metadata"].get("deprecation_reason", "") or "")
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return {"registered": name, "version": str(version), "permanent": True, "trusted": False}
-
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": entry["trusted"]}
+    if package_info is not None:
+        result["package"] = True
+        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
+    return result
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
     execution_id = str(uuid.uuid4())
@@ -2816,14 +2825,11 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         public_messages = sanitized_messages.copy()
         yield sse("meta", {"session_id": session_id, "model": request.model})
         repair_attempts_by_tool: dict[str, int] = {}
-        try:
-            max_repair_attempts = tool_repair_max_attempts()
-            max_model_turns = 4 + (max_repair_attempts * 2)
-            for _ in range(max_model_turns):
         yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
         yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
         try:
             max_task_steps = max(1, int(request.max_task_steps or 12))
+            max_repair_attempts = tool_repair_max_attempts()
             model_turns = 0
             while not task_state.done and model_turns < max_task_steps:
                 model_turns += 1
@@ -3026,10 +3032,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 else:
                     continue
                 continue
-                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                    yield sse("evaluation", evaluation)
-                    if evaluation["decision"] == "final":
-                        break
                 yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
             if not task_state.done:
                 task_state.failure_count += 1
