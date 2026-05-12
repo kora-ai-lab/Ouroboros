@@ -19,6 +19,16 @@
       "requires_approval": true
     },
     {
+      "name": "rollback_latest_checkpoint",
+      "description": "Restore the latest file mutation checkpoint created before an approved risky Python execution.",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      },
+      "builtin": true,
+      "requires_approval": true
+    },
+    {
       "name": "register_tool",
       "description": "Permanently register a Python file as a tool. The file must already exist on disk (written via execute_python). After registration the tool is available in all future sessions without restart.",
       "parameters": {

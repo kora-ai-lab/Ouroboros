@@ -23,6 +23,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+import checkpoints
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -41,6 +43,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 ARCHIVE_DIR = DATA_DIR / "archive"
+CHECKPOINTS_DIR = DATA_DIR / "checkpoints"
 TOOLS_DIR = BASE_DIR / "tools"
 KORA_DIR = BASE_DIR / "kora"
 REGISTRY_PATH = BASE_DIR / "registry.json"
@@ -102,6 +105,13 @@ DEFAULT_REGISTRY = {
                 "properties": {"code": {"type": "string"}},
                 "required": ["code"],
             },
+            "builtin": True,
+            "requires_approval": True,
+        },
+        {
+            "name": "rollback_latest_checkpoint",
+            "description": "Restore the latest file mutation checkpoint created before an approved risky Python execution.",
+            "parameters": {"type": "object", "properties": {}},
             "builtin": True,
             "requires_approval": True,
         },
@@ -559,7 +569,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
-    for path in (DATA_DIR, ARCHIVE_DIR, TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -661,6 +671,13 @@ def load_registry() -> dict[str, Any]:
     registry = load_json(REGISTRY_PATH, DEFAULT_REGISTRY)
     if "tools" not in registry or not isinstance(registry["tools"], list):
         raise HTTPException(status_code=500, detail="registry.json is invalid")
+    existing_names = {tool.get("name") for tool in registry["tools"] if isinstance(tool, dict)}
+    missing_builtins = [
+        tool for tool in DEFAULT_REGISTRY["tools"]
+        if tool.get("builtin") and tool.get("name") not in existing_names
+    ]
+    if missing_builtins:
+        registry["tools"] = registry["tools"] + missing_builtins
     return registry
 
 
@@ -1048,6 +1065,42 @@ def path_in_approved_roots(path: Path) -> bool:
     return False
 
 
+def filesystem_checkpoint_metadata(code: str) -> dict[str, Any]:
+    affected_paths = checkpoints.infer_affected_files(code, ROOT_DIR)
+    strategy = "files" if affected_paths else "git_repo" if (ROOT_DIR / ".git").exists() else "none"
+    return {
+        "enabled": strategy != "none",
+        "strategy": strategy,
+        "affected_paths_inferred": bool(affected_paths),
+        "affected_paths": [str(path) for path in affected_paths],
+        "storage_dir": str(CHECKPOINTS_DIR),
+    }
+
+
+def create_filesystem_mutation_checkpoint(code: str, policy: dict[str, Any]) -> dict[str, Any] | None:
+    if "filesystem write or mutation" not in policy.get("reasons", []):
+        return None
+    affected_paths = [Path(path) for path in policy.get("checkpoint", {}).get("affected_paths", [])]
+    checkpoint = checkpoints.create_checkpoint(
+        affected_paths,
+        root_dir=ROOT_DIR,
+        data_dir=DATA_DIR,
+        reason="approved execute_python filesystem mutation",
+        code=code,
+    )
+    return {
+        "id": checkpoint["id"],
+        "created_at": checkpoint["created_at"],
+        "strategy": checkpoint["strategy"],
+        "path_count": checkpoint["path_count"],
+        "storage_dir": str(CHECKPOINTS_DIR),
+    }
+
+
+def rollback_latest_checkpoint() -> dict[str, Any]:
+    return checkpoints.restore_latest_checkpoint(data_dir=DATA_DIR)
+
+
 def summarize_python_execution_policy(code: str) -> dict[str, Any]:
     reasons: list[str] = []
     blocked: list[str] = []
@@ -1136,11 +1189,14 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         }
     unique_reasons = sorted(set(reasons))
     if unique_reasons:
-        return {
+        response = {
             "action": "require_approval",
             "risk_summary": "Requires approval: " + "; ".join(unique_reasons) + ".",
             "reasons": unique_reasons,
         }
+        if "filesystem write or mutation" in unique_reasons:
+            response["checkpoint"] = filesystem_checkpoint_metadata(code)
+        return response
     return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
 
 
@@ -1150,6 +1206,8 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
         return {"error": policy["risk_summary"], "policy": policy, "exit_code": -1, "timed_out": False}
     if policy["action"] == "require_approval" and not policy_approved:
         return {"error": "Python execution requires approval by policy.", "policy": policy, "exit_code": -1, "timed_out": False}
+
+    checkpoint_metadata = create_filesystem_mutation_checkpoint(code, policy) if policy_approved else None
 
     start = time.time()
     proc = await asyncio.create_subprocess_exec(
@@ -1162,25 +1220,31 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=30
         )
-        return {
+        result = {
             "stdout": stdout.decode()[-100_000:],
             "stderr": stderr.decode()[-100_000:],
             "exit_code": proc.returncode,
             "timed_out": False,
             "duration_ms": int((time.time() - start) * 1000)
         }
+        if checkpoint_metadata is not None:
+            result["checkpoint"] = checkpoint_metadata
+        return result
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except OSError:
             pass
-        return {
+        result = {
             "stdout": "",
             "stderr": "Timed out after 30s",
             "exit_code": -1,
             "timed_out": True,
             "duration_ms": int((time.time() - start) * 1000)
         }
+        if checkpoint_metadata is not None:
+            result["checkpoint"] = checkpoint_metadata
+        return result
 
 
 
@@ -1601,6 +1665,14 @@ async def reject(decision: ApprovalDecision) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.post("/checkpoints/rollback")
+async def rollback_checkpoint_endpoint() -> JSONResponse:
+    result = rollback_latest_checkpoint()
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return JSONResponse(result)
+
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)) -> JSONResponse:
     raw = await file.read()
@@ -1753,6 +1825,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                 "arguments": arguments,
                                 "risk_summary": pending.risk_summary,
                                 "policy_reasons": pending.policy_reasons,
+                                "checkpoint": policy.get("checkpoint") if policy is not None else None,
                                 "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
                             },
                         )
@@ -1773,6 +1846,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     if tool_name == "execute_python":
                         result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+                    elif tool_name == "rollback_latest_checkpoint":
+                        result = rollback_latest_checkpoint()
                     elif tool_name == "register_tool":
                         result = register_tool(
                             name=str(arguments.get("name", "")),
