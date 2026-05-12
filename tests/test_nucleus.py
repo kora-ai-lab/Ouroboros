@@ -251,6 +251,12 @@ def test_execute_python_default_registry_requires_approval():
     assert tool["requires_approval"] is True
 
 
+def test_git_harness_is_not_special_case_tool_by_default():
+    names = {tool["name"] for tool in server.DEFAULT_REGISTRY["tools"]}
+    assert "git_status" not in names
+    assert "git_harness" not in names
+
+
 def test_execute_python_policy_classifies_risks():
     policy = server.summarize_python_execution_policy("import subprocess\nsubprocess.run(['echo', 'x'])")
     assert policy["action"] == "require_approval"
@@ -352,3 +358,85 @@ def test_capability_refusal_detection_does_not_create_tool_code():
     assert "duckduckgo" not in retry.lower()
     assert "urllib" not in retry.lower()
     assert server.is_capability_refusal("Here is the result.") is False
+
+
+def _run_git(repo: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(["git", *args], cwd=repo, check=True, text=True, capture_output=True)
+
+
+def _make_git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _run_git(repo, "init")
+    _run_git(repo, "config", "user.email", "agent@example.test")
+    _run_git(repo, "config", "user.name", "Agent Test")
+    (repo / "README.md").write_text("initial\n", encoding="utf-8")
+    _run_git(repo, "add", "README.md")
+    _run_git(repo, "commit", "-m", "initial")
+    return repo
+
+
+def test_git_harness_status_diff_and_checkpoint_commit(tmp_path):
+    import git_harness
+
+    repo = _make_git_repo(tmp_path)
+    (repo / "README.md").write_text("initial\nchanged\n", encoding="utf-8")
+    (repo / "notes.txt").write_text("new\n", encoding="utf-8")
+
+    status = git_harness.status(repo)
+    assert status["ok"] is True
+    assert status["clean"] is False
+    assert {file["path"] for file in status["files"]} == {"README.md", "notes.txt"}
+
+    diff = git_harness.diff(repo)
+    assert diff["ok"] is True
+    assert "+changed" in diff["stdout"]
+
+    changed = git_harness.list_changed_files(repo)
+    assert changed["paths"] == ["README.md", "notes.txt"]
+
+    checkpoint = git_harness.commit("checkpoint changes", repo)
+    assert checkpoint["ok"] is True
+    assert checkpoint["committed"] is True
+    assert checkpoint["before"]["clean"] is False
+    assert checkpoint["after"]["clean"] is True
+    assert checkpoint["hash"]
+
+
+def test_git_harness_restore_explicit_path(tmp_path):
+    import git_harness
+
+    repo = _make_git_repo(tmp_path)
+    readme = repo / "README.md"
+    readme.write_text("damaged\n", encoding="utf-8")
+
+    restored = git_harness.restore(repo, paths=["README.md"])
+    assert restored["ok"] is True
+    assert readme.read_text(encoding="utf-8") == "initial\n"
+    assert git_harness.status(repo)["clean"] is True
+
+
+def test_execute_python_policy_destructive_git_requires_manual_approval():
+    reset_policy = server.summarize_python_execution_policy(
+        "import subprocess\nsubprocess.run(['git', 'reset', '--hard', 'HEAD'])"
+    )
+    assert reset_policy["action"] == "require_approval"
+    assert reset_policy["manual_approval_required"] is True
+    assert "destructive git command requires explicit approval" in reset_policy["reasons"]
+
+    clean_policy = server.summarize_python_execution_policy("import os\nos.system('git clean -fd')")
+    assert clean_policy["manual_approval_required"] is True
+
+    push_policy = server.summarize_python_execution_policy("import os\nos.system('git push --force-with-lease origin main')")
+    assert push_policy["manual_approval_required"] is True
+
+
+def test_system_prompt_guides_git_status_for_self_modifying_work(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    prompt = server.build_system_prompt(
+        server.ChatRequest(messages=[server.ChatMessage(role="user", content="change yourself")])
+    )
+    assert "inspect `git status` before edits and again after edits" in prompt
+    assert "nucleus/git_harness.py" in prompt

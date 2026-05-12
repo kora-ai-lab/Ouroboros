@@ -16,7 +16,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Sequence
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -166,9 +166,10 @@ BEHAVIORAL RULES:
 3. Tool-call contract: output exactly `<tool_call>{{"name":"execute_python","arguments":{{"code":"..."}}}}</tool_call>`. Do not use markdown fences for tool calls.
 4. You are direct and strategic. No corporate fluff. No emotional validation. You report facts and actions.
 5. You can modify your own nucleus code (read/write files in the nucleus directory) when approved by policy.
-6. You do not ask for confirmation more than once per action. If the user asked for something, do it.
-7. After a tool result is returned, you MUST respond to it: summarize findings or confirm execution.
-8. For PDFs, the pymupdf library is pre-installed.
+6. For self-modifying repository work, inspect `git status` before edits and again after edits so the user can see the checkpoint state. Use the reusable `nucleus/git_harness.py` helpers through execute_python when useful, or register thin wrappers only when needed.
+7. You do not ask for confirmation more than once per action. If the user asked for something, do it.
+8. After a tool result is returned, you MUST respond to it: summarize findings or confirm execution.
+9. For PDFs, the pymupdf library is pre-installed.
 
 CURRENT REGISTERED TOOLS:
 {tool_registry}
@@ -1033,6 +1034,12 @@ NETWORK_IMPORTS = {"socket", "http.client", "httpx", "requests", "urllib", "urll
 BLOCKED_IMPORTS = {"ctypes"}
 DYNAMIC_EXECUTION_CALLS = {"eval", "exec", "compile", "__import__"}
 OS_PROCESS_CALLS = {"system", "popen", "spawnl", "spawnlp", "spawnv", "spawnvp", "execv", "execvp"}
+DESTRUCTIVE_GIT_REASON = "destructive git command requires explicit approval"
+DESTRUCTIVE_GIT_PATTERNS = (
+    re.compile(r"\bgit\s+reset\s+[^\n;&|]*--hard\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+clean\s+[^\n;&|]*(?:-[a-z]*f[a-z]*d|-d[a-z]*f)\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+push\s+[^\n;&|]*(?:--force(?:-with-lease)?\b|-f\b)", re.IGNORECASE),
+)
 
 
 def approved_execution_roots() -> list[Path]:
@@ -1048,8 +1055,32 @@ def path_in_approved_roots(path: Path) -> bool:
     return False
 
 
+def command_text_contains_destructive_git(command_text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", command_text.strip())
+    return any(pattern.search(normalized) for pattern in DESTRUCTIVE_GIT_PATTERNS)
+
+
+def command_parts_contain_destructive_git(parts: Sequence[str]) -> bool:
+    lowered = [part.lower() for part in parts]
+    if "git" not in lowered:
+        return False
+    git_index = lowered.index("git")
+    tail = lowered[git_index + 1 :]
+    if len(tail) >= 2 and tail[0] == "reset" and "--hard" in tail:
+        return True
+    if tail and tail[0] == "clean":
+        return any(part.startswith("-") and "f" in part and "d" in part for part in tail[1:])
+    if tail and tail[0] == "push":
+        return any(part in {"-f", "--force", "--force-with-lease"} or part.startswith("--force=") for part in tail[1:])
+    return False
+
+
 def summarize_python_execution_policy(code: str) -> dict[str, Any]:
     reasons: list[str] = []
+    manual_approval_required = False
+    if command_text_contains_destructive_git(code):
+        reasons.append(DESTRUCTIVE_GIT_REASON)
+        manual_approval_required = True
     blocked: list[str] = []
     module_aliases: dict[str, str] = {}
     risky_call_aliases: dict[str, str] = {}
@@ -1086,6 +1117,12 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                             risky_call_aliases[alias.asname or alias.name] = "subprocess/process access"
 
         for node in ast.walk(tree):
+            if isinstance(node, (ast.List, ast.Tuple)):
+                string_parts = [element.value for element in node.elts if isinstance(element, ast.Constant) and isinstance(element.value, str)]
+                if command_parts_contain_destructive_git(string_parts):
+                    reasons.append(DESTRUCTIVE_GIT_REASON)
+                    manual_approval_required = True
+
             if isinstance(node, ast.Call):
                 func_name = ""
                 owner = ""
@@ -1118,6 +1155,9 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
 
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 text = node.value
+                if command_text_contains_destructive_git(text):
+                    reasons.append(DESTRUCTIVE_GIT_REASON)
+                    manual_approval_required = True
                 if text.startswith("~"):
                     reasons.append("home-directory access")
                 path = Path(text)
@@ -1140,8 +1180,9 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "action": "require_approval",
             "risk_summary": "Requires approval: " + "; ".join(unique_reasons) + ".",
             "reasons": unique_reasons,
+            "manual_approval_required": manual_approval_required,
         }
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
+    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
 
 
 async def execute_python(code: str, policy_approved: bool = False) -> dict[str, Any]:
@@ -1732,7 +1773,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     policy_approved = False
                     if policy is not None and policy["action"] == "require_approval":
                         requires_approval = True
-                    if request.auto_approve:
+                    if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
                         requires_approval = False
                         policy_approved = True
                     if requires_approval:
