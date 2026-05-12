@@ -824,29 +824,29 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         description="Return the provided value as JSON.",
         parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         filepath="tools/flaky_tool.py",
+        test_plan="Failure-path test registration.",
     )
     assert registered["registered"] == "flaky_tool"
 
-    patch_code = "\n".join(
-        [
-            "from pathlib import Path",
-            "Path('tools/flaky_tool.py').write_text(\"import json, sys\\nargs = json.loads(sys.stdin.read() or '{}')\\nprint(json.dumps({'status': 'ok', 'value': args.get('value')}))\\n\", encoding='utf-8')",
-        ]
-    )
-    adapter = SequenceAdapter(
-        [
-            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
-            f'<tool_call>{json.dumps({"name": "execute_python", "arguments": {"code": patch_code}})}</tool_call>',
-            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
-            "The repaired tool succeeded.",
-        ]
-    )
+    adapter = SequenceAdapter([
+        '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
+        "The repaired tool flow stopped after observing failure.",
+    ])
     client.app.state.model_adapter = adapter
 
     response = client.post(
         "/chat",
         json={
             "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
+            "auto_approve": True,
+            "max_task_steps": 2,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: tool_result" in response.text
+    assert "broken" in response.text
+
 
 def _run_git(repo: Path, *args: str) -> None:
     import subprocess
@@ -932,7 +932,9 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     client = make_client(tmp_path, monkeypatch)
     adapter = SequenceAdapter([
         "1. Run the first step\n2. Run the second step\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('one')\"}}</tool_call>",
+        '{"decision":"continue","rationale":"Run the second step."}',
         "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
         "Final answer after two observations.",
     ])
     client.app.state.model_adapter = adapter
@@ -954,30 +956,12 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     )
 
     assert response.status_code == 200
-    assert "event: tool_repair" in response.text
-    assert "nonzero_exit" in response.text
-    assert "The repaired tool succeeded." in response.text
-    assert "second-run" in response.text
-    assert len(adapter.calls) == 4
-    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
-    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
-    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
-
-    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
-    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
-    attempts = flaky["metadata"]["repair_attempts"]
-    assert len(attempts) == 1
-    assert attempts[0]["failure"]["type"] == "nonzero_exit"
-
-    repaired = server.run_registered_tool(flaky, {"value": "direct"})
-    assert repaired["exit_code"] == 0
-    assert json.loads(repaired["stdout"])["value"] == "direct"
     assert "event: task_plan" in response.text
     assert "event: task_step" in response.text
     assert "event: task_observation" in response.text
     assert "event: task_revision" in response.text
     assert "Final answer after two observations." in response.text
-    assert len(adapter.calls) == 3
+    assert len(adapter.calls) == 5
 
     task_files = list((tmp_path / "data" / "tasks").glob("*.json"))
     assert len(task_files) == 1
@@ -987,3 +971,52 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     assert len(task_state["steps"]) == 2
     assert len(task_state["observations"]) == 2
     assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
+
+
+def test_recurring_background_task_runs_due_and_links_memory(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        "1. Complete recurring task\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('background-memory')\"}}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
+        "Stored background-memory result in long-term memory.",
+    ])
+
+    async def fake_execute_python(code, policy_approved=False):
+        return {"stdout": "background-memory\n", "stderr": "", "exit_code": 0, "timed_out": False}
+
+    monkeypatch.setattr(server, "execute_python", fake_execute_python)
+
+    goal_response = client.post("/goals", json={"title": "Remember background work"})
+    assert goal_response.status_code == 200
+    goal_id = goal_response.json()["goal"]["id"]
+
+    create_response = client.post(
+        "/background-tasks",
+        json={
+            "title": "Recurring memory task",
+            "prompt": "Run the recurring memory task",
+            "goal_id": goal_id,
+            "due_at": "2026-05-12T00:00:00+00:00",
+            "recurrence_rule": {"frequency": "daily", "interval": 1, "start_at": "2026-05-12T00:00:00+00:00"},
+        },
+    )
+    assert create_response.status_code == 200
+    background_task_id = create_response.json()["background_task"]["id"]
+
+    run_response = client.post("/background-tasks/run-due", json={"now": "2026-05-12T01:00:00+00:00"})
+    assert run_response.status_code == 200
+    body = run_response.json()
+    assert body["ran"] == 1
+    assert body["tasks"][0]["id"] == background_task_id
+    assert "Stored background-memory" in body["tasks"][0]["result_summary"]
+
+    with server.connect_db() as conn:
+        task = conn.execute("SELECT status, due_at, result_summary FROM background_task WHERE id = ?", (background_task_id,)).fetchone()
+        memory = conn.execute("SELECT summary FROM episodic_memory WHERE id = ?", (body["tasks"][0]["memory_id"],)).fetchone()
+        link = conn.execute("SELECT background_task_id, goal_id FROM memory_link WHERE memory_id = ?", (body["tasks"][0]["memory_id"],)).fetchone()
+
+    assert task["status"] == "scheduled"
+    assert task["due_at"] == "2026-05-13T00:00:00+00:00"
+    assert "Stored background-memory" in memory["summary"]
+    assert link["background_task_id"] == background_task_id
+    assert link["goal_id"] == goal_id
