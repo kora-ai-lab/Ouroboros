@@ -993,6 +993,22 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_task ON workspace_index(last_seen_task_id)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS tool_execution_audit (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                tool_version TEXT NOT NULL,
+                arguments_hash TEXT NOT NULL,
+                permissions_used TEXT NOT NULL,
+                files_touched TEXT NOT NULL,
+                network_flag INTEGER NOT NULL,
+                process_flag INTEGER NOT NULL,
+                approval_id TEXT,
+                result_status TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_tool_execution_audit_tool ON tool_execution_audit(tool_name, tool_version)")
             CREATE TABLE IF NOT EXISTS memory_compaction (
                 session_id TEXT PRIMARY KEY,
                 archive_path TEXT NOT NULL,
@@ -1970,6 +1986,7 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
+def load_package_metadata(package_dir: Path) -> dict[str, Any]:
 def load_tool_metadata(source: Path | dict[str, Any]) -> dict[str, Any]:
     if isinstance(source, dict):
         metadata = source.get("metadata")
@@ -2045,6 +2062,7 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
         raise ValueError(f"schema.json is invalid JSON: {exc.msg}") from exc
     validate_json_schema(schema)
     metadata = load_package_metadata(package_dir)
+    validate_tool_permission_manifest(metadata)
     metadata = load_tool_package_metadata(package_dir)
 
     completed = subprocess.run(
@@ -2497,14 +2515,169 @@ def annotate_registered_tool_output(result: dict[str, Any], tool: dict[str, Any]
     return result
 
 
+def arguments_hash(arguments: dict[str, Any]) -> str:
+    payload = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def tool_permission_defaults() -> dict[str, Any]:
+    return {"filesystem": [], "network": [], "environment": [], "process": {"allow": False}, "secrets": []}
+
+
+def normalize_tool_permissions(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    raw = (metadata or {}).get("permissions")
+    if raw is None:
+        raw = {
+            "filesystem": (metadata or {}).get("requested_filesystem_scopes", []),
+            "network": (metadata or {}).get("requested_network_scopes", []),
+            "environment": (metadata or {}).get("requested_environment_variables", []),
+            "process": (metadata or {}).get("process_permissions", {"allow": False}),
+            "secrets": (metadata or {}).get("secret_access", []),
+        }
+    if not isinstance(raw, dict):
+        raise ValueError("metadata.json permissions must be an object.")
+    normalized = tool_permission_defaults()
+    filesystem = raw.get("filesystem", raw.get("requested_filesystem_scopes", []))
+    if not isinstance(filesystem, list):
+        raise ValueError("permissions.filesystem must be a list.")
+    fs_scopes = []
+    for item in filesystem:
+        scope = {"path": item, "access": "read"} if isinstance(item, str) else item
+        if not isinstance(scope, dict):
+            raise ValueError("permissions.filesystem entries must be strings or objects.")
+        path_value = scope.get("path")
+        access = scope.get("access", "read")
+        if not isinstance(path_value, str) or not path_value.strip():
+            raise ValueError("permissions.filesystem entries require a non-empty path.")
+        if access not in {"read", "write", "read_write"}:
+            raise ValueError("permissions.filesystem access must be read, write, or read_write.")
+        fs_scopes.append({"path": path_value, "access": access})
+    normalized["filesystem"] = fs_scopes
+
+    network = raw.get("network", raw.get("requested_network_scopes", []))
+    if not isinstance(network, list):
+        raise ValueError("permissions.network must be a list.")
+    net_scopes = []
+    for item in network:
+        scope = {"host": item, "ports": []} if isinstance(item, str) else item
+        if not isinstance(scope, dict):
+            raise ValueError("permissions.network entries must be strings or objects.")
+        host = scope.get("host")
+        ports = scope.get("ports", [])
+        if not isinstance(host, str) or not host.strip():
+            raise ValueError("permissions.network entries require a non-empty host.")
+        if not isinstance(ports, list) or not all(isinstance(port, int) for port in ports):
+            raise ValueError("permissions.network ports must be a list of integers.")
+        net_scopes.append({"host": host, "ports": ports})
+    normalized["network"] = net_scopes
+
+    environment = raw.get("environment", raw.get("requested_environment_variables", []))
+    if not isinstance(environment, list) or not all(isinstance(item, str) and item for item in environment):
+        raise ValueError("permissions.environment must be a list of non-empty strings.")
+    normalized["environment"] = environment
+
+    process = raw.get("process", raw.get("process_permissions", {"allow": False}))
+    if isinstance(process, bool):
+        process = {"allow": process}
+    if not isinstance(process, dict) or not isinstance(process.get("allow", False), bool):
+        raise ValueError("permissions.process must be a boolean or an object with boolean allow.")
+    normalized["process"] = {"allow": bool(process.get("allow", False))}
+
+    secrets = raw.get("secrets", raw.get("secret_access", []))
+    if not isinstance(secrets, list) or not all(isinstance(item, str) and item for item in secrets):
+        raise ValueError("permissions.secrets must be a list of non-empty strings.")
+    normalized["secrets"] = secrets
+    return normalized
+
+
+def validate_tool_permission_manifest(metadata: dict[str, Any]) -> dict[str, Any]:
+    permissions = normalize_tool_permissions(metadata)
+    metadata["permissions"] = permissions
+    metadata.setdefault("requested_filesystem_scopes", permissions["filesystem"])
+    metadata.setdefault("requested_network_scopes", permissions["network"])
+    metadata.setdefault("requested_environment_variables", permissions["environment"])
+    metadata.setdefault("process_permissions", permissions["process"])
+    metadata.setdefault("secret_access", permissions["secrets"])
+    return permissions
+
+
+def tool_permissions_from_entry(tool: dict[str, Any]) -> dict[str, Any]:
+    if isinstance(tool.get("permissions"), dict):
+        return normalize_tool_permissions({"permissions": tool["permissions"]})
+    return normalize_tool_permissions(load_tool_metadata(tool))
+
+
+def permission_runtime_guard(permissions: dict[str, Any], package_dir: Path) -> str:
+    fs_scopes = permissions.get("filesystem", [])
+    network_scopes = permissions.get("network", [])
+    process_allowed = bool(permissions.get("process", {}).get("allow", False))
+    env_allowed = set(permissions.get("environment", [])) | set(permissions.get("secrets", [])) | SAFE_EXECUTION_ENV_VARS
+    scope_payload = []
+    for scope in fs_scopes:
+        path_value = Path(scope["path"])
+        if not path_value.is_absolute():
+            path_value = (ROOT_DIR / path_value).resolve()
+        scope_payload.append({"path": str(path_value), "access": scope["access"]})
+    scope_payload.append({"path": str(package_dir.resolve()), "access": "read"})
+    lines = [
+        "import builtins as _b, os as _os, pathlib as _p, runpy as _runpy, socket as _socket, subprocess as _subprocess",
+        f"_FS={scope_payload!r}",
+        f"_NET={network_scopes!r}",
+        f"_PROC={process_allowed!r}",
+        f"_ENV={sorted(env_allowed)!r}",
+        "def _res(path): return _os.path.realpath(_os.path.abspath(_os.fspath(path)))",
+        "def _allows(path, write):\n    r=_res(path)\n    for s in _FS:\n        root=_res(s['path'])\n        if r==root or r.startswith(root+_os.sep):\n            a=s.get('access','read')\n            if write and a in ('write','read_write'): return True\n            if (not write) and a in ('read','read_write'): return True\n    return False",
+        "def _writes(mode): return any(f in str(mode) for f in ('w','a','x','+'))",
+        "def _check(path, write=False):\n    if not _allows(path, write):\n        raise PermissionError(('undeclared filesystem write access: ' if write else 'undeclared filesystem read access: ')+_os.fspath(path))",
+        "_open=_b.open\ndef open(file, mode='r', *args, **kwargs):\n    _check(file, _writes(mode))\n    return _open(file, mode, *args, **kwargs)\n_b.open=open",
+        "_path_open=_p.Path.open\ndef _guard_path_open(self, mode='r', *args, **kwargs):\n    _check(self, _writes(mode))\n    return _path_open(self, mode, *args, **kwargs)\n_p.Path.open=_guard_path_open",
+        "def _wrap_path_write(name):\n    orig=getattr(_p.Path,name)\n    def wrapper(self,*args,**kwargs):\n        _check(self, True)\n        return orig(self,*args,**kwargs)\n    setattr(_p.Path,name,wrapper)\nfor _n in ('write_text','write_bytes','touch','unlink','mkdir','rmdir'):\n    _wrap_path_write(_n)",
+        "_conn=_socket.socket.connect\ndef _guard_connect(self,address,*args,**kwargs):\n    host=address[0] if isinstance(address,tuple) and address else address\n    ok=any(s.get('host')=='*' or s.get('host')==host for s in _NET)\n    if not ok: raise PermissionError('undeclared network access: '+str(host))\n    return _conn(self,address,*args,**kwargs)\n_socket.socket.connect=_guard_connect",
+        "if not _PROC:\n    def _block_process(*args, **kwargs): raise PermissionError('undeclared subprocess/process access')\n    _subprocess.Popen=_block_process\n    for _n in ('system','popen','spawnl','spawnlp','spawnv','spawnvp','execv','execvp'):\n        if hasattr(_os,_n): setattr(_os,_n,_block_process)",
+        "_copy=dict(_os.environ)\n_os.environ.clear()\nfor _k,_v in _copy.items():\n    if _k in _ENV: _os.environ[_k]=_v",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def summarize_tool_permission_use(result: dict[str, Any], permissions: dict[str, Any]) -> dict[str, Any]:
+    text = "\n".join(str(result.get(key, "")) for key in ("stdout", "stderr", "error"))
+    return {
+        "filesystem": bool(permissions.get("filesystem")) or "filesystem" in text or "PermissionError" in text,
+        "network": bool(permissions.get("network")) or "network" in text,
+        "process": bool(permissions.get("process", {}).get("allow", False)) or "subprocess" in text or "process" in text,
+        "environment": bool(permissions.get("environment") or permissions.get("secrets")),
+    }
+
+
+def audit_registered_tool_execution(tool: dict[str, Any], arguments: dict[str, Any], permissions: dict[str, Any], result: dict[str, Any], approval_id: str | None = None) -> None:
+    try:
+        status = "timeout" if result.get("timed_out") else "success" if int(result.get("exit_code", -1)) == 0 else "failed"
+    except (TypeError, ValueError):
+        status = "failed"
+    permissions_used = summarize_tool_permission_use(result, permissions)
+    files_touched = [scope.get("path") for scope in permissions.get("filesystem", []) if isinstance(scope, dict)]
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO tool_execution_audit (id, timestamp, tool_name, tool_version, arguments_hash, permissions_used, files_touched, network_flag, process_flag, approval_id, result_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), now_iso(), str(tool.get("name", "")), str(tool.get("version", "")), arguments_hash(arguments), json.dumps(permissions_used, sort_keys=True), json.dumps(files_touched), 1 if permissions_used.get("network") else 0, 1 if permissions_used.get("process") else 0, approval_id, status),
+        )
+        conn.commit()
+
+
+def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any], approval_id: str | None = None) -> dict[str, Any]:
 
 def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
     start = time.time()
+    permissions = tool_permissions_from_entry(tool)
     try:
         filepath = tool.get("filepath")
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
+        runner = permission_runtime_guard(permissions, path.parent) + f"\n_ouro_tool_path={str(path)!r}\n_runpy.run_path(_ouro_tool_path, run_name='__main__')\n"
+        completed = subprocess.run([sys.executable, "-c", runner], cwd=ROOT_DIR, input=json.dumps(arguments), text=True, encoding="utf-8", capture_output=True, timeout=REGISTERED_TOOL_TIMEOUT_SECONDS, check=False)
+        result = {"stdout": completed.stdout[-100_000:], "stderr": completed.stderr[-100_000:], "exit_code": completed.returncode, "timed_out": False, "duration_ms": int((time.time() - start) * 1000), "malformed_output": False}
+        result = annotate_registered_tool_output(result, tool)
         completed = subprocess.run(
             [sys.executable, str(path)],
             cwd=str(ROOT_DIR),
@@ -2525,16 +2698,11 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         }
         return annotate_registered_tool_output(result, tool)
     except subprocess.TimeoutExpired as exc:
-        return {
-            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "") or f"Timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s",
-            "exit_code": -1,
-            "timed_out": True,
-            "duration_ms": int((time.time() - start) * 1000),
-            "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.",
-            "malformed_output": False,
-        }
+        result = {"stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "", "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "") or f"Timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s", "exit_code": -1, "timed_out": True, "duration_ms": int((time.time() - start) * 1000), "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.", "malformed_output": False}
     except Exception as exc:
+        result = {"stdout": "", "stderr": str(exc), "exit_code": -1, "timed_out": False, "duration_ms": int((time.time() - start) * 1000), "error": f"Registered tool execution exception: {exc}", "exception": type(exc).__name__, "malformed_output": False}
+    audit_registered_tool_execution(tool, arguments, permissions, result, approval_id)
+    return result
         return {
             "stdout": "",
             "stderr": str(exc),
@@ -2592,6 +2760,11 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
 
         Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
 
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
+
 
         Generic repair instruction:
         1. Inspect the tool file and its registry metadata.
@@ -2639,7 +2812,6 @@ def update_registered_tool_status(
                 target = tool
     if target is None:
         return {"error": f"Tool {name} not found."}
-
     if last_test_status is not None:
         target["last_test_status"] = last_test_status
     if last_error is not None or last_test_status == "passed":
@@ -2653,36 +2825,20 @@ def update_registered_tool_status(
     return {"updated": target["name"], "version": target.get("version"), "tool": target}
 
 
-def validate_registered_tool(
-    name: str,
-    version: str | None = None,
-    sample_arguments: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def validate_registered_tool(name: str, version: str | None = None, sample_arguments: dict[str, Any] | None = None) -> dict[str, Any]:
     tool = find_tool_version(name, version)
     if tool is None:
         return {"error": f"Tool {name} not found."}
     if tool.get("builtin"):
         return {"error": f"Builtin tool {name} cannot be validated as a registered file tool."}
-
     arguments = sample_arguments if sample_arguments is not None else tool.get("sample_arguments", {})
     if not isinstance(arguments, dict):
         return {"error": "sample_arguments must be an object."}
-
-    try:
-        result = run_registered_tool(tool, arguments)
-    except Exception as exc:  # noqa: BLE001 - validation must persist failure details
-        message = str(exc)
-        update_registered_tool_status(
-            name,
-            str(tool.get("version", "")),
-            last_test_status="failed",
-            last_error=message,
-            trusted=False,
-        )
-        return {"validated": False, "error": message}
-
+    result = run_registered_tool(tool, arguments)
     passed = result.get("exit_code") == 0 and not result.get("timed_out")
     error = None if passed else (result.get("stderr") or f"Exited with code {result.get('exit_code')}")
+    status = update_registered_tool_status(name, str(tool.get("version", "")), last_test_status="passed" if passed else "failed", last_error=error, trusted=passed)
+    return {"validated": passed, "name": name, "version": status.get("version"), "result": result, "tool": status.get("tool")}
     status = update_registered_tool_status(
         name,
         str(tool.get("version", "")),
@@ -2725,6 +2881,7 @@ def register_tool(
             metadata = dict(package_info["metadata"])
             version = str(metadata.get("version", version))
         package_info: dict[str, Any] | None = None
+        package_metadata: dict[str, Any] = {"version": str(version), "deprecated": False, "deprecation_reason": ""}
         package_metadata: dict[str, Any] = {}
         entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
         package_metadata: dict[str, Any] = {"version": version, "deprecated": False, "deprecation_reason": ""}
@@ -2745,6 +2902,7 @@ def register_tool(
                 return {"error": "parameters_schema must be an object."}
             parameters = parameters_schema
             validate_json_schema(parameters)
+            validate_tool_permission_manifest(package_metadata)
             if not isinstance(parameters_schema, dict):
                 return {"error": "parameters_schema must be an object."}
             if not any([test_command, test_plan, sample_arguments is not None]):
@@ -2756,6 +2914,12 @@ def register_tool(
 
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
+        return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
+
+    registry = load_registry()
+    existing_versions = [tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")]
+    entry_version = str(package_metadata.get("version", version))
 
     registry = load_registry()
     if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
@@ -2802,6 +2966,15 @@ def register_tool(
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
+    metadata = {
+        "repair_attempts": [],
+        "permissions": package_metadata["permissions"],
+        "requested_filesystem_scopes": package_metadata["requested_filesystem_scopes"],
+        "requested_network_scopes": package_metadata["requested_network_scopes"],
+        "requested_environment_variables": package_metadata["requested_environment_variables"],
+        "process_permissions": package_metadata["process_permissions"],
+        "secret_access": package_metadata["secret_access"],
+    }
     metadata = {"repair_attempts": []}
     if package_info is not None:
         metadata.update(package_info["metadata"])
@@ -2819,11 +2992,25 @@ def register_tool(
         "builtin": False,
         "requires_approval": bool(requires_approval),
         "metadata": metadata,
+        "permissions": package_metadata["permissions"],
         "version": entry_version,
         "created_at": timestamp,
         "updated_at": timestamp,
         "source_task_id": source_task_id,
         "test_command": test_command,
+        "test_plan": test_plan or ("Skill package tests.py passed before registration." if package_info else ""),
+        "sample_arguments": sample_arguments or {},
+        "last_test_status": "passed" if package_info else "pending",
+        "last_error": None,
+        "use_count": 0,
+        "supersedes": supersedes,
+        "trusted": bool(package_info),
+        "deprecated": bool(package_metadata.get("deprecated", False)),
+        "deprecation_reason": str(package_metadata.get("deprecation_reason", "") or ""),
+    }
+    if path.is_dir():
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
         "test_plan": test_plan or ("Package tests.py passed." if package_info is not None else None),
         "test_plan": test_plan or ("Skill package tests.py passed before registration." if package_info else None),
         "sample_arguments": sample_arguments or {},
