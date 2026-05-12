@@ -113,6 +113,128 @@ def test_register_tool_validates_and_persists(tmp_path, monkeypatch):
     registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
     assert any(tool["name"] == "echo_tool" for tool in registry["tools"])
 
+def write_skill_package(base: Path) -> Path:
+    package = base / "tools" / "caps_echo"
+    package.mkdir(parents=True)
+    (package / "tool.py").write_text(
+        """
+import json
+import sys
+
+args = json.loads(sys.stdin.read() or '{}')
+print(json.dumps({'echo': args.get('message', '')}))
+""".lstrip(),
+        encoding="utf-8",
+    )
+    (package / "schema.json").write_text(
+        json.dumps(
+            {
+                "type": "object",
+                "properties": {"message": {"type": "string"}},
+                "required": ["message"],
+                "additionalProperties": False,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (package / "README.md").write_text("# caps_echo\n\nEchoes a message.\n", encoding="utf-8")
+    (package / "metadata.json").write_text(
+        json.dumps(
+            {
+                "version": "1.2.3",
+                "deprecated": False,
+                "deprecation_reason": "",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (package / "tests.py").write_text(
+        """
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+completed = subprocess.run(
+    [sys.executable, str(Path(__file__).with_name('tool.py'))],
+    input=json.dumps({'message': 'package-ok'}),
+    text=True,
+    encoding='utf-8',
+    capture_output=True,
+    check=False,
+)
+assert completed.returncode == 0, completed.stderr
+assert json.loads(completed.stdout)['echo'] == 'package-ok'
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return package
+
+
+def test_skill_package_validates_registers_and_runs(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    write_skill_package(tmp_path)
+
+    entry = server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    assert entry["registered"] == "caps_echo"
+    assert entry["package"] is True
+    assert entry["version"] == "1.2.3"
+
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "caps_echo")
+    assert tool["package"] is True
+    assert tool["filepath"] == "tools/caps_echo"
+    assert tool["parameters"]["required"] == ["message"]
+    assert tool["version"] == "1.2.3"
+    assert tool["deprecated"] is False
+    assert tool["deprecation_reason"] == ""
+
+    result = server.run_registered_tool(tool, {"message": "hello"})
+    assert result["exit_code"] == 0
+    assert json.loads(result["stdout"])["echo"] == "hello"
+
+
+def test_skill_package_must_pass_tests_before_registration(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    (package / "tests.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+
+    entry = server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    assert "tests.py failed" in entry["error"]
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    assert all(tool["name"] != "caps_echo" for tool in registry["tools"])
+
+
+def test_skill_package_requires_valid_schema_before_registration(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    (package / "schema.json").write_text(
+        json.dumps({"type": "not-a-json-schema-type"}),
+        encoding="utf-8",
+    )
+
+    entry = server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    assert "Invalid JSON Schema type" in entry["error"] or "Invalid JSON Schema" in entry["error"]
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    assert all(tool["name"] != "caps_echo" for tool in registry["tools"])
+
 
 def test_retrieve_relevant_memory(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)

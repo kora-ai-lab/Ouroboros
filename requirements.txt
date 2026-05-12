@@ -6,3 +6,5 @@ pymupdf
 pytest
 # Optional for direct local GGUF inference:
 # llama-cpp-python
+
+jsonschema
