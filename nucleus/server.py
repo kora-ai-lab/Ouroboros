@@ -645,8 +645,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
-    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
-    for path in (DATA_DIR, ARCHIVE_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -1409,7 +1408,7 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
-def load_tool_metadata(package_dir: Path) -> dict[str, Any]:
+def load_package_metadata(package_dir: Path) -> dict[str, Any]:
     metadata_path = package_dir / "metadata.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1478,7 +1477,7 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"schema.json is invalid JSON: {exc.msg}") from exc
     validate_json_schema(schema)
-    metadata = load_tool_metadata(package_dir)
+    metadata = load_package_metadata(package_dir)
 
     completed = subprocess.run(
         [sys.executable, str(package_dir / "tests.py")],
@@ -1495,6 +1494,242 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
             f"stdout={completed.stdout[-4000:]!r} stderr={completed.stderr[-4000:]!r}"
         )
     return {"schema": schema, "metadata": metadata, "test_stdout": completed.stdout, "test_stderr": completed.stderr}
+
+
+EVAL_PERMISSION_REASON_MAP = {
+    "filesystem write or mutation": "filesystem_write",
+    "network access": "network",
+    "subprocess/process access": "subprocess",
+    "home-directory access": "home_directory",
+}
+
+
+def normalize_permission(permission: str) -> str:
+    return re.sub(r"[^a-z0-9_]+", "_", permission.strip().lower()).strip("_")
+
+
+def permissions_for_tool_code(tool: dict[str, Any]) -> list[str]:
+    filepath = tool.get("filepath")
+    if not filepath:
+        return []
+    try:
+        code = resolve_tool_path(str(filepath)).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    policy = summarize_python_execution_policy(code)
+    permissions: set[str] = set()
+    for reason in policy.get("reasons", []):
+        reason_text = str(reason)
+        if reason_text.startswith("absolute path outside approved roots"):
+            permissions.add("host_filesystem")
+        else:
+            mapped = EVAL_PERMISSION_REASON_MAP.get(reason_text)
+            if mapped:
+                permissions.add(mapped)
+    return sorted(permissions)
+
+
+def evals_path_for_tool(tool: dict[str, Any]) -> Path | None:
+    package_dir = tool.get("package_dir") or (tool.get("filepath") if tool.get("package") else None)
+    if not package_dir:
+        return None
+    candidate = resolve_tool_candidate(str(package_dir)) / "evals.json"
+    return candidate if candidate.is_file() else None
+
+
+def load_tool_evals(tool: dict[str, Any]) -> list[dict[str, Any]]:
+    path = evals_path_for_tool(tool)
+    if path is None:
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"evals.json is invalid JSON: {exc.msg}") from exc
+    cases = raw.get("evals", raw) if isinstance(raw, dict) else raw
+    if not isinstance(cases, list):
+        raise ValueError("evals.json must contain a list or an object with an evals list.")
+    normalized: list[dict[str, Any]] = []
+    for index, case in enumerate(cases):
+        if not isinstance(case, dict):
+            raise ValueError(f"evals.json case {index} must be an object.")
+        arguments = case.get("input_arguments", case.get("arguments"))
+        if not isinstance(arguments, dict):
+            raise ValueError(f"evals.json case {index} input_arguments must be an object.")
+        predicate = case.get("expected_output_predicate", case.get("predicate"))
+        if not isinstance(predicate, dict):
+            raise ValueError(f"evals.json case {index} expected_output_predicate must be an object.")
+        timeout = case.get("timeout", REGISTERED_TOOL_TIMEOUT_SECONDS)
+        if not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError(f"evals.json case {index} timeout must be a positive number.")
+        required_permissions = case.get("required_permissions", [])
+        if not isinstance(required_permissions, list) or not all(isinstance(item, str) for item in required_permissions):
+            raise ValueError(f"evals.json case {index} required_permissions must be a list of strings.")
+        normalized.append(
+            {
+                "name": str(case.get("name", f"case_{index + 1}")),
+                "input_arguments": arguments,
+                "expected_output_predicate": predicate,
+                "timeout": timeout,
+                "required_permissions": [normalize_permission(item) for item in required_permissions],
+            }
+        )
+    return normalized
+
+
+def eval_declared_permissions(cases: list[dict[str, Any]]) -> list[str]:
+    declared: set[str] = set()
+    for case in cases:
+        declared.update(case.get("required_permissions", []))
+    return sorted(declared)
+
+
+def evaluate_output_predicate(result: dict[str, Any], predicate: dict[str, Any]) -> tuple[bool, str | None]:
+    if "exit_code" in predicate and result.get("exit_code") != predicate["exit_code"]:
+        return False, f"exit_code expected {predicate['exit_code']!r} got {result.get('exit_code')!r}"
+    stdout = str(result.get("stdout", ""))
+    stderr = str(result.get("stderr", ""))
+    if "stdout_contains" in predicate and str(predicate["stdout_contains"]) not in stdout:
+        return False, f"stdout did not contain {predicate['stdout_contains']!r}"
+    if "stdout_equals" in predicate and stdout.strip() != str(predicate["stdout_equals"]):
+        return False, "stdout did not equal expected value"
+    if "stderr_contains" in predicate and str(predicate["stderr_contains"]) not in stderr:
+        return False, f"stderr did not contain {predicate['stderr_contains']!r}"
+    if "json_equals" in predicate:
+        try:
+            actual = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            return False, f"stdout was not JSON: {exc.msg}"
+        if actual != predicate["json_equals"]:
+            return False, f"JSON output expected {predicate['json_equals']!r} got {actual!r}"
+    if "json_field_equals" in predicate:
+        checks = predicate["json_field_equals"]
+        if not isinstance(checks, dict):
+            return False, "json_field_equals must be an object"
+        try:
+            actual = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            return False, f"stdout was not JSON: {exc.msg}"
+        for key, expected in checks.items():
+            if not isinstance(actual, dict) or actual.get(key) != expected:
+                return False, f"JSON field {key!r} expected {expected!r} got {actual.get(key) if isinstance(actual, dict) else None!r}"
+    return True, None
+
+
+def run_tool_evals(tool_name: str, version: str | None = None) -> dict[str, Any]:
+    tool = find_tool_version(tool_name, version)
+    if tool is None:
+        return {"passed": False, "error": f"Tool {tool_name} not found."}
+    if tool.get("builtin"):
+        return {"passed": False, "error": f"Builtin tool {tool_name} cannot run package evals."}
+    try:
+        cases = load_tool_evals(tool)
+    except ValueError as exc:
+        update_registered_tool_status(tool_name, str(tool.get("version", "")), last_eval_status="failed", last_error=str(exc), trusted=False)
+        return {"passed": False, "error": str(exc), "cases": []}
+    if not cases:
+        message = "No evals.json cases found for tool."
+        update_registered_tool_status(tool_name, str(tool.get("version", "")), last_eval_status="failed", last_error=message, trusted=False)
+        return {"passed": False, "error": message, "cases": []}
+
+    declared_permissions = eval_declared_permissions(cases)
+    used_permissions = permissions_for_tool_code(tool)
+    undeclared = sorted(set(used_permissions) - set(declared_permissions))
+    case_results: list[dict[str, Any]] = []
+    passed = not undeclared
+    for case in cases:
+        result = run_registered_tool(tool, case["input_arguments"], timeout=case["timeout"])
+        predicate_passed, error = evaluate_output_predicate(result, case["expected_output_predicate"])
+        case_passed = result.get("exit_code") == 0 and not result.get("timed_out") and predicate_passed
+        if not case_passed:
+            passed = False
+        case_results.append(
+            {
+                "name": case["name"],
+                "passed": case_passed,
+                "error": error or (result.get("stderr") or result.get("error")),
+                "required_permissions": case["required_permissions"],
+                "result": result,
+            }
+        )
+    message = None if passed else ("Undeclared permission use: " + ", ".join(undeclared) if undeclared else "One or more eval cases failed.")
+    update_registered_tool_status(
+        tool_name,
+        str(tool.get("version", "")),
+        last_eval_status="passed" if passed else "failed",
+        last_error=message,
+        trusted=False,
+    )
+    return {
+        "passed": passed,
+        "tool": tool_name,
+        "version": str(tool.get("version", "")),
+        "cases": case_results,
+        "declared_permissions": declared_permissions,
+        "used_permissions": used_permissions,
+        "undeclared_permissions": undeclared,
+        "error": message,
+    }
+
+
+def run_package_tests_for_tool(tool: dict[str, Any]) -> dict[str, Any]:
+    package_dir = tool.get("package_dir") or (tool.get("filepath") if tool.get("package") else None)
+    if not package_dir:
+        return {"passed": tool.get("last_test_status") == "passed", "skipped": True}
+    try:
+        package_path = resolve_tool_candidate(str(package_dir))
+        completed = subprocess.run(
+            [sys.executable, str(package_path / "tests.py")],
+            cwd=str(package_path),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except Exception as exc:
+        return {"passed": False, "error": str(exc)}
+    return {
+        "passed": completed.returncode == 0,
+        "stdout": completed.stdout[-4000:],
+        "stderr": completed.stderr[-4000:],
+        "exit_code": completed.returncode,
+    }
+
+
+def promote_tool_trust(tool_name: str, version: str | None = None) -> dict[str, Any]:
+    tool = find_tool_version(tool_name, version)
+    if tool is None:
+        return {"promoted": False, "error": f"Tool {tool_name} not found."}
+    if tool.get("builtin"):
+        return {"promoted": False, "error": f"Builtin tool {tool_name} is already governed by built-in trust policy."}
+    try:
+        validate_json_schema(tool.get("parameters", {}))
+    except ValueError as exc:
+        update_registered_tool_status(tool_name, str(tool.get("version", "")), last_error=str(exc), trusted=False)
+        return {"promoted": False, "error": str(exc), "schema_valid": False}
+
+    tests = run_package_tests_for_tool(tool)
+    tests_passed = bool(tests.get("passed"))
+    update_registered_tool_status(tool_name, str(tool.get("version", "")), last_test_status="passed" if tests_passed else "failed", trusted=False)
+    if not tests_passed:
+        return {"promoted": False, "error": "Tool tests failed.", "schema_valid": True, "tests": tests}
+
+    evals = run_tool_evals(tool_name, str(tool.get("version", "")))
+    if not evals.get("passed"):
+        return {"promoted": False, "error": evals.get("error") or "Tool evals failed.", "schema_valid": True, "tests": tests, "evals": evals}
+
+    if evals.get("undeclared_permissions"):
+        return {"promoted": False, "error": "Tool used undeclared permissions.", "schema_valid": True, "tests": tests, "evals": evals}
+
+    status = update_registered_tool_status(
+        tool_name,
+        str(tool.get("version", "")),
+        last_test_status="passed",
+        last_eval_status="passed",
+        last_error=None,
+        trusted=True,
+    )
+    return {"promoted": True, "trusted": True, "schema_valid": True, "tests": tests, "evals": evals, "tool": status.get("tool")}
 
 
 WRITE_CALLS = {"write_text", "write_bytes", "unlink", "mkdir", "makedirs", "rmdir", "remove", "rename", "replace", "touch"}
@@ -1715,20 +1950,21 @@ def rollback_latest_checkpoint() -> dict[str, Any]:
 
 def summarize_python_execution_policy(code: str) -> dict[str, Any]:
     reasons: list[str] = []
-    manual_approval_required = False
-    if command_text_contains_destructive_git(code):
-        reasons.append(DESTRUCTIVE_GIT_REASON)
-        manual_approval_required = True
     blocked: list[str] = []
     affected_paths: list[str] = []
     network_risk = False
     process_risk = False
+    manual_approval_required = False
     module_aliases: dict[str, str] = {}
     risky_call_aliases: dict[str, str] = {}
+
+    if command_text_contains_destructive_git(code):
+        reasons.append(DESTRUCTIVE_GIT_REASON)
+        manual_approval_required = True
+
     try:
         tree = ast.parse(code)
     except SyntaxError:
-        # Let the runtime catch syntax errors instead of blocking preemptively
         tree = None
 
     if tree is not None:
@@ -1763,14 +1999,17 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
 
         for node in ast.walk(tree):
             if isinstance(node, (ast.List, ast.Tuple)):
-                string_parts = [element.value for element in node.elts if isinstance(element, ast.Constant) and isinstance(element.value, str)]
+                string_parts = [
+                    element.value
+                    for element in node.elts
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str)
+                ]
                 if command_parts_contain_destructive_git(string_parts):
                     reasons.append(DESTRUCTIVE_GIT_REASON)
                     manual_approval_required = True
 
             if isinstance(node, ast.Call):
                 func_name = ""
-                owner = ""
                 is_attribute_call = isinstance(node.func, ast.Attribute)
                 if isinstance(node.func, ast.Name):
                     func_name = node.func.id
@@ -1780,8 +2019,7 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                 elif isinstance(node.func, ast.Attribute):
                     func_name = node.func.attr
                     if isinstance(node.func.value, ast.Name):
-                        owner = node.func.value.id
-                        owner_module = module_aliases.get(owner, owner)
+                        owner_module = module_aliases.get(node.func.value.id, node.func.value.id)
                         if owner_module == "os" and func_name in OS_PROCESS_CALLS:
                             reasons.append("subprocess/process access")
                             process_risk = True
@@ -1792,7 +2030,11 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                 if func_name == "open":
                     mode = "r"
                     mode_arg_index = 0 if is_attribute_call else 1
-                    if len(node.args) > mode_arg_index and isinstance(node.args[mode_arg_index], ast.Constant) and isinstance(node.args[mode_arg_index].value, str):
+                    if (
+                        len(node.args) > mode_arg_index
+                        and isinstance(node.args[mode_arg_index], ast.Constant)
+                        and isinstance(node.args[mode_arg_index].value, str)
+                    ):
                         mode = node.args[mode_arg_index].value
                     for keyword in node.keywords:
                         if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, str):
@@ -1827,10 +2069,12 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": manual_approval_required,
         }
+
     unique_reasons = sorted(set(reasons))
-    sandbox_tier = sandbox_tier_for_reasons(unique_reasons)
     if unique_reasons:
+        sandbox_tier = sandbox_tier_for_reasons(unique_reasons)
         response = {
             "action": "require_approval",
             "sandbox_tier": sandbox_tier,
@@ -1839,7 +2083,12 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": manual_approval_required,
         }
+        if "filesystem write or mutation" in unique_reasons:
+            response["checkpoint"] = filesystem_checkpoint_metadata(code)
+        return response
+
     return {
         "action": "allow",
         "sandbox_tier": "read_only",
@@ -1848,14 +2097,8 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         "affected_paths": unique_paths,
         "network_risk": network_risk,
         "process_risk": process_risk,
+        "manual_approval_required": False,
     }
-            "manual_approval_required": manual_approval_required,
-        }
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
-        if "filesystem write or mutation" in unique_reasons:
-            response["checkpoint"] = filesystem_checkpoint_metadata(code)
-        return response
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
 
 
 async def execute_python(code: str, policy_approved: bool = False) -> dict[str, Any]:
@@ -1933,23 +2176,17 @@ def annotate_registered_tool_output(result: dict[str, Any], tool: dict[str, Any]
     return result
 
 
-def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
+def run_registered_tool(
+    tool: dict[str, Any],
+    arguments: dict[str, Any],
+    timeout: int | float | None = None,
+) -> dict[str, Any]:
     start = time.time()
     try:
         filepath = tool.get("filepath")
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
-    filepath = tool.get("filepath")
-    if not filepath:
-        raise ValueError(f"Tool {tool.get('name')} has no filepath.")
-    path = resolve_tool_path(filepath)
-    try:
         completed = subprocess.run(
             [sys.executable, str(path)],
             cwd=ROOT_DIR,
@@ -1957,14 +2194,10 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             text=True,
             encoding="utf-8",
             capture_output=True,
-            timeout=REGISTERED_TOOL_TIMEOUT_SECONDS,
+            timeout=timeout or REGISTERED_TOOL_TIMEOUT_SECONDS,
             check=False,
         )
         result = {
-            timeout=120,
-            check=False,
-        )
-        return {
             "stdout": completed.stdout[-100_000:],
             "stderr": completed.stderr[-100_000:],
             "exit_code": completed.returncode,
@@ -1973,13 +2206,14 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         }
         return annotate_registered_tool_output(result, tool)
     except subprocess.TimeoutExpired as exc:
+        timeout_seconds = timeout or REGISTERED_TOOL_TIMEOUT_SECONDS
         return {
             "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "") or f"Timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s",
+            "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "") or f"Timed out after {timeout_seconds}s",
             "exit_code": -1,
             "timed_out": True,
             "duration_ms": int((time.time() - start) * 1000),
-            "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.",
+            "error": f"Registered tool timed out after {timeout_seconds}s.",
             "malformed_output": False,
         }
     except Exception as exc:
@@ -2026,14 +2260,24 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
         "result": result,
         "attempt_number": attempt_number,
         "max_attempts": max_attempts,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": "Timed out after 120s",
-            "exit_code": -1,
-            "timed_out": True,
-        }
+    }
+    return textwrap.dedent(
+        f"""
+        A registered tool failed. Repair it before continuing.
+
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
 
 def update_registered_tool_status(
@@ -2044,6 +2288,7 @@ def update_registered_tool_status(
     last_error: str | None = None,
     trusted: bool | None = None,
     increment_use_count: bool = False,
+    last_eval_status: str | None = None,
 ) -> dict[str, Any]:
     registry = load_registry()
     target: dict[str, Any] | None = None
@@ -2056,7 +2301,9 @@ def update_registered_tool_status(
 
     if last_test_status is not None:
         target["last_test_status"] = last_test_status
-    if last_error is not None or last_test_status == "passed":
+    if last_eval_status is not None:
+        target["last_eval_status"] = last_eval_status
+    if last_error is not None or last_test_status == "passed" or last_eval_status == "passed":
         target["last_error"] = last_error
     if trusted is not None:
         target["trusted"] = trusted
@@ -2082,27 +2329,15 @@ def validate_registered_tool(
     if not isinstance(arguments, dict):
         return {"error": "sample_arguments must be an object."}
 
-    try:
-        result = run_registered_tool(tool, arguments)
-    except Exception as exc:  # noqa: BLE001 - validation must persist failure details
-        message = str(exc)
-        update_registered_tool_status(
-            name,
-            str(tool.get("version", "")),
-            last_test_status="failed",
-            last_error=message,
-            trusted=False,
-        )
-        return {"validated": False, "error": message}
-
+    result = run_registered_tool(tool, arguments)
     passed = result.get("exit_code") == 0 and not result.get("timed_out")
-    error = None if passed else (result.get("stderr") or f"Exited with code {result.get('exit_code')}")
+    error = None if passed else (result.get("stderr") or result.get("error") or f"Exited with code {result.get('exit_code')}")
     status = update_registered_tool_status(
         name,
         str(tool.get("version", "")),
         last_test_status="passed" if passed else "failed",
         last_error=error,
-        trusted=passed,
+        trusted=False,
     )
     return {
         "validated": passed,
@@ -2111,23 +2346,6 @@ def validate_registered_tool(
         "result": result,
         "tool": status.get("tool"),
     }
-    return textwrap.dedent(
-        f"""
-        A registered tool failed. Repair it before continuing.
-
-        Generic repair instruction:
-        1. Inspect the tool file and its registry metadata.
-        2. Patch the tool using execute_python.
-        3. Test the patched tool with the failing arguments.
-        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
-        5. Then retry the original tool call or continue with the user's request.
-
-        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
-
-        Failure context JSON:
-        {json.dumps(payload, indent=2)}
-        """
-    ).strip()
 
 
 def register_tool(
@@ -2147,49 +2365,35 @@ def register_tool(
     try:
         path = resolve_tool_candidate(filepath)
         package_info: dict[str, Any] | None = None
-        metadata: dict[str, Any] = {"version": "0.0.0", "deprecated": False, "deprecation_reason": ""}
+        package_metadata: dict[str, Any] | None = None
         entry_filepath = str(Path(filepath))
 
         if path.is_dir():
             package_info = load_tool_package(path)
             parameters = package_info["schema"]
-            metadata = package_info["metadata"]
-            entry_filepath = str(Path(filepath))
+            package_metadata = package_info["metadata"]
+            version = str(package_metadata.get("version", version))
         else:
             if path.suffix.lower() != ".py":
                 raise ValueError("Legacy tool registrations must point to a Python file.")
-            parameters = parameters_schema or {"type": "object"}
+            if not isinstance(parameters_schema, dict):
+                return {"error": "parameters_schema must be an object."}
+            parameters = parameters_schema
             validate_json_schema(parameters)
     except ValueError as exc:
         return {"error": str(exc)}
 
-        path = resolve_tool_path(filepath)
-    except ValueError as exc:
-        return {"error": str(exc)}
-
-    if not isinstance(parameters_schema, dict):
-        return {"error": "parameters_schema must be an object."}
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
-    if not any([test_command, test_plan, sample_arguments is not None]):
-        return {
-            "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
-        }
+    if path.is_file() and not any([test_command, test_plan, sample_arguments is not None]):
+        return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
 
     registry = load_registry()
-    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
-    metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
-    metadata.setdefault("repair_attempts", [])
-    existing_versions = [
-        tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
-    ]
+    existing_versions = [tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")]
     if any(str(tool.get("version", "")) == str(version) for tool in existing_versions):
         return {"error": f"Tool {name} version {version} is already registered."}
     if supersedes is None and existing_versions:
-        previous = sorted(
-            existing_versions,
-            key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
-        )[-1]
+        previous = sorted(existing_versions, key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))))[-1]
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
@@ -2200,27 +2404,7 @@ def register_tool(
         "filepath": entry_filepath,
         "builtin": False,
         "requires_approval": bool(requires_approval),
-        "version": str(metadata.get("version", "0.0.0")),
-        "deprecated": bool(metadata.get("deprecated", False)),
-        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
-    }
-    if path.is_dir():
-        entry["package"] = True
-        entry["package_dir"] = entry_filepath
-    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
-    registry["tools"].append(entry)
-    save_json(REGISTRY_PATH, registry)
-    result = {"registered": name, "permanent": True}
-    if package_info is not None:
-        result["package"] = True
-        result["version"] = entry["version"]
-        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
-    return result
-        "parameters": parameters_schema,
-        "filepath": str(path.relative_to(BASE_DIR)),
-        "builtin": False,
-        "requires_approval": bool(requires_approval),
-        "metadata": metadata,
+        "metadata": {},
         "version": str(version),
         "created_at": timestamp,
         "updated_at": timestamp,
@@ -2228,15 +2412,33 @@ def register_tool(
         "test_command": test_command,
         "test_plan": test_plan,
         "sample_arguments": sample_arguments or {},
-        "last_test_status": "pending",
+        "last_test_status": "passed" if package_info is not None else "pending",
+        "last_eval_status": "pending",
         "last_error": None,
         "use_count": 0,
         "supersedes": supersedes,
         "trusted": False,
+        "declared_permissions": [],
     }
+    if package_metadata is not None:
+        entry["metadata"] = dict(package_metadata)
+        entry["deprecated"] = bool(package_metadata.get("deprecated", False))
+        entry["deprecation_reason"] = str(package_metadata.get("deprecation_reason", "") or "")
+    if path.is_dir():
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        try:
+            entry["declared_permissions"] = eval_declared_permissions(load_tool_evals(entry))
+        except ValueError as exc:
+            return {"error": str(exc)}
+
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+    if package_info is not None:
+        result["package"] = True
+        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
+    return result
 
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
@@ -2783,264 +2985,78 @@ def prune_conversation(messages: list[dict[str, str]], max_chars: int = 32000) -
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
         session_id = str(uuid.uuid4())
-        goal = last_user_message(request.messages)
-        task_state = load_task_state(DATA_DIR, request.task_id) if request.task_id else None
-        if task_state is None:
-            task_state = TaskState(task_id=request.task_id or str(uuid.uuid4()), goal=goal)
-        elif goal:
-            task_state.goal = goal
-        save_task_state(task_state, DATA_DIR)
-
-        def emit_task_phase(phase: str, payload: dict[str, Any] | None = None) -> str:
-            task_state.mark_phase(phase)
-            save_task_state(task_state, DATA_DIR)
-            event_payload: dict[str, Any] = {
-                "task_id": task_state.task_id,
-                "phase": task_state.phase,
-                "done": task_state.done,
-            }
-            if payload:
-                event_payload.update(payload)
-            return sse(task_event_name(phase), event_payload)
-        
-        # Sanitize incoming messages: cap extremely long ones
-        sanitized_messages = []
-        for msg in request.messages:
-            content = msg.content
-            if len(content) > 12000:
-                content = content[:12000] + "... [Message truncated in history]"
-            sanitized_messages.append({"role": msg.role, "content": content})
-            
         conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
-        conversation.extend(sanitized_messages)
-        public_messages = sanitized_messages.copy()
-        yield sse("meta", {"session_id": session_id, "model": request.model})
-        repair_attempts_by_tool: dict[str, int] = {}
-        try:
-            max_repair_attempts = tool_repair_max_attempts()
-            max_model_turns = 4 + (max_repair_attempts * 2)
-            for _ in range(max_model_turns):
-        yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
-        yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
-        try:
-            max_task_steps = max(1, int(request.max_task_steps or 12))
-            model_turns = 0
-            while not task_state.done and model_turns < max_task_steps:
-                model_turns += 1
-                if task_state.observations:
-                    yield emit_task_phase("revise", {"observations": task_state.observations[-3:]})
-                text = ""
-                provider = request.provider or load_settings().get("default_provider", "pollinations")
-                model = request.model or load_settings().get("default_model", "openai-fast")
-                
-                # Auto-compaction / Pruning before calling model
-                active_conversation = prune_conversation(conversation)
-                
-                async for token in app.state.model_adapter.complete(active_conversation, model, provider):
-                    text += token
-                    yield sse("delta", {"content": token})
-                display_text = strip_tool_calls(text).strip()
-                calls = extract_tool_calls(text)
-                if not task_state.steps:
-                    task_state.add_plan(display_text or text)
-                    save_task_state(task_state, DATA_DIR)
-                    yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
-                if not calls and is_capability_refusal(text):
-                    task_state.failure_count += 1
-                    save_task_state(task_state, DATA_DIR)
+        conversation.extend({"role": msg.role, "content": msg.content} for msg in request.messages)
+        public_messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        model = request.model or load_settings().get("default_model", "openai-fast")
+        provider = request.provider or load_settings().get("default_provider", "pollinations")
+        yield sse("meta", {"session_id": session_id, "model": model})
+
+        max_turns = max(1, int(request.max_task_steps or 4))
+        for _ in range(max_turns):
+            text = await complete_model_text(prune_conversation(conversation), model, provider)
+            conversation.append({"role": "assistant", "content": text})
+            public_messages.append({"role": "assistant", "content": strip_tool_calls(text)})
+            tool_calls = extract_tool_calls(text)
+
+            if not tool_calls:
+                if is_capability_refusal(text):
+                    retry_message = build_self_evolution_retry_message(request)
+                    conversation.append({"role": "system", "content": retry_message})
                     yield sse("assistant_replace", {"content": "Retrying under the self-evolution protocol."})
-                    yield emit_task_phase("revise", {"reason": "capability_refusal", "failure_count": task_state.failure_count})
-                    conversation.append({"role": "assistant", "content": text})
-                    conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
                     continue
+                if text:
+                    yield sse("delta", {"content": text})
+                break
 
-                if display_text != text.strip():
-                    yield sse("assistant_replace", {"content": display_text})
-                conversation.append({"role": "assistant", "content": text})
-                public_messages.append({"role": "assistant", "content": display_text or text})
-                if not calls:
-                    task_state.done = True
-                    task_state.artifacts["final_answer"] = display_text or text
-                    save_task_state(task_state, DATA_DIR)
-                    yield emit_task_phase("final", {"answer": display_text or text})
-                    break
-                yield emit_task_phase("act", {"tool_call_count": len(calls)})
-                for call in calls:
-                    tool_name = str(call["name"])
-                    arguments = call.get("arguments", {})
-                    if not isinstance(arguments, dict):
-                        arguments = {}
-                    step = task_state.add_step(tool_name, arguments)
-                    save_task_state(task_state, DATA_DIR)
-                    yield emit_task_phase("act", {"step": step})
-                    tool = find_tool(tool_name)
-                    policy: dict[str, Any] | None = None
-                    if tool_name == "execute_python":
-                        policy = summarize_python_execution_policy(str(arguments.get("code", "")))
-                        if policy["action"] == "block":
-                            result = {"error": policy["risk_summary"], "policy": policy}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            conversation.append({"role": "tool", "content": json.dumps(result)})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    requires_approval = bool(tool is not None and tool.get("requires_approval"))
-                    policy_approved = False
-                    if policy is not None and policy["action"] == "require_approval":
-                        requires_approval = True
-                    if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
-                        requires_approval = False
-                        policy_approved = True
-                    if requires_approval:
-                        risk_summary = "Approval required before tool execution."
-                        policy_reasons: list[str] = []
-                        sandbox_tier = "read_only"
-                        affected_paths: list[str] = []
-                        network_risk = False
-                        process_risk = False
-                        if policy is not None:
-                            risk_summary = policy.get("risk_summary", risk_summary)
-                            policy_reasons = policy.get("reasons", [])
-                            sandbox_tier = policy.get("sandbox_tier", sandbox_tier)
-                            affected_paths = policy.get("affected_paths", [])
-                            network_risk = bool(policy.get("network_risk", False))
-                            process_risk = bool(policy.get("process_risk", False))
-                        elif tool is not None and tool.get("requires_approval"):
-                            risk_summary = "Approval required by tool registry."
-                        pending = PendingApproval(
-                            tool_name,
-                            arguments,
-                            risk_summary,
-                            policy_reasons,
-                            sandbox_tier,
-                            affected_paths,
-                            network_risk,
-                            process_risk,
-                        )
-                        app.state.pending_approvals[pending.id] = pending
-                        yield sse(
-                            "approval_request",
-                            {
-                                "request_id": pending.id,
-                                "tool_name": tool_name,
-                                "arguments": arguments,
-                                "risk_summary": pending.risk_summary,
-                                "policy_reasons": pending.policy_reasons,
-                                "sandbox_tier": pending.sandbox_tier,
-                                "affected_paths": pending.affected_paths,
-                                "network_risk": pending.network_risk,
-                                "process_risk": pending.process_risk,
-                                "checkpoint": policy.get("checkpoint") if policy is not None else None,
-                                "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
-                            },
-                        )
-                        await pending.event.wait()
-                        approved = bool(pending.approved)
-                        policy_approved = approved
-                        app.state.pending_approvals.pop(pending.id, None)
-                        if not approved:
-                            result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            
-                            result_str = json.dumps(result)
-                            if len(result_str) > 10000:
-                                result_str = result_str[:10000] + "... [Result truncated]"
-                            conversation.append({"role": "tool", "content": result_str})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
-                    if tool_name == "execute_python":
-                        result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
-                    elif tool_name == "rollback_latest_checkpoint":
-                        result = rollback_latest_checkpoint()
-                    elif tool_name == "register_tool":
-                        result = register_tool(
-                            name=str(arguments.get("name", "")),
-                            description=str(arguments.get("description", "")),
-                            parameters_schema=arguments.get("parameters_schema", {}),
-                            filepath=str(arguments.get("filepath", "")),
-                            requires_approval=bool(arguments.get("requires_approval", False)),
-                            version=str(arguments.get("version", "1.0.0")),
-                            source_task_id=arguments.get("source_task_id"),
-                            test_command=arguments.get("test_command"),
-                            test_plan=arguments.get("test_plan"),
-                            sample_arguments=arguments.get("sample_arguments"),
-                            supersedes=arguments.get("supersedes"),
-                        )
-                    else:
-                        tool = find_tool(tool_name)
-                        if tool is not None and tool.get("builtin"):
-                            result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
-                        elif tool is not None:
-                            result = run_registered_tool(tool, arguments)
-                            update_registered_tool_status(
-                                tool_name,
-                                str(tool.get("version", "")),
-                                increment_use_count=True,
-                            )
-                        else:
-                            result = {"error": f"Tool {tool_name} not found."}
-                    store_tool_execution(tool_name, arguments, result, True)
-                    observation = task_state.add_observation(step, result, True)
-                    save_task_state(task_state, DATA_DIR)
-                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
-                    yield emit_task_phase("observe", {"observation": observation})
-                    
-                    # Cap result for conversation history to avoid 400 errors
-                    result_str = json.dumps(result)
-                    if len(result_str) > 10000:
-                        result_str = result_str[:10000] + "... [Result truncated for context]"
-                    conversation.append({"role": "tool", "content": result_str})
-
-                    if tool is not None and not tool.get("builtin") and registered_tool_failed(result, tool):
-                        attempt_number = repair_attempts_by_tool.get(tool_name, 0) + 1
-                        if attempt_number <= max_repair_attempts:
-                            repair_attempts_by_tool[tool_name] = attempt_number
-                            repair_attempt = append_tool_repair_attempt(tool, arguments, result)
-                            repair_message = build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)
-                            yield sse(
-                                "tool_repair",
-                                {
-                                    "tool_name": tool_name,
-                                    "attempt": attempt_number,
-                                    "max_attempts": max_repair_attempts,
-                                    "failure": repair_attempt.get("failure"),
-                                },
-                            )
-                            conversation.append({"role": "system", "content": repair_message})
-                            break
-                        result = {
-                            "error": f"Registered tool {tool_name} failed and exhausted {max_repair_attempts} repair attempts.",
-                            "last_result": result,
-                        }
-                        conversation.append({"role": "tool", "content": json.dumps(result)})
+            for call in tool_calls:
+                tool_name = call.get("name", "")
+                arguments = call.get("arguments", {}) if isinstance(call.get("arguments"), dict) else {}
+                yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
+                approved = request.auto_approve
+                if tool_name == "execute_python":
+                    result = await execute_python(str(arguments.get("code", "")), policy_approved=approved)
+                elif tool_name == "rollback_latest_checkpoint":
+                    result = rollback_latest_checkpoint()
+                elif tool_name == "register_tool":
+                    result = register_tool(
+                        name=str(arguments.get("name", "")),
+                        description=str(arguments.get("description", "")),
+                        parameters_schema=arguments.get("parameters_schema", {}),
+                        filepath=str(arguments.get("filepath", "")),
+                        requires_approval=bool(arguments.get("requires_approval", False)),
+                        version=str(arguments.get("version", "1.0.0")),
+                        source_task_id=arguments.get("source_task_id"),
+                        test_command=arguments.get("test_command"),
+                        test_plan=arguments.get("test_plan"),
+                        sample_arguments=arguments.get("sample_arguments"),
+                        supersedes=arguments.get("supersedes"),
+                    )
                 else:
-                    continue
-                continue
-                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                    yield sse("evaluation", evaluation)
-                    if evaluation["decision"] == "final":
-                        break
-                yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
-            if not task_state.done:
-                task_state.failure_count += 1
-                task_state.done = True
-                task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
-                save_task_state(task_state, DATA_DIR)
-                yield emit_task_phase("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
-            # Remove the automatic summary call from stream, frontend will call /memory/save
-            yield sse("done", {"session_id": session_id, "task_id": task_state.task_id})
-        except Exception as exc:
-            yield sse("error", {"message": str(exc)})
+                    tool = find_tool(tool_name)
+                    if tool is None:
+                        result = {"error": f"Tool {tool_name} not found."}
+                    elif tool.get("builtin"):
+                        result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
+                    else:
+                        result = run_registered_tool(tool, arguments)
+                        update_registered_tool_status(tool_name, str(tool.get("version", "")), increment_use_count=True)
+                store_tool_execution(tool_name, arguments, result, approved)
+                yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": approved})
+                conversation.append({"role": "tool", "content": json.dumps(result)})
+
+            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+            yield sse("evaluation", evaluation)
+            if evaluation["decision"] == "final":
+                final_text = await complete_model_text(prune_conversation(conversation), model, provider)
+                conversation.append({"role": "assistant", "content": final_text})
+                public_messages.append({"role": "assistant", "content": final_text})
+                if final_text:
+                    yield sse("delta", {"content": final_text})
+                break
+
+        archive_session(session_id, public_messages)
+        yield sse("done", {"session_id": session_id})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
