@@ -14,6 +14,7 @@ import sys
 import textwrap
 import time
 import uuid
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +97,10 @@ DEFAULT_SETTINGS = {
     "default_provider": "pollinations",
     "default_model": "openai-fast",
     "tool_repair_max_attempts": 2,
+    "memory_recent_days": 30,
+    "memory_max_raw_archive_mb": 256,
+    "memory_summary_target_tokens": 512,
+    "memory_cold_archive_compression": "zlib",
     "providers": {
         "pollinations": {
             "label": "Pollinations",
@@ -645,8 +650,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
-    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
-    for path in (DATA_DIR, ARCHIVE_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -758,6 +762,22 @@ def init_db() -> None:
         )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_kind ON workspace_index(kind)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_task ON workspace_index(last_seen_task_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_compaction (
+                session_id TEXT PRIMARY KEY,
+                archive_path TEXT NOT NULL,
+                original_size INTEGER NOT NULL,
+                compressed_size INTEGER NOT NULL,
+                summary_id TEXT NOT NULL,
+                summary_path TEXT NOT NULL,
+                last_accessed_at TEXT NOT NULL,
+                compacted_at TEXT NOT NULL,
+                compression TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_compaction_last_accessed ON memory_compaction(last_accessed_at)")
         conn.commit()
 
 
@@ -1409,7 +1429,7 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
-def load_tool_metadata(package_dir: Path) -> dict[str, Any]:
+def load_package_metadata(package_dir: Path) -> dict[str, Any]:
     metadata_path = package_dir / "metadata.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -1478,7 +1498,7 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise ValueError(f"schema.json is invalid JSON: {exc.msg}") from exc
     validate_json_schema(schema)
-    metadata = load_tool_metadata(package_dir)
+    metadata = load_package_metadata(package_dir)
 
     completed = subprocess.run(
         [sys.executable, str(package_dir / "tests.py")],
@@ -1827,6 +1847,7 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": manual_approval_required,
         }
     unique_reasons = sorted(set(reasons))
     sandbox_tier = sandbox_tier_for_reasons(unique_reasons)
@@ -1839,7 +1860,11 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": manual_approval_required,
         }
+        if "filesystem write or mutation" in unique_reasons:
+            response["checkpoint"] = filesystem_checkpoint_metadata(code)
+        return response
     return {
         "action": "allow",
         "sandbox_tier": "read_only",
@@ -1848,14 +1873,8 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         "affected_paths": unique_paths,
         "network_risk": network_risk,
         "process_risk": process_risk,
+        "manual_approval_required": False,
     }
-            "manual_approval_required": manual_approval_required,
-        }
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
-        if "filesystem write or mutation" in unique_reasons:
-            response["checkpoint"] = filesystem_checkpoint_metadata(code)
-        return response
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
 
 
 async def execute_python(code: str, policy_approved: bool = False) -> dict[str, Any]:
@@ -1912,7 +1931,7 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
 
 
 def registered_tool_expects_json(tool: dict[str, Any]) -> bool:
-    metadata = load_tool_metadata(tool)
+    metadata = tool.get("metadata", {}) if isinstance(tool.get("metadata", {}), dict) else {}
     return tool.get("output_format") == "json" or metadata.get("output_format") == "json"
 
 
@@ -1940,16 +1959,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
-    filepath = tool.get("filepath")
-    if not filepath:
-        raise ValueError(f"Tool {tool.get('name')} has no filepath.")
-    path = resolve_tool_path(filepath)
-    try:
         completed = subprocess.run(
             [sys.executable, str(path)],
             cwd=ROOT_DIR,
@@ -1961,10 +1970,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             check=False,
         )
         result = {
-            timeout=120,
-            check=False,
-        )
-        return {
             "stdout": completed.stdout[-100_000:],
             "stderr": completed.stderr[-100_000:],
             "exit_code": completed.returncode,
@@ -1993,7 +1998,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             "exception": type(exc).__name__,
             "malformed_output": False,
         }
-
 
 def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if result.get("timed_out"):
@@ -2026,15 +2030,24 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
         "result": result,
         "attempt_number": attempt_number,
         "max_attempts": max_attempts,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": "Timed out after 120s",
-            "exit_code": -1,
-            "timed_out": True,
-        }
+    }
+    return textwrap.dedent(
+        f"""
+        A registered tool failed. Repair it before continuing.
 
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
 def update_registered_tool_status(
     name: str,
@@ -2143,46 +2156,33 @@ def register_tool(
     sample_arguments: dict[str, Any] | None = None,
     supersedes: str | None = None,
 ) -> dict[str, Any]:
-    validate_tool_name(name)
     try:
+        validate_tool_name(name)
         path = resolve_tool_candidate(filepath)
         package_info: dict[str, Any] | None = None
-        metadata: dict[str, Any] = {"version": "0.0.0", "deprecated": False, "deprecation_reason": ""}
-        entry_filepath = str(Path(filepath))
-
+        package_metadata: dict[str, Any] = {}
+        entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
         if path.is_dir():
             package_info = load_tool_package(path)
             parameters = package_info["schema"]
-            metadata = package_info["metadata"]
-            entry_filepath = str(Path(filepath))
+            package_metadata = package_info["metadata"]
+            version = str(package_metadata.get("version") or version)
         else:
             if path.suffix.lower() != ".py":
                 raise ValueError("Legacy tool registrations must point to a Python file.")
-            parameters = parameters_schema or {"type": "object"}
+            if not isinstance(parameters_schema, dict):
+                return {"error": "parameters_schema must be an object."}
+            parameters = parameters_schema
             validate_json_schema(parameters)
     except ValueError as exc:
         return {"error": str(exc)}
 
-        path = resolve_tool_path(filepath)
-    except ValueError as exc:
-        return {"error": str(exc)}
-
-    if not isinstance(parameters_schema, dict):
-        return {"error": "parameters_schema must be an object."}
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
-    if not any([test_command, test_plan, sample_arguments is not None]):
-        return {
-            "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
-        }
-
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
+        return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
     registry = load_registry()
-    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
-    metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
-    metadata.setdefault("repair_attempts", [])
-    existing_versions = [
-        tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
-    ]
+    existing_versions = [tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")]
     if any(str(tool.get("version", "")) == str(version) for tool in existing_versions):
         return {"error": f"Tool {name} version {version} is already registered."}
     if supersedes is None and existing_versions:
@@ -2193,31 +2193,13 @@ def register_tool(
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
+    metadata = dict(package_metadata) if package_info is not None else dict(existing_versions[-1].get("metadata", {})) if existing_versions else {}
+    metadata.setdefault("repair_attempts", [])
     entry = {
         "name": name,
         "description": description,
         "parameters": parameters,
         "filepath": entry_filepath,
-        "builtin": False,
-        "requires_approval": bool(requires_approval),
-        "version": str(metadata.get("version", "0.0.0")),
-        "deprecated": bool(metadata.get("deprecated", False)),
-        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
-    }
-    if path.is_dir():
-        entry["package"] = True
-        entry["package_dir"] = entry_filepath
-    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
-    registry["tools"].append(entry)
-    save_json(REGISTRY_PATH, registry)
-    result = {"registered": name, "permanent": True}
-    if package_info is not None:
-        result["package"] = True
-        result["version"] = entry["version"]
-        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
-    return result
-        "parameters": parameters_schema,
-        "filepath": str(path.relative_to(BASE_DIR)),
         "builtin": False,
         "requires_approval": bool(requires_approval),
         "metadata": metadata,
@@ -2228,16 +2210,25 @@ def register_tool(
         "test_command": test_command,
         "test_plan": test_plan,
         "sample_arguments": sample_arguments or {},
-        "last_test_status": "pending",
+        "last_test_status": "passed" if package_info is not None else "pending",
         "last_error": None,
         "use_count": 0,
         "supersedes": supersedes,
         "trusted": False,
+        "deprecated": bool(metadata.get("deprecated", False)),
+        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
     }
+    if package_info is not None:
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        entry["output_format"] = package_metadata.get("output_format", entry.get("output_format"))
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return {"registered": name, "version": str(version), "permanent": True, "trusted": False}
-
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+    if package_info is not None:
+        result["package"] = True
+        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
+    return result
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
     execution_id = str(uuid.uuid4())
@@ -2385,13 +2376,27 @@ CONVERSATION:
     return await call_model_simple(summary_prompt, model="openai-fast")
 
 
-def store_episodic_memory(session_id: str, summary: str, keywords: list[str]) -> None:
+def store_episodic_memory(session_id: str, summary: str, keywords: list[str]) -> str:
+    memory_id = str(uuid.uuid4())
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO episodic_memory (id, created_at, keywords, summary, session_id) VALUES (?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), now_iso(), ",".join(keywords), summary, session_id),
+            (memory_id, now_iso(), ",".join(keywords), summary, session_id),
         )
         conn.commit()
+    return memory_id
+
+
+def find_or_store_session_summary(session_id: str, summary: str) -> str:
+    keywords = extract_keywords(summary) or ["session", "archive"]
+    with connect_db() as conn:
+        row = conn.execute(
+            "SELECT id FROM episodic_memory WHERE session_id = ? ORDER BY created_at DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+    if row:
+        return str(row["id"])
+    return store_episodic_memory(session_id, summary, keywords)
 
 
 async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
@@ -2416,6 +2421,7 @@ async def summarize_and_store(messages: list[dict[str, str]], session_id: str):
 
         write_session_archive(session_id, messages, summary=summary)
         store_episodic_memory(session_id, summary, keywords)
+        enforce_memory_budget()
         return {
             "status": "saved",
             "session_id": session_id,
@@ -2471,10 +2477,222 @@ def archive_updated_at(path: Path, payload: dict[str, Any]) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
 
 
+
+
+def parse_archive_time(value: str | None) -> datetime:
+    if not value:
+        return datetime.fromtimestamp(0, timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.fromtimestamp(0, timezone.utc)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def memory_setting_int(name: str, minimum: int = 0) -> int:
+    value = load_settings().get(name, DEFAULT_SETTINGS[name])
+    try:
+        return max(int(value), minimum)
+    except (TypeError, ValueError):
+        return int(DEFAULT_SETTINGS[name])
+
+
+def memory_setting_float(name: str, minimum: float = 0.0) -> float:
+    value = load_settings().get(name, DEFAULT_SETTINGS[name])
+    try:
+        return max(float(value), minimum)
+    except (TypeError, ValueError):
+        return float(DEFAULT_SETTINGS[name])
+
+
+def archive_raw_size(path: Path) -> int:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    except Exception:
+        return path.stat().st_size
+    return len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+
+
+def summary_tokens_to_chars(tokens: int) -> int:
+    return max(tokens, 1) * 4
+
+
+def durable_lines_from_messages(messages: list[dict[str, Any]], limit: int = 12) -> list[str]:
+    patterns = ("decision", "decided", "remember", "important", "durable", "fact", "requirement", "must", "should")
+    durable: list[str] = []
+    for message in messages:
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        lower = content.lower()
+        if any(pattern in lower for pattern in patterns):
+            role = str(message.get("role", "unknown"))
+            durable.append(f"{role}: {re.sub(r'\s+', ' ', content)[:500]}")
+        if len(durable) >= limit:
+            break
+    return durable
+
+
+def compact_session_summary(archive: dict[str, Any], target_tokens: int) -> str:
+    existing = str(archive.get("summary") or "").strip()
+    messages = archive.get("messages") if isinstance(archive.get("messages"), list) else []
+    durable = durable_lines_from_messages(messages)
+    fallback_parts = [existing] if existing else [f"Conversation session {archive.get('session_id', 'unknown')}"]
+    if durable:
+        fallback_parts.append("Important durable facts and decisions:\n" + "\n".join(f"- {line}" for line in durable))
+    summary = "\n\n".join(part for part in fallback_parts if part).strip()
+    max_chars = summary_tokens_to_chars(target_tokens)
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1].rstrip() + "…"
+    return summary
+
+
+def upsert_memory_compaction_metadata(
+    session_id: str,
+    archive_path: Path,
+    original_size: int,
+    compressed_size: int,
+    summary_id: str,
+    compression: str,
+    timestamp: str | None = None,
+) -> None:
+    when = timestamp or now_iso()
+    with connect_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO memory_compaction (
+                session_id, archive_path, original_size, compressed_size, summary_id,
+                summary_path, last_accessed_at, compacted_at, compression
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                archive_path = excluded.archive_path,
+                original_size = excluded.original_size,
+                compressed_size = excluded.compressed_size,
+                summary_id = excluded.summary_id,
+                summary_path = excluded.summary_path,
+                compacted_at = excluded.compacted_at,
+                compression = excluded.compression
+            """,
+            (
+                session_id,
+                str(archive_path),
+                original_size,
+                compressed_size,
+                summary_id,
+                f"episodic_memory:{summary_id}",
+                when,
+                when,
+                compression,
+            ),
+        )
+        conn.commit()
+
+
+def touch_memory_archive(session_id: str) -> None:
+    with connect_db() as conn:
+        conn.execute(
+            "UPDATE memory_compaction SET last_accessed_at = ? WHERE session_id = ?",
+            (now_iso(), session_id),
+        )
+        conn.commit()
+
+
+def compact_session_archive(path: Path, compression: str, target_tokens: int) -> dict[str, Any] | None:
+    archive = normalize_session_archive(path)
+    messages = archive.get("messages") if isinstance(archive.get("messages"), list) else []
+    if not messages:
+        return None
+    original_size = path.stat().st_size
+    summary = compact_session_summary(archive, target_tokens)
+    summary_id = find_or_store_session_summary(archive["session_id"], summary)
+    durable = durable_lines_from_messages(messages)
+    payload = {
+        "session_id": archive["session_id"],
+        "type": archive.get("type", "conversation_thread"),
+        "title": archive.get("title") or derive_session_title(messages, archive["session_id"]),
+        "summary": summary,
+        "messages": [],
+        "durable_facts": durable,
+        "created_at": archive.get("created_at"),
+        "updated_at": archive.get("updated_at"),
+        "compacted": True,
+        "compacted_at": now_iso(),
+        "summary_id": summary_id,
+    }
+    if compression == "zlib":
+        raw = json.dumps(messages, ensure_ascii=False).encode("utf-8")
+        payload["raw_messages_compressed"] = base64.b64encode(zlib.compress(raw, level=9)).decode("ascii")
+        payload["raw_messages_compression"] = "zlib"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    compressed_size = path.stat().st_size
+    upsert_memory_compaction_metadata(
+        archive["session_id"], path, original_size, compressed_size, summary_id, compression, payload["compacted_at"]
+    )
+    return {
+        "session_id": archive["session_id"],
+        "original_size": original_size,
+        "compressed_size": compressed_size,
+        "summary_id": summary_id,
+    }
+
+
+def enforce_memory_budget() -> dict[str, Any]:
+    recent_days = memory_setting_int("memory_recent_days")
+    max_raw_bytes = int(memory_setting_float("memory_max_raw_archive_mb") * 1024 * 1024)
+    target_tokens = memory_setting_int("memory_summary_target_tokens", minimum=1)
+    compression = str(load_settings().get("memory_cold_archive_compression", "zlib")).lower()
+    if compression not in {"zlib", "remove"}:
+        compression = "zlib"
+    now = datetime.now(timezone.utc)
+    archives: list[dict[str, Any]] = []
+    for path in sorted(ARCHIVE_DIR.glob("*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            archive = normalize_session_archive(path)
+            updated_at = parse_archive_time(archive.get("updated_at"))
+            is_recent = (now - updated_at).days < recent_days
+            is_raw = bool(payload.get("messages"))
+            size = archive_raw_size(path) if is_raw else 0
+            archives.append({"path": path, "archive": archive, "updated_at": updated_at, "recent": is_recent, "raw_size": size})
+        except Exception as exc:
+            print(f"WARNING: skipping archive during memory budget enforcement: {path}: {exc}")
+    raw_total = sum(item["raw_size"] for item in archives)
+    compacted: list[dict[str, Any]] = []
+    candidates = sorted(
+        (item for item in archives if not item["recent"] and item["raw_size"] > 0),
+        key=lambda item: item["updated_at"],
+    )
+    for item in candidates:
+        if raw_total <= max_raw_bytes:
+            break
+        result = compact_session_archive(item["path"], compression, target_tokens)
+        if result:
+            compacted.append(result)
+            raw_total -= item["raw_size"]
+    return {
+        "status": "ok",
+        "raw_bytes": raw_total,
+        "max_raw_bytes": max_raw_bytes,
+        "recent_days": recent_days,
+        "compacted": compacted,
+        "compacted_count": len(compacted),
+    }
+
 def normalize_session_archive(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     session_id = str(payload.get("session_id") or path.stem)
     messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+    if not messages and payload.get("raw_messages_compression") == "zlib" and payload.get("raw_messages_compressed"):
+        try:
+            raw_messages = zlib.decompress(base64.b64decode(payload["raw_messages_compressed"])).decode("utf-8")
+            loaded_messages = json.loads(raw_messages)
+            if isinstance(loaded_messages, list):
+                messages = loaded_messages
+        except Exception:
+            messages = []
     updated_at = archive_updated_at(path, payload)
     title = payload.get("title") or derive_session_title(messages, session_id)
     return {
@@ -2580,7 +2798,9 @@ async def get_session(session_id: str) -> JSONResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Session not found.")
     try:
-        return JSONResponse(normalize_session_archive(path))
+        archive = normalize_session_archive(path)
+        touch_memory_archive(archive["session_id"])
+        return JSONResponse(archive)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2741,7 +2961,9 @@ async def get_session_history(session_id: str) -> JSONResponse:
     if not path.exists():
         raise HTTPException(status_code=404, detail="Session not found.")
     try:
-        return JSONResponse(normalize_session_archive(path))
+        archive = normalize_session_archive(path)
+        touch_memory_archive(archive["session_id"])
+        return JSONResponse(archive)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2794,49 +3016,29 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         def emit_task_phase(phase: str, payload: dict[str, Any] | None = None) -> str:
             task_state.mark_phase(phase)
             save_task_state(task_state, DATA_DIR)
-            event_payload: dict[str, Any] = {
-                "task_id": task_state.task_id,
-                "phase": task_state.phase,
-                "done": task_state.done,
-            }
+            event_payload: dict[str, Any] = {"task_id": task_state.task_id, "phase": task_state.phase, "done": task_state.done}
             if payload:
                 event_payload.update(payload)
             return sse(task_event_name(phase), event_payload)
-        
-        # Sanitize incoming messages: cap extremely long ones
+
         sanitized_messages = []
         for msg in request.messages:
-            content = msg.content
-            if len(content) > 12000:
-                content = content[:12000] + "... [Message truncated in history]"
+            content = msg.content[:12000] + ("... [Message truncated in history]" if len(msg.content) > 12000 else "")
             sanitized_messages.append({"role": msg.role, "content": content})
-            
-        conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
-        conversation.extend(sanitized_messages)
+        conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}, *sanitized_messages]
         public_messages = sanitized_messages.copy()
-        yield sse("meta", {"session_id": session_id, "model": request.model})
         repair_attempts_by_tool: dict[str, int] = {}
-        try:
-            max_repair_attempts = tool_repair_max_attempts()
-            max_model_turns = 4 + (max_repair_attempts * 2)
-            for _ in range(max_model_turns):
-        yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
+        max_repair_attempts = tool_repair_max_attempts()
+        provider = request.provider or load_settings().get("default_provider", "pollinations")
+        model = request.model or load_settings().get("default_model", "openai-fast")
+
+        yield sse("meta", {"session_id": session_id, "model": model, "task_id": task_state.task_id})
         yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
         try:
             max_task_steps = max(1, int(request.max_task_steps or 12))
-            model_turns = 0
-            while not task_state.done and model_turns < max_task_steps:
-                model_turns += 1
-                if task_state.observations:
-                    yield emit_task_phase("revise", {"observations": task_state.observations[-3:]})
+            for _ in range(max_task_steps):
                 text = ""
-                provider = request.provider or load_settings().get("default_provider", "pollinations")
-                model = request.model or load_settings().get("default_model", "openai-fast")
-                
-                # Auto-compaction / Pruning before calling model
-                active_conversation = prune_conversation(conversation)
-                
-                async for token in app.state.model_adapter.complete(active_conversation, model, provider):
+                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
                     text += token
                     yield sse("delta", {"content": token})
                 display_text = strip_tool_calls(text).strip()
@@ -2853,7 +3055,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     conversation.append({"role": "assistant", "content": text})
                     conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
                     continue
-
                 if display_text != text.strip():
                     yield sse("assistant_replace", {"content": display_text})
                 conversation.append({"role": "assistant", "content": text})
@@ -2864,102 +3065,28 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     save_task_state(task_state, DATA_DIR)
                     yield emit_task_phase("final", {"answer": display_text or text})
                     break
+
                 yield emit_task_phase("act", {"tool_call_count": len(calls)})
+                repaired_this_turn = False
                 for call in calls:
-                    tool_name = str(call["name"])
-                    arguments = call.get("arguments", {})
-                    if not isinstance(arguments, dict):
-                        arguments = {}
+                    tool_name = str(call.get("name", ""))
+                    arguments = call.get("arguments", {}) if isinstance(call.get("arguments", {}), dict) else {}
                     step = task_state.add_step(tool_name, arguments)
                     save_task_state(task_state, DATA_DIR)
                     yield emit_task_phase("act", {"step": step})
                     tool = find_tool(tool_name)
+                    approved = True
                     policy: dict[str, Any] | None = None
                     if tool_name == "execute_python":
                         policy = summarize_python_execution_policy(str(arguments.get("code", "")))
                         if policy["action"] == "block":
-                            result = {"error": policy["risk_summary"], "policy": policy}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            conversation.append({"role": "tool", "content": json.dumps(result)})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    requires_approval = bool(tool is not None and tool.get("requires_approval"))
-                    policy_approved = False
-                    if policy is not None and policy["action"] == "require_approval":
-                        requires_approval = True
-                    if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
-                        requires_approval = False
-                        policy_approved = True
-                    if requires_approval:
-                        risk_summary = "Approval required before tool execution."
-                        policy_reasons: list[str] = []
-                        sandbox_tier = "read_only"
-                        affected_paths: list[str] = []
-                        network_risk = False
-                        process_risk = False
-                        if policy is not None:
-                            risk_summary = policy.get("risk_summary", risk_summary)
-                            policy_reasons = policy.get("reasons", [])
-                            sandbox_tier = policy.get("sandbox_tier", sandbox_tier)
-                            affected_paths = policy.get("affected_paths", [])
-                            network_risk = bool(policy.get("network_risk", False))
-                            process_risk = bool(policy.get("process_risk", False))
-                        elif tool is not None and tool.get("requires_approval"):
-                            risk_summary = "Approval required by tool registry."
-                        pending = PendingApproval(
-                            tool_name,
-                            arguments,
-                            risk_summary,
-                            policy_reasons,
-                            sandbox_tier,
-                            affected_paths,
-                            network_risk,
-                            process_risk,
-                        )
-                        app.state.pending_approvals[pending.id] = pending
-                        yield sse(
-                            "approval_request",
-                            {
-                                "request_id": pending.id,
-                                "tool_name": tool_name,
-                                "arguments": arguments,
-                                "risk_summary": pending.risk_summary,
-                                "policy_reasons": pending.policy_reasons,
-                                "sandbox_tier": pending.sandbox_tier,
-                                "affected_paths": pending.affected_paths,
-                                "network_risk": pending.network_risk,
-                                "process_risk": pending.process_risk,
-                                "checkpoint": policy.get("checkpoint") if policy is not None else None,
-                                "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
-                            },
-                        )
-                        await pending.event.wait()
-                        approved = bool(pending.approved)
-                        policy_approved = approved
-                        app.state.pending_approvals.pop(pending.id, None)
-                        if not approved:
-                            result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
-                            store_tool_execution(tool_name, arguments, result, False)
-                            observation = task_state.add_observation(step, result, False)
-                            save_task_state(task_state, DATA_DIR)
-                            yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
-                            yield emit_task_phase("observe", {"observation": observation})
-                            
-                            result_str = json.dumps(result)
-                            if len(result_str) > 10000:
-                                result_str = result_str[:10000] + "... [Result truncated]"
-                            conversation.append({"role": "tool", "content": result_str})
-                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                            yield sse("evaluation", evaluation)
-                            continue
-                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
-                    if tool_name == "execute_python":
-                        result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+                            result = {"error": policy["risk_summary"], "policy": policy, "exit_code": -1, "timed_out": False}
+                            approved = False
+                        elif policy["action"] == "require_approval" and not request.auto_approve:
+                            result = {"error": "Python execution requires approval by policy.", "policy": policy, "exit_code": -1, "timed_out": False}
+                            approved = False
+                        else:
+                            result = await execute_python(str(arguments.get("code", "")), policy_approved=policy["action"] == "require_approval")
                     elif tool_name == "rollback_latest_checkpoint":
                         result = rollback_latest_checkpoint()
                     elif tool_name == "register_tool":
@@ -2976,26 +3103,18 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             sample_arguments=arguments.get("sample_arguments"),
                             supersedes=arguments.get("supersedes"),
                         )
+                    elif tool is not None and not tool.get("builtin"):
+                        result = run_registered_tool(tool, arguments)
+                        update_registered_tool_status(tool_name, str(tool.get("version", "")), increment_use_count=True)
                     else:
-                        tool = find_tool(tool_name)
-                        if tool is not None and tool.get("builtin"):
-                            result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
-                        elif tool is not None:
-                            result = run_registered_tool(tool, arguments)
-                            update_registered_tool_status(
-                                tool_name,
-                                str(tool.get("version", "")),
-                                increment_use_count=True,
-                            )
-                        else:
-                            result = {"error": f"Tool {tool_name} not found."}
-                    store_tool_execution(tool_name, arguments, result, True)
-                    observation = task_state.add_observation(step, result, True)
+                        result = {"error": f"Tool {tool_name} not found."}
+
+                    store_tool_execution(tool_name, arguments, result, approved)
+                    observation = task_state.add_observation(step, result, approved)
                     save_task_state(task_state, DATA_DIR)
-                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
+                    yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
+                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": approved})
                     yield emit_task_phase("observe", {"observation": observation})
-                    
-                    # Cap result for conversation history to avoid 400 errors
                     result_str = json.dumps(result)
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
@@ -3007,43 +3126,25 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             repair_attempts_by_tool[tool_name] = attempt_number
                             repair_attempt = append_tool_repair_attempt(tool, arguments, result)
                             repair_message = build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)
-                            yield sse(
-                                "tool_repair",
-                                {
-                                    "tool_name": tool_name,
-                                    "attempt": attempt_number,
-                                    "max_attempts": max_repair_attempts,
-                                    "failure": repair_attempt.get("failure"),
-                                },
-                            )
+                            yield sse("tool_repair", {"tool_name": tool_name, "attempt": attempt_number, "max_attempts": max_repair_attempts, "failure": repair_attempt.get("failure")})
                             conversation.append({"role": "system", "content": repair_message})
+                            repaired_this_turn = True
                             break
-                        result = {
-                            "error": f"Registered tool {tool_name} failed and exhausted {max_repair_attempts} repair attempts.",
-                            "last_result": result,
-                        }
-                        conversation.append({"role": "tool", "content": json.dumps(result)})
-                else:
-                    continue
-                continue
-                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                    yield sse("evaluation", evaluation)
-                    if evaluation["decision"] == "final":
-                        break
                 yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+                if repaired_this_turn:
+                    continue
+                evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                yield sse("evaluation", evaluation)
             if not task_state.done:
-                task_state.failure_count += 1
                 task_state.done = True
                 task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
                 save_task_state(task_state, DATA_DIR)
                 yield emit_task_phase("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
-            # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id, "task_id": task_state.task_id})
         except Exception as exc:
             yield sse("error", {"message": str(exc)})
 
     return StreamingResponse(stream(), media_type="text/event-stream")
-
 
 if __name__ == "__main__":
     import uvicorn
