@@ -352,3 +352,46 @@ def test_capability_refusal_detection_does_not_create_tool_code():
     assert "duckduckgo" not in retry.lower()
     assert "urllib" not in retry.lower()
     assert server.is_capability_refusal("Here is the result.") is False
+
+
+def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    adapter = SequenceAdapter([
+        "1. Run the first step\n2. Run the second step\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('one')\"}}</tool_call>",
+        "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
+        "Final answer after two observations.",
+    ])
+    client.app.state.model_adapter = adapter
+
+    async def fake_execute_python(code, policy_approved=False):
+        return {"stdout": code, "stderr": "", "exit_code": 0, "timed_out": False}
+
+    monkeypatch.setattr(server, "execute_python", fake_execute_python)
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "Complete a two-step task"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+            "max_task_steps": 5,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: task_plan" in response.text
+    assert "event: task_step" in response.text
+    assert "event: task_observation" in response.text
+    assert "event: task_revision" in response.text
+    assert "Final answer after two observations." in response.text
+    assert len(adapter.calls) == 3
+
+    task_files = list((tmp_path / "data" / "tasks").glob("*.json"))
+    assert len(task_files) == 1
+    task_state = json.loads(task_files[0].read_text(encoding="utf-8"))
+    assert task_state["done"] is True
+    assert task_state["phase"] == "final"
+    assert len(task_state["steps"]) == 2
+    assert len(task_state["observations"]) == 2
+    assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
