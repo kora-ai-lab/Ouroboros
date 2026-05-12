@@ -1,4 +1,5 @@
 use crate::crypto;
+use crate::llm::validation::{retry_with_validation, ModelResponse, ValidationContext};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -98,17 +99,70 @@ fn get_api_key(app: &AppHandle, provider: &str) -> Result<String, String> {
     crypto::decrypt(&encrypted)
 }
 
-pub async fn stream_from_cloud(app: &AppHandle, provider: &str, message: &str, conversation_id: &str) -> Result<(), String> {
+pub async fn stream_from_cloud(
+    app: &AppHandle,
+    provider: &str,
+    message: &str,
+    conversation_id: &str,
+) -> Result<(), String> {
     let api_key = get_api_key(app, provider)?;
+    let api_key_for_retry = api_key.clone();
+    let provider_for_retry = provider.to_string();
+    let original_message = message.to_string();
+
+    let outcome = retry_with_validation(
+        move |attempt| {
+            let api_key = api_key_for_retry.clone();
+            let provider = provider_for_retry.clone();
+            let original_message = original_message.clone();
+            async move {
+                let prompt = if let Some(correction) = attempt.corrective_system_message {
+                    format!("System correction: {correction}\n\nUser request: {original_message}")
+                } else {
+                    original_message
+                };
+
+                match complete_from_cloud_provider(&provider, &api_key, &prompt).await {
+                    Ok(content) => ModelResponse::text(content),
+                    Err(error) => ModelResponse::text(format!("Error: {error}")),
+                }
+            }
+        },
+        ValidationContext::default(),
+        None,
+    )
+    .await;
+
+    if !outcome.failures.is_empty() {
+        let state = app.state::<crate::state::AppState>();
+        let conn = state.db.conn();
+        for failure in &outcome.failures {
+            let _ = crate::commands::chat::insert_validation_observation(
+                &conn,
+                conversation_id,
+                failure,
+            );
+        }
+    }
+
+    emit_tokens(app, conversation_id, &outcome.response.content);
+    Ok(())
+}
+
+async fn complete_from_cloud_provider(
+    provider: &str,
+    api_key: &str,
+    message: &str,
+) -> Result<String, String> {
     match provider {
-        "openai" => stream_openai(app, &api_key, message, conversation_id).await,
-        "anthropic" => stream_anthropic(app, &api_key, message, conversation_id).await,
-        "google" => stream_google(app, &api_key, message, conversation_id).await,
+        "openai" => complete_openai(api_key, message).await,
+        "anthropic" => complete_anthropic(api_key, message).await,
+        "google" => complete_google(api_key, message).await,
         _ => Err(format!("Unknown provider: {}", provider)),
     }
 }
 
-async fn stream_openai(app: &AppHandle, api_key: &str, message: &str, conversation_id: &str) -> Result<(), String> {
+async fn complete_openai(api_key: &str, message: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "model": "gpt-4o-mini",
@@ -124,17 +178,17 @@ async fn stream_openai(app: &AppHandle, api_key: &str, message: &str, conversati
         .await
         .map_err(|e| format!("OpenAI request failed: {}", e))?;
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
-    let content = json["choices"][0]["message"]["content"]
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+    Ok(json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("No response")
-        .to_string();
-
-    emit_tokens(app, conversation_id, &content);
-    Ok(())
+        .to_string())
 }
 
-async fn stream_anthropic(app: &AppHandle, api_key: &str, message: &str, conversation_id: &str) -> Result<(), String> {
+async fn complete_anthropic(api_key: &str, message: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
         "model": "claude-sonnet-4-20250514",
@@ -151,17 +205,17 @@ async fn stream_anthropic(app: &AppHandle, api_key: &str, message: &str, convers
         .await
         .map_err(|e| format!("Anthropic request failed: {}", e))?;
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
-    let content = json["content"][0]["text"]
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+    Ok(json["content"][0]["text"]
         .as_str()
         .unwrap_or("No response")
-        .to_string();
-
-    emit_tokens(app, conversation_id, &content);
-    Ok(())
+        .to_string())
 }
 
-async fn stream_google(app: &AppHandle, api_key: &str, message: &str, conversation_id: &str) -> Result<(), String> {
+async fn complete_google(api_key: &str, message: &str) -> Result<String, String> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}",
         api_key
@@ -178,35 +232,46 @@ async fn stream_google(app: &AppHandle, api_key: &str, message: &str, conversati
         .await
         .map_err(|e| format!("Google request failed: {}", e))?;
 
-    let json: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
-    let content = json["candidates"][0]["content"]["parts"][0]["text"]
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Parse error: {}", e))?;
+    Ok(json["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .unwrap_or("No response")
-        .to_string();
-
-    emit_tokens(app, conversation_id, &content);
-    Ok(())
+        .to_string())
 }
 
-fn emit_tokens(app: &AppHandle, _conversation_id: &str, text: &str) {
+fn emit_tokens(app: &AppHandle, conversation_id: &str, text: &str) {
     let app_clone = app.clone();
     let text_owned = text.to_string();
+    let conversation_id = conversation_id.to_string();
 
     std::thread::spawn(move || {
         let words: Vec<String> = text_owned.split(' ').map(|w| w.to_string()).collect();
         for (i, word) in words.iter().enumerate() {
-            let token = if i == 0 { word.clone() } else { format!(" {}", word) };
-            let _ = app_clone.emit("chat:token", crate::commands::chat::ChatPayload {
-                conversation_id: "stream".to_string(),
-                token,
-                index: i as u32,
-            });
+            let token = if i == 0 {
+                word.clone()
+            } else {
+                format!(" {}", word)
+            };
+            let _ = app_clone.emit(
+                "chat:token",
+                crate::commands::chat::ChatPayload {
+                    conversation_id: conversation_id.clone(),
+                    token,
+                    index: i as u32,
+                },
+            );
             std::thread::sleep(std::time::Duration::from_millis(15));
         }
-        let _ = app_clone.emit("chat:done", crate::commands::chat::ChatDonePayload {
-            conversation_id: "stream".to_string(),
-            message_id: uuid::Uuid::new_v4().to_string(),
-            full_text: text_owned,
-        });
+        let _ = app_clone.emit(
+            "chat:done",
+            crate::commands::chat::ChatDonePayload {
+                conversation_id: conversation_id.clone(),
+                message_id: uuid::Uuid::new_v4().to_string(),
+                full_text: text_owned,
+            },
+        );
     });
 }
