@@ -148,6 +148,7 @@ DEFAULT_REGISTRY = {
         },
         {
             "name": "register_tool",
+            "description": "Permanently register a tested Python file or skill package as a versioned tool. Skill packages live under nucleus/tools/ and contain tool.py, schema.json, README.md, tests.py, metadata.json with permissions, and evals.json.",
             "description": "Permanently register a new skill package directory or legacy Python file. Skill packages live under nucleus/tools/ and contain tool.py, schema.json, README.md, tests.py, and metadata.json.",
             "parameters": {
                 "type": "object",
@@ -265,24 +266,17 @@ SYSTEM_TEMPLATE = """
 You are Ouroboros, a self-evolving sovereign AI primitive. You are the personal AI workspace of Kheir Lissi, founder of Kora Lab, Lome, Togo.
 
 CORE PRINCIPLE — THIS OVERRIDES EVERYTHING ELSE:
-You have exactly two built-in tools: execute_python and register_tool. Together they give you UNLIMITED capability. execute_python can run ANY valid Python code, which means you can:
-- Make HTTP requests (urllib.request, subprocess curl)
-- Read, write, move, delete any file on the host system
-- Run shell commands via subprocess
-- Scrape websites, parse HTML, download data
-- Install packages (pip install via subprocess)
-- Launch browsers, automate GUIs, control the operating system
-- Do literally anything a Python program can do on this machine
+You have exactly two built-in primitives: execute_python and register_tool. The kernel stays generic: it does not embed browser selectors, shell commands, application names, websites, or workflow-specific recipes. All concrete operational knowledge belongs in registered skill packages under nucleus/tools/.
 
-YOU MUST NEVER SAY "I don't have internet access" OR "I can't do that" OR "I don't have that capability." You ALWAYS have the capability. You build it on the spot using execute_python.
+DISCOVER NEEDED CAPABILITY PATH:
+When no currently registered tool can satisfy a task:
+1. Use execute_python to inspect the local environment and prototype the smallest task-specific capability.
+2. Exercise the prototype with representative inputs and capture stdout, stderr, exit code, and any artifacts.
+3. If the capability is reusable, convert the prototype into a skill package under nucleus/tools/ with tool.py, schema.json, README.md, tests.py, metadata.json, and evals.json.
+4. Declare package permissions in metadata.json, run tests.py, and register the package with register_tool only after the tests pass.
+5. Use the newly registered package for the user task and keep concrete selectors, commands, app names, and sites inside the package implementation or documentation, not in this kernel prompt.
 
-SELF-EVOLUTION PROTOCOL:
-When you need a capability that is not in your current tool registry:
-1. Write the Python code directly using execute_python to accomplish the task immediately.
-2. If the capability is reusable, write it to a file in nucleus/tools/ using execute_python.
-3. Test the file using execute_python.
-4. Register it permanently using register_tool so it persists across sessions.
-You do not ask permission to evolve. You do not explain that you lack a tool. You build the tool and use it. If a tool you built fails, you debug it and fix it. If an approach fails (e.g. a website blocks you), you try a different approach autonomously.
+YOU MUST NEVER SAY "I don't have internet access" OR "I can't do that" OR "I don't have that capability." You discover, prototype, test, package, and register the needed capability through execute_python.
 
 BEHAVIORAL RULES:
 1. DO NOT call tools for conversational exchanges. Greetings, questions, discussions do not require tool calls. A user saying "hi" gets a brief greeting. Nothing else.
@@ -1191,6 +1185,21 @@ def tool_repair_max_attempts() -> int:
         return DEFAULT_TOOL_REPAIR_MAX_ATTEMPTS
 
 
+def load_registry_tool_metadata(tool: dict[str, Any]) -> dict[str, Any]:
+    metadata = tool.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def save_tool_metadata(tool_name: str, metadata: dict[str, Any]) -> None:
+    registry = load_registry()
+    updated = False
+    for entry in registry["tools"]:
+        if entry.get("name") == tool_name:
+            entry["metadata"] = metadata
+            updated = True
+            break
+    if updated:
+        save_json(REGISTRY_PATH, registry)
 def load_tool_metadata(source: dict[str, Any] | Path) -> dict[str, Any]:
     if isinstance(source, dict):
         metadata = source.get("metadata")
@@ -1214,6 +1223,26 @@ def load_tool_metadata(source: dict[str, Any] | Path) -> dict[str, Any]:
         raise ValueError("metadata.json deprecation_reason must be a string when present.")
     return metadata
 
+def append_tool_repair_attempt(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(load_registry_tool_metadata(tool))
+    attempts = metadata.get("repair_attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+    failure = classify_registered_tool_failure(result, tool)
+    attempts.append(
+        {
+            "timestamp": now_iso(),
+            "arguments": arguments,
+            "failure": failure,
+            "result": result,
+        }
+    )
+    metadata["repair_attempts"] = attempts
+    metadata["last_repair_attempt_at"] = attempts[-1]["timestamp"]
+    metadata["repair_attempt_count"] = len(attempts)
+    save_tool_metadata(str(tool.get("name", "")), metadata)
+    tool["metadata"] = metadata
+    return attempts[-1]
 
 
 def load_kora_context() -> str:
@@ -1834,10 +1863,10 @@ def build_self_evolution_retry_message(request: ChatRequest) -> str:
         user_request = "the user's request"
     return textwrap.dedent(
         f"""
-        Your previous answer violated the self-evolution protocol by claiming a missing capability.
-        You are not allowed to stop at that refusal. Use the existing primitive instead:
-        emit exactly one valid <tool_call> for execute_python that creates or exercises the capability needed to satisfy this user request.
-        If the capability should persist, use execute_python to write a reusable file under nucleus/tools/ and then register it with register_tool after it is tested.
+        Your previous answer violated the discover-needed-capability path by claiming a missing capability.
+        You are not allowed to stop at that refusal. Emit exactly one valid <tool_call> for execute_python that prototypes or exercises the smallest capability needed for this request.
+        If the capability should persist, package it under nucleus/tools/ with tool.py, schema.json, README.md, tests.py, metadata.json with permissions, and evals.json; run tests.py; then register it with register_tool.
+        Keep concrete selectors, commands, app names, and websites in the package, not in the kernel prompt.
 
         Original user request:
         {user_request}
@@ -2005,6 +2034,11 @@ def load_tool_package_metadata(package_dir: Path) -> dict[str, Any]:
     version = metadata.get("version")
     if not isinstance(version, str) or not version.strip():
         raise ValueError("metadata.json must include a non-empty string version.")
+    permissions = metadata.get("permissions")
+    if not isinstance(permissions, dict) or not permissions:
+        raise ValueError("metadata.json must include a non-empty permissions object.")
+    if not all(isinstance(key, str) and key.strip() for key in permissions):
+        raise ValueError("metadata.json permissions keys must be non-empty strings.")
     deprecated = metadata.get("deprecated", False)
     if not isinstance(deprecated, bool):
         raise ValueError("metadata.json deprecated must be a boolean when present.")
@@ -2052,7 +2086,7 @@ def validate_json_schema(schema: dict[str, Any]) -> None:
 
 
 def load_tool_package(package_dir: Path) -> dict[str, Any]:
-    required_files = ["tool.py", "schema.json", "README.md", "tests.py", "metadata.json"]
+    required_files = ["tool.py", "schema.json", "README.md", "tests.py", "metadata.json", "evals.json"]
     missing = [name for name in required_files if not (package_dir / name).is_file()]
     if missing:
         raise ValueError("Skill package is missing required files: " + ", ".join(missing))
@@ -2063,6 +2097,12 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
         raise ValueError(f"schema.json is invalid JSON: {exc.msg}") from exc
     validate_json_schema(schema)
     metadata = load_package_metadata(package_dir)
+    try:
+        evals = json.loads((package_dir / "evals.json").read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"evals.json is invalid JSON: {exc.msg}") from exc
+    if not isinstance(evals, (dict, list)):
+        raise ValueError("evals.json must contain a JSON object or array.")
     validate_tool_permission_manifest(metadata)
     metadata = load_tool_package_metadata(package_dir)
 
@@ -2080,7 +2120,7 @@ def load_tool_package(package_dir: Path) -> dict[str, Any]:
             "Skill package tests.py failed before registration. "
             f"stdout={completed.stdout[-4000:]!r} stderr={completed.stderr[-4000:]!r}"
         )
-    return {"schema": schema, "metadata": metadata, "test_stdout": completed.stdout, "test_stderr": completed.stderr}
+    return {"schema": schema, "metadata": metadata, "evals": evals, "test_stdout": completed.stdout, "test_stderr": completed.stderr}
 
 
 EVAL_PERMISSION_REASON_MAP = {
@@ -2745,6 +2785,7 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
 
 
 def registered_tool_expects_json(tool: dict[str, Any]) -> bool:
+    metadata = load_registry_tool_metadata(tool)
     metadata = tool.get("metadata", {}) if isinstance(tool.get("metadata", {}), dict) else {}
     return tool.get("output_format") == "json" or metadata.get("output_format") == "json"
 
@@ -3036,7 +3077,7 @@ def registered_tool_failed(result: dict[str, Any], tool: dict[str, Any] | None =
 
 
 def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any], attempt_number: int, max_attempts: int) -> str:
-    metadata = load_tool_metadata(tool)
+    metadata = load_registry_tool_metadata(tool)
     failure = classify_registered_tool_failure(result, tool) or {"type": "unknown", "message": "Tool failed."}
     payload = {
         "tool": {key: tool.get(key) for key in ("name", "description", "filepath", "parameters", "requires_approval", "version")},
@@ -3049,6 +3090,21 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
     }
     return textwrap.dedent(
         f"""
+        A registered tool failed while serving the user's request. Repair it autonomously.
+
+        Repair protocol:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Run its test_command, test_plan, sample_arguments, or package tests.py against the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
         A registered tool failed. Repair it before continuing.
 
         Generic repair instruction:
@@ -3274,9 +3330,32 @@ def register_tool(
 ) -> dict[str, Any]:
     validate_tool_name(name)
     package_info: dict[str, Any] | None = None
+    metadata: dict[str, Any] = {"repair_attempts": []}
+    entry_filepath = str(Path(filepath))
+
     try:
         validate_tool_name(name)
         path = resolve_tool_candidate(filepath)
+        if path.is_dir():
+            package_info = load_tool_package(path)
+            parameters = package_info["schema"]
+            metadata = dict(package_info["metadata"])
+            tool_version = str(metadata.get("version", version))
+            test_status = "passed"
+        else:
+            path = resolve_tool_path(filepath)
+            if not isinstance(parameters_schema, dict):
+                return {"error": "parameters_schema must be an object for legacy Python tool registrations."}
+            validate_json_schema(parameters_schema)
+            parameters = parameters_schema
+            tool_version = str(version)
+            test_status = "pending"
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
         entry_filepath = str(Path(filepath))
         metadata: dict[str, Any] = {}
         if path.is_dir():
@@ -3348,10 +3427,18 @@ def register_tool(
     registry = load_registry()
     if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
         return {
-            "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
+            "error": "Legacy registered tools must include a test_command, test_plan, or sample_arguments for validation."
         }
 
     registry = load_registry()
+    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
+    existing_metadata = dict(load_registry_tool_metadata(existing)) if existing else {}
+    metadata.setdefault("repair_attempts", existing_metadata.get("repair_attempts", []))
+    existing_versions = [
+        tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
+    ]
+    if any(str(tool.get("version", "")) == tool_version for tool in existing_versions):
+        return {"error": f"Tool {name} version {tool_version} is already registered."}
     existing_versions = [
         tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
     ]
@@ -3419,6 +3506,30 @@ def register_tool(
         "filepath": entry_filepath,
         "builtin": False,
         "requires_approval": bool(requires_approval),
+        "metadata": metadata,
+        "version": tool_version,
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "source_task_id": source_task_id,
+        "test_command": test_command,
+        "test_plan": test_plan,
+        "sample_arguments": sample_arguments or {},
+        "last_test_status": test_status,
+        "last_error": None,
+        "use_count": 0,
+        "supersedes": supersedes,
+        "trusted": False,
+        "deprecated": bool(metadata.get("deprecated", False)),
+        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
+    }
+    if package_info is not None:
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        entry["last_test_status"] = "passed"
+
+    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
         "metadata": {"repair_attempts": [], **metadata},
         "metadata": {},
         "version": str(version),
@@ -3544,6 +3655,14 @@ def register_tool(
         result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
     return result
 
+    result = {"registered": name, "version": tool_version, "permanent": True, "trusted": False}
+    if package_info is not None:
+        result["package"] = True
+        result["tests"] = {
+            "stdout": package_info["test_stdout"][-4000:],
+            "stderr": package_info["test_stderr"][-4000:],
+        }
+    return result
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
     execution_id = str(uuid.uuid4())
@@ -4399,6 +4518,9 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
+        yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
+        repair_attempts_by_tool: dict[str, int] = {}
+        max_repair_attempts = tool_repair_max_attempts()
         repair_attempts_by_tool: dict[str, int] = {}
         max_repair_attempts = tool_repair_max_attempts()
         yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
