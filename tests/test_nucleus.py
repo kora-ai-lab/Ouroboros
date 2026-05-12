@@ -175,6 +175,77 @@ def test_chat_stream_uses_fake_adapter_and_saves_memory(tmp_path, monkeypatch):
     assert "Test response" in response.text
 
 
+def test_chat_stream_emits_task_protocol_events(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "hello"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+        },
+    )
+
+    assert response.status_code == 200
+    for event_name in [
+        "task_started",
+        "task_plan",
+        "task_step",
+        "task_observation",
+        "task_evaluation",
+        "task_done",
+    ]:
+        assert f"event: {event_name}" in response.text
+    assert "event: delta" in response.text
+
+
+def test_chat_stream_emits_retry_event_for_self_evolution_retry(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        "I don't have internet access to search for current details.",
+        "Recovered after retry.",
+    ])
+
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "Find current details"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: task_retry" in response.text
+    assert "capability_refusal" in response.text
+
+
+def test_chat_stream_emits_checkpoint_after_tool_result(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        '<tool_call>{"name":"execute_python","arguments":{"code":"print(1)"}}</tool_call>',
+        "Done with tool.",
+    ])
+
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "run a tool"}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: tool_call" in response.text
+    assert "event: tool_result" in response.text
+    assert "event: task_checkpoint" in response.text
+
+
 def test_settings_save_updates_env_and_defaults(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     response = client.post(
