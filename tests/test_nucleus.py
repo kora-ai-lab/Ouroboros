@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -170,6 +171,13 @@ print(json.dumps({'echo': args.get('message', '')}))
                 "version": "1.2.3",
                 "deprecated": False,
                 "deprecation_reason": "",
+                "permissions": {
+                    "filesystem": [],
+                    "network": [],
+                    "environment": [],
+                    "process": {"allow": False},
+                    "secrets": [],
+                },
             },
             indent=2,
         ),
@@ -847,6 +855,31 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         "/chat",
         json={
             "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+            "max_task_steps": 5,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: tool_repair" in response.text
+    assert "nonzero_exit" in response.text
+    assert "The repaired tool succeeded." in response.text
+    assert "second-run" in response.text
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
+    attempts = flaky["metadata"]["repair_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure"]["type"] == "nonzero_exit"
+
+    repaired = server.run_registered_tool(flaky, {"value": "direct"})
+    assert repaired["exit_code"] == 0
+    assert json.loads(repaired["stdout"])["value"] == "direct"
 
 def _run_git(repo: Path, *args: str) -> None:
     import subprocess
@@ -987,3 +1020,52 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     assert len(task_state["steps"]) == 2
     assert len(task_state["observations"]) == 2
     assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
+
+
+
+def test_registered_tool_rejects_undeclared_filesystem_access(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    (package / "tool.py").write_text(
+        "from pathlib import Path\nprint(Path('outside.txt').read_text(encoding='utf-8'))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "outside.txt").write_text("secret\n", encoding="utf-8")
+    (package / "tests.py").write_text("pass\n", encoding="utf-8")
+
+    server.register_tool(
+        name="caps_echo",
+        description="Attempts undeclared filesystem reads",
+        filepath="tools/caps_echo",
+    )
+    tool = next(tool for tool in json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))["tools"] if tool["name"] == "caps_echo")
+
+    result = server.run_registered_tool(tool, {})
+
+    assert result["exit_code"] != 0
+    assert "undeclared filesystem read access" in result["stderr"]
+    with sqlite3.connect(tmp_path / "data" / "memory.sqlite3") as conn:
+        row = conn.execute("SELECT tool_name, tool_version, result_status FROM tool_execution_audit").fetchone()
+    assert row == ("caps_echo", "1.2.3", "failed")
+
+
+def test_registered_tool_rejects_undeclared_network_access(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    package = write_skill_package(tmp_path)
+    (package / "tool.py").write_text(
+        "import socket\ns=socket.socket()\ns.connect(('127.0.0.1', 9))\n",
+        encoding="utf-8",
+    )
+    (package / "tests.py").write_text("pass\n", encoding="utf-8")
+
+    server.register_tool(
+        name="caps_echo",
+        description="Attempts undeclared network access",
+        filepath="tools/caps_echo",
+    )
+    tool = next(tool for tool in json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))["tools"] if tool["name"] == "caps_echo")
+
+    result = server.run_registered_tool(tool, {})
+
+    assert result["exit_code"] != 0
+    assert "undeclared network access" in result["stderr"]
