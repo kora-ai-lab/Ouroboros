@@ -590,6 +590,41 @@ def test_capability_refusal_detection_does_not_create_tool_code():
     assert "urllib" not in retry.lower()
     assert server.is_capability_refusal("Here is the result.") is False
 
+def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "flaky_tool.py"
+    tool_path.write_text(
+        "import sys\nprint('broken', file=sys.stderr)\nsys.exit(1)\n",
+        encoding="utf-8",
+    )
+    registered = server.register_tool(
+        name="flaky_tool",
+        description="Return the provided value as JSON.",
+        parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
+        filepath="tools/flaky_tool.py",
+    )
+    assert registered["registered"] == "flaky_tool"
+
+    patch_code = "\n".join(
+        [
+            "from pathlib import Path",
+            "Path('tools/flaky_tool.py').write_text(\"import json, sys\\nargs = json.loads(sys.stdin.read() or '{}')\\nprint(json.dumps({'status': 'ok', 'value': args.get('value')}))\\n\", encoding='utf-8')",
+        ]
+    )
+    adapter = SequenceAdapter(
+        [
+            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
+            f'<tool_call>{json.dumps({"name": "execute_python", "arguments": {"code": patch_code}})}</tool_call>',
+            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
+            "The repaired tool succeeded.",
+        ]
+    )
+    client.app.state.model_adapter = adapter
+
+    response = client.post(
+        "/chat",
+        json={
+            "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
 
 def _run_git(repo: Path, *args: str) -> None:
     import subprocess
@@ -697,6 +732,24 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     )
 
     assert response.status_code == 200
+    assert "event: tool_repair" in response.text
+    assert "nonzero_exit" in response.text
+    assert "The repaired tool succeeded." in response.text
+    assert "second-run" in response.text
+    assert len(adapter.calls) == 4
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
+
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
+    attempts = flaky["metadata"]["repair_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure"]["type"] == "nonzero_exit"
+
+    repaired = server.run_registered_tool(flaky, {"value": "direct"})
+    assert repaired["exit_code"] == 0
+    assert json.loads(repaired["stdout"])["value"] == "direct"
     assert "event: task_plan" in response.text
     assert "event: task_step" in response.text
     assert "event: task_observation" in response.text
