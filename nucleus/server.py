@@ -16,7 +16,7 @@ import time
 import uuid
 import zlib
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, AsyncIterator, Sequence
 
@@ -343,6 +343,37 @@ class ChatRequest(BaseModel):
     auto_approve: bool = False
     task_id: str | None = None
     max_task_steps: int = 12
+
+
+class GoalCreateRequest(BaseModel):
+    title: str
+    description: str = ""
+    status: str = "active"
+
+
+class RecurrenceRuleRequest(BaseModel):
+    frequency: str = "once"
+    interval: int = 1
+    start_at: str | None = None
+    end_at: str | None = None
+
+
+class BackgroundTaskCreateRequest(BaseModel):
+    title: str
+    prompt: str
+    goal_id: str | None = None
+    project_id: str | None = None
+    due_at: str | None = None
+    recurrence_rule: RecurrenceRuleRequest | None = None
+    model: str = "openai-fast"
+    provider: str = "pollinations"
+    auto_approve: bool = True
+    max_task_steps: int = 12
+
+
+class RunDueBackgroundTasksRequest(BaseModel):
+    now: str | None = None
+    limit: int = 10
 
 
 class ApprovalDecision(BaseModel):
@@ -1007,6 +1038,84 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workspace_index_task ON workspace_index(last_seen_task_id)")
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS goal (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS project (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(goal_id) REFERENCES goal(id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recurrence_rule (
+                id TEXT PRIMARY KEY,
+                frequency TEXT NOT NULL,
+                interval INTEGER NOT NULL DEFAULT 1,
+                start_at TEXT NOT NULL,
+                end_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS background_task (
+                id TEXT PRIMARY KEY,
+                goal_id TEXT,
+                project_id TEXT,
+                recurrence_rule_id TEXT,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'scheduled',
+                due_at TEXT NOT NULL,
+                last_run_at TEXT,
+                completed_at TEXT,
+                result_summary TEXT NOT NULL DEFAULT '',
+                task_state_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(goal_id) REFERENCES goal(id),
+                FOREIGN KEY(project_id) REFERENCES project(id),
+                FOREIGN KEY(recurrence_rule_id) REFERENCES recurrence_rule(id)
+            )
+            """
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_background_task_due ON background_task(status, due_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_background_task_goal ON background_task(goal_id)")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_link (
+                id TEXT PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                background_task_id TEXT,
+                goal_id TEXT,
+                project_id TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(memory_id) REFERENCES episodic_memory(id),
+                FOREIGN KEY(background_task_id) REFERENCES background_task(id),
+                FOREIGN KEY(goal_id) REFERENCES goal(id),
+                FOREIGN KEY(project_id) REFERENCES project(id)
+            )
+            """
+        )
             CREATE TABLE IF NOT EXISTS tool_execution_audit (
                 id TEXT PRIMARY KEY,
                 timestamp TEXT NOT NULL,
@@ -3382,6 +3491,7 @@ def register_tool(
             metadata = dict(package_info["metadata"])
             version = str(metadata.get("version", version))
         package_info: dict[str, Any] | None = None
+        package_metadata: dict[str, Any] = {}
         metadata: dict[str, Any] = {}
         package_metadata: dict[str, Any] = {}
         package_metadata: dict[str, Any] = {"version": str(version), "deprecated": False, "deprecation_reason": ""}
@@ -3393,6 +3503,8 @@ def register_tool(
         if path.is_dir():
             package_info = load_tool_package(path)
             parameters = package_info["schema"]
+            package_metadata = package_info["metadata"]
+            version = str(package_metadata.get("version", version))
             metadata = package_info["metadata"]
             version = str(metadata.get("version", version))
             test_plan = test_plan or "Skill package tests.py passed before registration."
@@ -3409,6 +3521,21 @@ def register_tool(
                 return {"error": "parameters_schema must be an object."}
             parameters = parameters_schema
             validate_json_schema(parameters)
+            if not isinstance(parameters, dict):
+                return {"error": "parameters_schema must be an object."}
+            if sample_arguments is not None and not isinstance(sample_arguments, dict):
+                return {"error": "sample_arguments must be an object."}
+            if not any([test_command, test_plan, sample_arguments is not None]):
+                return {
+                    "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
+                }
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    registry = load_registry()
+    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
+    existing_metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
+    existing_metadata.setdefault("repair_attempts", [])
             validate_tool_permission_manifest(package_metadata)
             if not isinstance(parameters_schema, dict):
                 return {"error": "parameters_schema must be an object."}
@@ -3495,6 +3622,9 @@ def register_tool(
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
+    metadata = existing_metadata
+    if package_metadata:
+        metadata.update(package_metadata)
     effective_task_id = created_by_task_id if created_by_task_id is not None else source_task_id
     entry = normalize_registry_entry({
     metadata = {"repair_attempts": []}
@@ -3525,6 +3655,7 @@ def register_tool(
         "builtin": False,
         "requires_approval": bool(requires_approval),
         "metadata": metadata,
+        "version": str(version),
         "version": tool_version,
         "created_at": timestamp,
         "updated_at": timestamp,
@@ -3532,6 +3663,20 @@ def register_tool(
         "test_command": test_command,
         "test_plan": test_plan,
         "sample_arguments": sample_arguments or {},
+        "last_test_status": "passed" if package_info is not None else "pending",
+        "last_error": None,
+        "use_count": 0,
+        "supersedes": supersedes,
+        "trusted": bool(package_info is not None),
+    }
+    if package_info is not None:
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+        entry["deprecated"] = bool(package_metadata.get("deprecated", False))
+        entry["deprecation_reason"] = str(package_metadata.get("deprecation_reason", "") or "")
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": entry["trusted"]}
         "last_test_status": test_status,
         "last_error": None,
         "use_count": 0,
@@ -4480,6 +4625,15 @@ def prune_conversation(messages: list[dict[str, str]], max_chars: int = 32000) -
     return head + pruned_middle + tail
 
 
+def parse_iso_datetime(value: str | None, fallback: datetime | None = None) -> datetime:
+    if not value:
+        return fallback or datetime.now(timezone.utc)
+    normalized = value.replace("Z", "+00:00")
+    parsed = datetime.fromisoformat(normalized)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
 @app.post("/chat")
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
@@ -4510,9 +4664,291 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             task_state.goal = goal
         save_task_state(task_state, DATA_DIR)
 
-        def emit_task_phase(phase: str, payload: dict[str, Any] | None = None) -> str:
-            task_state.mark_phase(phase)
+def next_due_at(current_due_at: str, rule: sqlite3.Row | dict[str, Any] | None) -> str | None:
+    if rule is None:
+        return None
+    frequency = str(rule["frequency"]).lower()
+    interval = max(1, int(rule["interval"] or 1))
+    current = parse_iso_datetime(current_due_at)
+    if frequency in {"once", "none"}:
+        return None
+    if frequency in {"minute", "minutes"}:
+        candidate = current + timedelta(minutes=interval)
+    elif frequency in {"hour", "hours", "hourly"}:
+        candidate = current + timedelta(hours=interval)
+    elif frequency in {"day", "days", "daily"}:
+        candidate = current + timedelta(days=interval)
+    elif frequency in {"week", "weeks", "weekly"}:
+        candidate = current + timedelta(weeks=interval)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported recurrence frequency: {frequency}")
+    end_at = rule["end_at"] if isinstance(rule, sqlite3.Row) else rule.get("end_at")
+    if end_at and candidate > parse_iso_datetime(str(end_at)):
+        return None
+    return candidate.isoformat()
+
+
+def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+async def dispatch_task_tool(tool_name: str, arguments: dict[str, Any], policy_approved: bool) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    if tool_name == "execute_python":
+        result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+        return result, None
+    if tool_name == "rollback_latest_checkpoint":
+        return rollback_latest_checkpoint(), None
+    if tool_name == "register_tool":
+        result = register_tool(
+            name=str(arguments.get("name", "")),
+            description=str(arguments.get("description", "")),
+            parameters_schema=arguments.get("parameters_schema", {}),
+            filepath=str(arguments.get("filepath", "")),
+            requires_approval=bool(arguments.get("requires_approval", False)),
+            version=str(arguments.get("version", "1.0.0")),
+            source_task_id=arguments.get("source_task_id"),
+            test_command=arguments.get("test_command"),
+            test_plan=arguments.get("test_plan"),
+            sample_arguments=arguments.get("sample_arguments"),
+            supersedes=arguments.get("supersedes"),
+        )
+        return result, None
+    tool = find_tool(tool_name)
+    if tool is not None and tool.get("builtin"):
+        return {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}, tool
+    if tool is not None:
+        result = run_registered_tool(tool, arguments)
+        update_registered_tool_status(tool_name, str(tool.get("version", "")), increment_use_count=True)
+        return result, tool
+    return {"error": f"Tool {tool_name} not found."}, None
+
+
+async def task_state_machine_events(request: ChatRequest, session_id: str) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    goal = last_user_message(request.messages)
+    task_state = load_task_state(DATA_DIR, request.task_id) if request.task_id else None
+    if task_state is None:
+        task_state = TaskState(task_id=request.task_id or str(uuid.uuid4()), goal=goal)
+    elif goal:
+        task_state.goal = goal
+    save_task_state(task_state, DATA_DIR)
+
+    def phase_payload(phase: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        task_state.mark_phase(phase)
+        save_task_state(task_state, DATA_DIR)
+        event_payload: dict[str, Any] = {"task_id": task_state.task_id, "phase": task_state.phase, "done": task_state.done}
+        if payload:
+            event_payload.update(payload)
+        return event_payload
+
+    sanitized_messages = []
+    for msg in request.messages:
+        content = msg.content[:12000] + "... [Message truncated in history]" if len(msg.content) > 12000 else msg.content
+        sanitized_messages.append({"role": msg.role, "content": content})
+
+    conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
+    conversation.extend(sanitized_messages)
+    yield "meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id}
+    yield task_event_name("plan"), phase_payload("plan", {"goal": task_state.goal, "plan": task_state.plan})
+
+    max_task_steps = max(1, int(request.max_task_steps or 12))
+    model_turns = 0
+    while not task_state.done and model_turns < max_task_steps:
+        model_turns += 1
+        if task_state.observations:
+            yield task_event_name("revise"), phase_payload("revise", {"observations": task_state.observations[-3:]})
+        text = ""
+        provider = request.provider or load_settings().get("default_provider", "pollinations")
+        model = request.model or load_settings().get("default_model", "openai-fast")
+        async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
+            text += token
+            yield "delta", {"content": token}
+        display_text = strip_tool_calls(text).strip()
+        calls = extract_tool_calls(text)
+        if not task_state.steps:
+            task_state.add_plan(display_text or text)
             save_task_state(task_state, DATA_DIR)
+            yield task_event_name("plan"), phase_payload("plan", {"goal": task_state.goal, "plan": task_state.plan})
+        if not calls and is_capability_refusal(text):
+            task_state.failure_count += 1
+            save_task_state(task_state, DATA_DIR)
+            yield "assistant_replace", {"content": "Retrying under the self-evolution protocol."}
+            yield task_event_name("revise"), phase_payload("revise", {"reason": "capability_refusal", "failure_count": task_state.failure_count})
+            conversation.append({"role": "assistant", "content": text})
+            conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
+            continue
+        if display_text != text.strip():
+            yield "assistant_replace", {"content": display_text}
+        conversation.append({"role": "assistant", "content": text})
+        if not calls:
+            task_state.done = True
+            task_state.artifacts["final_answer"] = display_text or text
+            save_task_state(task_state, DATA_DIR)
+            yield task_event_name("final"), phase_payload("final", {"answer": display_text or text})
+            break
+        yield task_event_name("act"), phase_payload("act", {"tool_call_count": len(calls)})
+        for call in calls:
+            tool_name = str(call.get("name", ""))
+            arguments = call.get("arguments", {})
+            if not isinstance(arguments, dict):
+                arguments = {}
+            step = task_state.add_step(tool_name, arguments)
+            save_task_state(task_state, DATA_DIR)
+            yield task_event_name("act"), phase_payload("act", {"step": step})
+            policy_approved = True
+            if tool_name == "execute_python":
+                policy = summarize_python_execution_policy(str(arguments.get("code", "")))
+                if policy["action"] == "block":
+                    result = {"error": policy["risk_summary"], "policy": policy}
+                    store_tool_execution(tool_name, arguments, result, False)
+                    observation = task_state.add_observation(step, result, False)
+                    save_task_state(task_state, DATA_DIR)
+                    yield "tool_result", {"tool_name": tool_name, "result": result, "approved": False}
+                    yield task_event_name("observe"), phase_payload("observe", {"observation": observation})
+                    conversation.append({"role": "tool", "content": json.dumps(result)})
+                    continue
+                policy_approved = request.auto_approve and not policy.get("manual_approval_required", False)
+                if policy["action"] == "require_approval" and not policy_approved:
+                    result = {"error": "Python execution requires approval by policy.", "policy": policy}
+                    store_tool_execution(tool_name, arguments, result, False)
+                    observation = task_state.add_observation(step, result, False)
+                    save_task_state(task_state, DATA_DIR)
+                    yield "approval_required", {"tool_name": tool_name, "arguments": arguments, "policy": policy}
+                    yield task_event_name("observe"), phase_payload("observe", {"observation": observation})
+                    conversation.append({"role": "tool", "content": json.dumps(result)})
+                    continue
+            yield "tool_call", {"tool_name": tool_name, "arguments": arguments}
+            result, tool = await dispatch_task_tool(tool_name, arguments, policy_approved)
+            store_tool_execution(tool_name, arguments, result, True)
+            observation = task_state.add_observation(step, result, True)
+            save_task_state(task_state, DATA_DIR)
+            yield "tool_result", {"tool_name": tool_name, "result": result, "approved": True}
+            yield task_event_name("observe"), phase_payload("observe", {"observation": observation})
+            result_str = json.dumps(result)
+            if len(result_str) > 10000:
+                result_str = result_str[:10000] + "... [Result truncated for context]"
+            conversation.append({"role": "tool", "content": result_str})
+            if tool is not None and not tool.get("builtin") and registered_tool_failed(result, tool):
+                conversation.append({"role": "system", "content": build_tool_repair_message(tool, arguments, result, 1, tool_repair_max_attempts())})
+                break
+        yield task_event_name("evaluate"), phase_payload("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+        evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+        yield "evaluation", evaluation
+
+    if not task_state.done:
+        task_state.failure_count += 1
+        task_state.done = True
+        task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
+        save_task_state(task_state, DATA_DIR)
+        yield task_event_name("final"), phase_payload("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
+    yield "done", {"session_id": session_id, "task_id": task_state.task_id}
+
+
+@app.post("/goals")
+async def create_goal(request: GoalCreateRequest) -> JSONResponse:
+    goal_id = str(uuid.uuid4())
+    timestamp = now_iso()
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO goal (id, title, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (goal_id, request.title, request.description, request.status, timestamp, timestamp),
+        )
+        conn.commit()
+    return JSONResponse({"goal": {"id": goal_id, "title": request.title, "description": request.description, "status": request.status, "created_at": timestamp, "updated_at": timestamp}})
+
+
+@app.get("/goals")
+async def list_goals() -> JSONResponse:
+    with connect_db() as conn:
+        rows = conn.execute("SELECT id, title, description, status, created_at, updated_at FROM goal ORDER BY created_at DESC").fetchall()
+    return JSONResponse({"goals": [row_to_dict(row) for row in rows]})
+
+
+@app.post("/background-tasks")
+async def create_background_task(request: BackgroundTaskCreateRequest) -> JSONResponse:
+    task_id = str(uuid.uuid4())
+    timestamp = now_iso()
+    due_at = (parse_iso_datetime(request.due_at, datetime.now(timezone.utc))).isoformat()
+    recurrence_rule_id = None
+    with connect_db() as conn:
+        if request.recurrence_rule is not None:
+            recurrence_rule_id = str(uuid.uuid4())
+            rule_start = parse_iso_datetime(request.recurrence_rule.start_at, parse_iso_datetime(due_at)).isoformat()
+            conn.execute(
+                "INSERT INTO recurrence_rule (id, frequency, interval, start_at, end_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (recurrence_rule_id, request.recurrence_rule.frequency, max(1, request.recurrence_rule.interval), rule_start, request.recurrence_rule.end_at, timestamp, timestamp),
+            )
+        conn.execute(
+            """
+            INSERT INTO background_task (id, goal_id, project_id, recurrence_rule_id, title, prompt, status, due_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task_id, request.goal_id, request.project_id, recurrence_rule_id, request.title, request.prompt, "scheduled", due_at, timestamp, timestamp),
+        )
+        conn.commit()
+    return JSONResponse({"background_task": {"id": task_id, "title": request.title, "prompt": request.prompt, "status": "scheduled", "due_at": due_at, "recurrence_rule_id": recurrence_rule_id}})
+
+
+async def run_background_task(row: sqlite3.Row, request: RunDueBackgroundTasksRequest) -> dict[str, Any]:
+    session_id = f"background-{row['id']}-{uuid.uuid4()}"
+    task_state_id = row["task_state_id"] or str(uuid.uuid4())
+    chat_request = ChatRequest(
+        messages=[ChatMessage(role="user", content=row["prompt"])],
+        task_id=task_state_id,
+        auto_approve=True,
+        max_task_steps=12,
+    )
+    events: list[dict[str, Any]] = []
+    async for event, payload in task_state_machine_events(chat_request, session_id):
+        events.append({"event": event, "data": payload})
+    state = load_task_state(DATA_DIR, task_state_id)
+    final_answer = (state.artifacts.get("final_answer") if state else "") or ""
+    memory_summary = final_answer if final_answer else f"Background task completed: {row['title']}"
+    memory_id = store_episodic_memory(session_id, memory_summary, extract_keywords(memory_summary) or ["background", "task"])
+    timestamp = now_iso()
+    with connect_db() as conn:
+        rule = conn.execute("SELECT * FROM recurrence_rule WHERE id = ?", (row["recurrence_rule_id"],)).fetchone() if row["recurrence_rule_id"] else None
+        following_due_at = next_due_at(row["due_at"], rule)
+        status = "scheduled" if following_due_at else "completed"
+        conn.execute(
+            """
+            UPDATE background_task
+            SET status = ?, due_at = ?, last_run_at = ?, completed_at = ?, result_summary = ?, task_state_id = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status, following_due_at or row["due_at"], timestamp, timestamp if status == "completed" else None, memory_summary, task_state_id, timestamp, row["id"]),
+        )
+        conn.execute(
+            "INSERT INTO memory_link (id, memory_id, background_task_id, goal_id, project_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), memory_id, row["id"], row["goal_id"], row["project_id"], timestamp),
+        )
+        conn.commit()
+    return {"id": row["id"], "status": status, "task_state_id": task_state_id, "memory_id": memory_id, "result_summary": memory_summary, "events": events}
+
+
+@app.post("/background-tasks/run-due")
+async def run_due_background_tasks(request: RunDueBackgroundTasksRequest) -> JSONResponse:
+    now_value = parse_iso_datetime(request.now, datetime.now(timezone.utc)).isoformat()
+    with connect_db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM background_task
+            WHERE status IN ('scheduled', 'failed') AND due_at <= ?
+            ORDER BY due_at ASC
+            LIMIT ?
+            """,
+            (now_value, max(1, request.limit)),
+        ).fetchall()
+    results = [await run_background_task(row, request) for row in rows]
+    return JSONResponse({"ran": len(results), "tasks": results})
+
+
+@app.post("/chat")
+async def chat(request: ChatRequest) -> StreamingResponse:
+    async def stream() -> AsyncIterator[str]:
+        session_id = str(uuid.uuid4())
+        try:
+            async for event, payload in task_state_machine_events(request, session_id):
+                yield sse(event, payload)
             event_payload: dict[str, Any] = {"task_id": task_state.task_id, "phase": task_state.phase, "done": task_state.done}
             if payload:
                 event_payload.update(payload)

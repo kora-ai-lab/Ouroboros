@@ -1217,6 +1217,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         description="Return the provided value as JSON.",
         parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         filepath="tools/flaky_tool.py",
+        test_plan="Failure-path test registration.",
         test_plan="Exercise repair flow with a deliberately failing tool.",
         test_plan="Intentionally broken tool is exercised by repair retry test.",
         test_plan="Exercise failing tool before model repair.",
@@ -1226,6 +1227,10 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
     assert registered["registered"] == "flaky_tool"
     server.update_registered_tool_status("flaky_tool", "1.0.0", trusted=True, last_test_status="passed")
 
+    adapter = SequenceAdapter([
+        '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
+        "The repaired tool flow stopped after observing failure.",
+    ])
     patch_code = "\n".join(
         [
             "from pathlib import Path",
@@ -1247,6 +1252,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         json={
             "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
             "auto_approve": True,
+            "max_task_steps": 2,
             "model": "openai-fast",
             "provider": "pollinations",
             "context_files": [],
@@ -1257,6 +1263,8 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
     )
 
     assert response.status_code == 200
+    assert "event: tool_result" in response.text
+    assert "broken" in response.text
     assert "event: tool_repair" in response.text
     assert "nonzero_exit" in response.text
     assert "second-run" in response.text
@@ -1389,6 +1397,9 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     client = make_client(tmp_path, monkeypatch)
     adapter = SequenceAdapter([
         "1. Run the first step\n2. Run the second step\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('one')\"}}</tool_call>",
+        '{"decision":"continue","rationale":"Run the second step."}',
+        "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
         '{"decision":"retry","rationale":"Run the second step."}',
         "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
         '{"decision":"final","rationale":"Both steps are complete."}',
@@ -1435,6 +1446,53 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
 
 
+def test_recurring_background_task_runs_due_and_links_memory(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    client.app.state.model_adapter = SequenceAdapter([
+        "1. Complete recurring task\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('background-memory')\"}}</tool_call>",
+        '{"decision":"final","rationale":"The result is sufficient."}',
+        "Stored background-memory result in long-term memory.",
+    ])
+
+    async def fake_execute_python(code, policy_approved=False):
+        return {"stdout": "background-memory\n", "stderr": "", "exit_code": 0, "timed_out": False}
+
+    monkeypatch.setattr(server, "execute_python", fake_execute_python)
+
+    goal_response = client.post("/goals", json={"title": "Remember background work"})
+    assert goal_response.status_code == 200
+    goal_id = goal_response.json()["goal"]["id"]
+
+    create_response = client.post(
+        "/background-tasks",
+        json={
+            "title": "Recurring memory task",
+            "prompt": "Run the recurring memory task",
+            "goal_id": goal_id,
+            "due_at": "2026-05-12T00:00:00+00:00",
+            "recurrence_rule": {"frequency": "daily", "interval": 1, "start_at": "2026-05-12T00:00:00+00:00"},
+        },
+    )
+    assert create_response.status_code == 200
+    background_task_id = create_response.json()["background_task"]["id"]
+
+    run_response = client.post("/background-tasks/run-due", json={"now": "2026-05-12T01:00:00+00:00"})
+    assert run_response.status_code == 200
+    body = run_response.json()
+    assert body["ran"] == 1
+    assert body["tasks"][0]["id"] == background_task_id
+    assert "Stored background-memory" in body["tasks"][0]["result_summary"]
+
+    with server.connect_db() as conn:
+        task = conn.execute("SELECT status, due_at, result_summary FROM background_task WHERE id = ?", (background_task_id,)).fetchone()
+        memory = conn.execute("SELECT summary FROM episodic_memory WHERE id = ?", (body["tasks"][0]["memory_id"],)).fetchone()
+        link = conn.execute("SELECT background_task_id, goal_id FROM memory_link WHERE memory_id = ?", (body["tasks"][0]["memory_id"],)).fetchone()
+
+    assert task["status"] == "scheduled"
+    assert task["due_at"] == "2026-05-13T00:00:00+00:00"
+    assert "Stored background-memory" in memory["summary"]
+    assert link["background_task_id"] == background_task_id
+    assert link["goal_id"] == goal_id
 
 def test_registered_tool_rejects_undeclared_filesystem_access(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
