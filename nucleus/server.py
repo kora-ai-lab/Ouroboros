@@ -179,6 +179,40 @@ DEFAULT_REGISTRY = {
             "supersedes": None,
             "trusted": True,
         },
+        {
+            "name": "mcp_bridge",
+            "description": "Generic bridge for configured MCP servers: list servers/tools/resources/prompts, read resources, and call arbitrary MCP tools.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["list_servers", "list_tools", "call_tool", "list_resources", "read_resource", "list_prompts"]},
+                    "server": {"type": "string"},
+                    "tool_name": {"type": "string"},
+                    "arguments": {"type": "object"},
+                    "uri": {"type": "string"},
+                },
+                "required": ["operation"],
+                "additionalProperties": False,
+            },
+            "filepath": "tools/mcp_bridge",
+            "builtin": False,
+            "requires_approval": False,
+            "package": True,
+            "package_dir": "tools/mcp_bridge",
+            "metadata": {"version": "1.0.0", "deprecated": False, "deprecation_reason": "", "output_format": "json"},
+            "version": "1.0.0",
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "source_task_id": None,
+            "test_command": "python nucleus/tools/mcp_bridge/tests.py",
+            "test_plan": "Package smoke test plus adapter unit tests cover generic MCP discovery and call dispatch.",
+            "sample_arguments": {"operation": "list_servers"},
+            "last_test_status": "pending",
+            "last_error": None,
+            "use_count": 0,
+            "supersedes": None,
+            "trusted": False,
+        },
     ]
 }
 
@@ -1904,6 +1938,11 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
+def load_tool_metadata(source: Path | dict[str, Any]) -> dict[str, Any]:
+    if isinstance(source, dict):
+        metadata = source.get("metadata")
+        return dict(metadata) if isinstance(metadata, dict) else {}
+    package_dir = source
 def load_package_metadata(package_dir: Path) -> dict[str, Any]:
 def load_tool_package_metadata(package_dir: Path) -> dict[str, Any]:
     metadata_path = package_dir / "metadata.json"
@@ -1923,7 +1962,6 @@ def load_tool_package_metadata(package_dir: Path) -> dict[str, Any]:
     if deprecation_reason is not None and not isinstance(deprecation_reason, str):
         raise ValueError("metadata.json deprecation_reason must be a string when present.")
     return metadata
-
 
 def validate_json_schema(schema: dict[str, Any]) -> None:
     if not isinstance(schema, dict):
@@ -2516,6 +2554,16 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
         4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
         5. Then retry the original tool call or continue with the user's request.
 
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
 
         Generic repair instruction:
         1. Inspect the tool file and its registry metadata.
@@ -2645,6 +2693,8 @@ def register_tool(
     sample_arguments: dict[str, Any] | None = None,
     supersedes: str | None = None,
 ) -> dict[str, Any]:
+    validate_tool_name(name)
+    package_info: dict[str, Any] | None = None
     try:
         validate_tool_name(name)
         path = resolve_tool_candidate(filepath)
@@ -2658,6 +2708,7 @@ def register_tool(
             package_info = load_tool_package(path)
             parameters = package_info["schema"]
             package_metadata = package_info["metadata"]
+            version = str(package_metadata.get("version", version))
             version = str(package_metadata.get("version") or version)
             version = str(package_metadata.get("version", version))
             entry_version = str(package_metadata.get("version", version))
@@ -2668,6 +2719,21 @@ def register_tool(
                 return {"error": "parameters_schema must be an object."}
             parameters = parameters_schema
             validate_json_schema(parameters)
+            entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
+        return {
+            "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
+        }
+
+    registry = load_registry()
+    existing_versions = [
+        tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
+    ]
             entry_version = str(version)
             if not any([test_command, test_plan, sample_arguments is not None]):
                 return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
@@ -2706,6 +2772,9 @@ def register_tool(
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
+    metadata = {"repair_attempts": []}
+    if package_info is not None:
+        metadata.update(package_info["metadata"])
     metadata = dict(package_metadata) if package_info is not None else dict(existing_versions[-1].get("metadata", {})) if existing_versions else {}
     metadata.setdefault("repair_attempts", [])
     metadata = {"repair_attempts": []}
@@ -2725,12 +2794,14 @@ def register_tool(
         "updated_at": timestamp,
         "source_task_id": source_task_id,
         "test_command": test_command,
+        "test_plan": test_plan or ("Package tests.py passed." if package_info is not None else None),
         "test_plan": test_plan or ("Skill package tests.py passed before registration." if package_info else None),
         "sample_arguments": sample_arguments or {},
         "last_test_status": "passed" if package_info is not None else "pending",
         "last_error": None,
         "use_count": 0,
         "supersedes": supersedes,
+        "trusted": bool(package_info is not None),
         "trusted": False,
         "deprecated": bool(metadata.get("deprecated", False)),
         "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
@@ -2743,6 +2814,11 @@ def register_tool(
     if package_info is not None:
         entry["package"] = True
         entry["package_dir"] = entry_filepath
+        entry["deprecated"] = bool(package_info["metadata"].get("deprecated", False))
+        entry["deprecation_reason"] = str(package_info["metadata"].get("deprecation_reason", "") or "")
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": entry["trusted"]}
         entry["output_format"] = package_metadata.get("output_format", entry.get("output_format"))
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
@@ -3603,6 +3679,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
         repair_attempts_by_tool: dict[str, int] = {}
+        yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
         provider = request.provider or load_settings().get("default_provider", "pollinations")
         model = request.model or load_settings().get("default_model", "openai-fast")
         yield sse("meta", {"session_id": session_id, "model": request.model})
@@ -3639,6 +3716,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         try:
             max_repair_attempts = tool_repair_max_attempts()
             max_task_steps = max(1, int(request.max_task_steps or 12))
+            max_repair_attempts = tool_repair_max_attempts()
             for _ in range(max_task_steps):
                 text = ""
                 async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
@@ -3925,6 +4003,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
                 if repaired_this_turn:
                     continue
+                continue
                 evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
                 yield sse("evaluation", evaluation)
                             repair_requested = True
