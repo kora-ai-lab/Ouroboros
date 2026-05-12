@@ -104,10 +104,22 @@ DEFAULT_REGISTRY = {
             },
             "builtin": True,
             "requires_approval": True,
+            "version": "1.0.0",
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "source_task_id": None,
+            "test_command": None,
+            "test_plan": "Built-in tool covered by application tests.",
+            "sample_arguments": {},
+            "last_test_status": "built_in",
+            "last_error": None,
+            "use_count": 0,
+            "supersedes": None,
+            "trusted": True,
         },
         {
             "name": "register_tool",
-            "description": "Permanently register a new tool from a Python file you have already written and tested via execute_python.",
+            "description": "Permanently register a tested Python file as a versioned tool.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -116,11 +128,29 @@ DEFAULT_REGISTRY = {
                     "parameters_schema": {"type": "object"},
                     "filepath": {"type": "string"},
                     "requires_approval": {"type": "boolean"},
+                    "version": {"type": "string", "default": "1.0.0"},
+                    "source_task_id": {"type": "string"},
+                    "test_command": {"type": "string"},
+                    "test_plan": {"type": "string"},
+                    "sample_arguments": {"type": "object"},
+                    "supersedes": {"type": "string"},
                 },
                 "required": ["name", "description", "parameters_schema", "filepath"],
             },
             "builtin": True,
             "requires_approval": False,
+            "version": "1.0.0",
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "source_task_id": None,
+            "test_command": None,
+            "test_plan": "Built-in tool covered by application tests.",
+            "sample_arguments": {},
+            "last_test_status": "built_in",
+            "last_error": None,
+            "use_count": 0,
+            "supersedes": None,
+            "trusted": True,
         },
     ]
 }
@@ -754,11 +784,29 @@ def upsert_provider(update: ProviderUpdate) -> dict[str, Any]:
     return provider_status()
 
 
+def parse_version_key(version: Any) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", str(version or "0"))
+    return tuple(int(part) for part in parts) or (0,)
+
+
 def find_tool(name: str) -> dict[str, Any] | None:
-    for tool in load_registry()["tools"]:
-        if tool.get("name") == name:
-            return tool
-    return None
+    matches = [tool for tool in load_registry()["tools"] if tool.get("name") == name]
+    if not matches:
+        return None
+    return sorted(
+        matches,
+        key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
+    )[-1]
+
+
+def find_tool_version(name: str, version: str | None = None) -> dict[str, Any] | None:
+    matches = [tool for tool in load_registry()["tools"] if tool.get("name") == name]
+    if version is not None:
+        for tool in matches:
+            if str(tool.get("version", "")) == str(version):
+                return tool
+        return None
+    return find_tool(name)
 
 
 def load_kora_context() -> str:
@@ -1186,26 +1234,115 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
 
 
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
     filepath = tool.get("filepath")
     if not filepath:
         raise ValueError(f"Tool {tool.get('name')} has no filepath.")
     path = resolve_tool_path(filepath)
-    completed = subprocess.run(
-        [sys.executable, str(path)],
-        cwd=ROOT_DIR,
-        input=json.dumps(arguments),
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        timeout=120,
-        check=False,
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(path)],
+            cwd=ROOT_DIR,
+            input=json.dumps(arguments),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+        return {
+            "stdout": completed.stdout[-100_000:],
+            "stderr": completed.stderr[-100_000:],
+            "exit_code": completed.returncode,
+            "timed_out": False,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
+            "stderr": "Timed out after 120s",
+            "exit_code": -1,
+            "timed_out": True,
+        }
+
+
+def update_registered_tool_status(
+    name: str,
+    version: str | None = None,
+    *,
+    last_test_status: str | None = None,
+    last_error: str | None = None,
+    trusted: bool | None = None,
+    increment_use_count: bool = False,
+) -> dict[str, Any]:
+    registry = load_registry()
+    target: dict[str, Any] | None = None
+    for tool in registry["tools"]:
+        if tool.get("name") == name and (version is None or str(tool.get("version", "")) == str(version)):
+            if target is None or parse_version_key(tool.get("version")) >= parse_version_key(target.get("version")):
+                target = tool
+    if target is None:
+        return {"error": f"Tool {name} not found."}
+
+    if last_test_status is not None:
+        target["last_test_status"] = last_test_status
+    if last_error is not None or last_test_status == "passed":
+        target["last_error"] = last_error
+    if trusted is not None:
+        target["trusted"] = trusted
+    if increment_use_count:
+        target["use_count"] = int(target.get("use_count", 0)) + 1
+    target["updated_at"] = now_iso()
+    save_json(REGISTRY_PATH, registry)
+    return {"updated": target["name"], "version": target.get("version"), "tool": target}
+
+
+def validate_registered_tool(
+    name: str,
+    version: str | None = None,
+    sample_arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    tool = find_tool_version(name, version)
+    if tool is None:
+        return {"error": f"Tool {name} not found."}
+    if tool.get("builtin"):
+        return {"error": f"Builtin tool {name} cannot be validated as a registered file tool."}
+
+    arguments = sample_arguments if sample_arguments is not None else tool.get("sample_arguments", {})
+    if not isinstance(arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+
+    try:
+        result = run_registered_tool(tool, arguments)
+    except Exception as exc:  # noqa: BLE001 - validation must persist failure details
+        message = str(exc)
+        update_registered_tool_status(
+            name,
+            str(tool.get("version", "")),
+            last_test_status="failed",
+            last_error=message,
+            trusted=False,
+        )
+        return {"validated": False, "error": message}
+
+    passed = result.get("exit_code") == 0 and not result.get("timed_out")
+    error = None if passed else (result.get("stderr") or f"Exited with code {result.get('exit_code')}")
+    status = update_registered_tool_status(
+        name,
+        str(tool.get("version", "")),
+        last_test_status="passed" if passed else "failed",
+        last_error=error,
+        trusted=passed,
     )
     return {
-        "stdout": completed.stdout[-100_000:],
-        "stderr": completed.stderr[-100_000:],
-        "exit_code": completed.returncode,
-        "timed_out": False,
+        "validated": passed,
+        "name": name,
+        "version": status.get("version"),
+        "result": result,
+        "tool": status.get("tool"),
     }
 
 
@@ -1215,27 +1352,65 @@ def register_tool(
     parameters_schema: dict[str, Any],
     filepath: str,
     requires_approval: bool = False,
+    version: str = "1.0.0",
+    source_task_id: str | None = None,
+    test_command: str | None = None,
+    test_plan: str | None = None,
+    sample_arguments: dict[str, Any] | None = None,
+    supersedes: str | None = None,
 ) -> dict[str, Any]:
     validate_tool_name(name)
-    full_path = ROOT_DIR / filepath
-    if not full_path.exists():
+    try:
+        path = resolve_tool_path(filepath)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if not isinstance(parameters_schema, dict):
+        return {"error": "parameters_schema must be an object."}
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if not any([test_command, test_plan, sample_arguments is not None]):
         return {
-            "error": f"File not found: {filepath}. Write the file first via execute_python before registering."
+            "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
         }
-    
+
     registry = load_registry()
+    existing_versions = [
+        tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
+    ]
+    if any(str(tool.get("version", "")) == str(version) for tool in existing_versions):
+        return {"error": f"Tool {name} version {version} is already registered."}
+    if supersedes is None and existing_versions:
+        previous = sorted(
+            existing_versions,
+            key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
+        )[-1]
+        supersedes = str(previous.get("version", "")) or None
+
+    timestamp = now_iso()
     entry = {
         "name": name,
         "description": description,
         "parameters": parameters_schema,
-        "filepath": str(filepath),
+        "filepath": str(path.relative_to(BASE_DIR)),
         "builtin": False,
         "requires_approval": bool(requires_approval),
+        "version": str(version),
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "source_task_id": source_task_id,
+        "test_command": test_command,
+        "test_plan": test_plan,
+        "sample_arguments": sample_arguments or {},
+        "last_test_status": "pending",
+        "last_error": None,
+        "use_count": 0,
+        "supersedes": supersedes,
+        "trusted": False,
     }
-    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return {"registered": name, "permanent": True}
+    return {"registered": name, "version": str(version), "permanent": True, "trusted": False}
 
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> None:
@@ -1780,6 +1955,12 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             parameters_schema=arguments.get("parameters_schema", {}),
                             filepath=str(arguments.get("filepath", "")),
                             requires_approval=bool(arguments.get("requires_approval", False)),
+                            version=str(arguments.get("version", "1.0.0")),
+                            source_task_id=arguments.get("source_task_id"),
+                            test_command=arguments.get("test_command"),
+                            test_plan=arguments.get("test_plan"),
+                            sample_arguments=arguments.get("sample_arguments"),
+                            supersedes=arguments.get("supersedes"),
                         )
                     else:
                         tool = find_tool(tool_name)
@@ -1787,6 +1968,11 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
                         elif tool is not None:
                             result = run_registered_tool(tool, arguments)
+                            update_registered_tool_status(
+                                tool_name,
+                                str(tool.get("version", "")),
+                                increment_use_count=True,
+                            )
                         else:
                             result = {"error": f"Tool {tool_name} not found."}
                     store_tool_execution(tool_name, arguments, result, True)

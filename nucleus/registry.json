@@ -16,11 +16,23 @@
         ]
       },
       "builtin": true,
-      "requires_approval": true
+      "requires_approval": true,
+      "version": "1.0.0",
+      "created_at": "2026-05-12T00:00:00+00:00",
+      "updated_at": "2026-05-12T00:00:00+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Built-in tool covered by application tests.",
+      "sample_arguments": {},
+      "last_test_status": "built_in",
+      "last_error": null,
+      "use_count": 0,
+      "supersedes": null,
+      "trusted": true
     },
     {
       "name": "register_tool",
-      "description": "Permanently register a Python file as a tool. The file must already exist on disk (written via execute_python). After registration the tool is available in all future sessions without restart.",
+      "description": "Permanently register a tested Python file as a versioned tool. The file must live under nucleus/tools and include a test_command, test_plan, or sample_arguments.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -40,6 +52,25 @@
           "requires_approval": {
             "type": "boolean",
             "default": false
+          },
+          "version": {
+            "type": "string",
+            "default": "1.0.0"
+          },
+          "source_task_id": {
+            "type": "string"
+          },
+          "test_command": {
+            "type": "string"
+          },
+          "test_plan": {
+            "type": "string"
+          },
+          "sample_arguments": {
+            "type": "object"
+          },
+          "supersedes": {
+            "type": "string"
           }
         },
         "required": [
@@ -50,7 +81,19 @@
         ]
       },
       "builtin": true,
-      "requires_approval": true
+      "requires_approval": true,
+      "version": "1.0.0",
+      "created_at": "2026-05-12T00:00:00+00:00",
+      "updated_at": "2026-05-12T00:00:00+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Built-in tool covered by application tests.",
+      "sample_arguments": {},
+      "last_test_status": "built_in",
+      "last_error": null,
+      "use_count": 0,
+      "supersedes": null,
+      "trusted": true
     }
   ]
 }

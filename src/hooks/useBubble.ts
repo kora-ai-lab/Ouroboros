@@ -1,11 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
-
-interface BubblePosition {
-  x: number;
-  y: number;
-}
-
-const BUBBLE_SIZE = 44;
+import { useState, useCallback } from "react";
 
 export function useBubble() {
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
