@@ -81,6 +81,7 @@ RUNTIME_SETTINGS = tuple(RUNTIME_SETTING_DEFAULTS.keys())
 DEFAULT_SETTINGS = {
     "default_provider": "pollinations",
     "default_model": "openai-fast",
+    "tool_repair_max_attempts": 2,
     "providers": {
         "pollinations": {
             "label": "Pollinations",
@@ -91,6 +92,9 @@ DEFAULT_SETTINGS = {
         }
     },
 }
+
+DEFAULT_TOOL_REPAIR_MAX_ATTEMPTS = 2
+REGISTERED_TOOL_TIMEOUT_SECONDS = 120
 
 DEFAULT_REGISTRY = {
     "tools": [
@@ -761,6 +765,55 @@ def find_tool(name: str) -> dict[str, Any] | None:
     return None
 
 
+def tool_repair_max_attempts() -> int:
+    raw_value = os.getenv("OUROBOROS_TOOL_REPAIR_MAX_ATTEMPTS")
+    if raw_value is None:
+        raw_value = load_settings().get("tool_repair_max_attempts", DEFAULT_TOOL_REPAIR_MAX_ATTEMPTS)
+    try:
+        return max(int(raw_value), 0)
+    except (TypeError, ValueError):
+        return DEFAULT_TOOL_REPAIR_MAX_ATTEMPTS
+
+
+def load_tool_metadata(tool: dict[str, Any]) -> dict[str, Any]:
+    metadata = tool.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def save_tool_metadata(tool_name: str, metadata: dict[str, Any]) -> None:
+    registry = load_registry()
+    updated = False
+    for entry in registry["tools"]:
+        if entry.get("name") == tool_name:
+            entry["metadata"] = metadata
+            updated = True
+            break
+    if updated:
+        save_json(REGISTRY_PATH, registry)
+
+
+def append_tool_repair_attempt(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(load_tool_metadata(tool))
+    attempts = metadata.get("repair_attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+    failure = classify_registered_tool_failure(result, tool)
+    attempts.append(
+        {
+            "timestamp": now_iso(),
+            "arguments": arguments,
+            "failure": failure,
+            "result": result,
+        }
+    )
+    metadata["repair_attempts"] = attempts
+    metadata["last_repair_attempt_at"] = attempts[-1]["timestamp"]
+    metadata["repair_attempt_count"] = len(attempts)
+    save_tool_metadata(str(tool.get("name", "")), metadata)
+    tool["metadata"] = metadata
+    return attempts[-1]
+
+
 def load_kora_context() -> str:
     parts: list[str] = []
     for path in sorted(KORA_DIR.glob("**/*")):
@@ -1186,27 +1239,125 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
 
 
 
+def registered_tool_expects_json(tool: dict[str, Any]) -> bool:
+    metadata = load_tool_metadata(tool)
+    return tool.get("output_format") == "json" or metadata.get("output_format") == "json"
+
+
+def annotate_registered_tool_output(result: dict[str, Any], tool: dict[str, Any]) -> dict[str, Any]:
+    result.setdefault("malformed_output", False)
+    if not registered_tool_expects_json(tool):
+        return result
+    stdout = str(result.get("stdout", "")).strip()
+    if not stdout:
+        result["malformed_output"] = True
+        result["error"] = "Registered tool produced no JSON output."
+        return result
+    try:
+        result["output"] = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        result["malformed_output"] = True
+        result["error"] = f"Registered tool produced malformed JSON output: {exc.msg}."
+    return result
+
+
 def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
-    filepath = tool.get("filepath")
-    if not filepath:
-        raise ValueError(f"Tool {tool.get('name')} has no filepath.")
-    path = resolve_tool_path(filepath)
-    completed = subprocess.run(
-        [sys.executable, str(path)],
-        cwd=ROOT_DIR,
-        input=json.dumps(arguments),
-        text=True,
-        encoding="utf-8",
-        capture_output=True,
-        timeout=120,
-        check=False,
-    )
-    return {
-        "stdout": completed.stdout[-100_000:],
-        "stderr": completed.stderr[-100_000:],
-        "exit_code": completed.returncode,
-        "timed_out": False,
+    start = time.time()
+    try:
+        filepath = tool.get("filepath")
+        if not filepath:
+            raise ValueError(f"Tool {tool.get('name')} has no filepath.")
+        path = resolve_tool_path(filepath)
+        completed = subprocess.run(
+            [sys.executable, str(path)],
+            cwd=ROOT_DIR,
+            input=json.dumps(arguments),
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=REGISTERED_TOOL_TIMEOUT_SECONDS,
+            check=False,
+        )
+        result = {
+            "stdout": completed.stdout[-100_000:],
+            "stderr": completed.stderr[-100_000:],
+            "exit_code": completed.returncode,
+            "timed_out": False,
+            "duration_ms": int((time.time() - start) * 1000),
+        }
+        return annotate_registered_tool_output(result, tool)
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
+            "stderr": ((exc.stderr or "")[-100_000:] if isinstance(exc.stderr, str) else "") or f"Timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s",
+            "exit_code": -1,
+            "timed_out": True,
+            "duration_ms": int((time.time() - start) * 1000),
+            "error": f"Registered tool timed out after {REGISTERED_TOOL_TIMEOUT_SECONDS}s.",
+            "malformed_output": False,
+        }
+    except Exception as exc:
+        return {
+            "stdout": "",
+            "stderr": str(exc),
+            "exit_code": -1,
+            "timed_out": False,
+            "duration_ms": int((time.time() - start) * 1000),
+            "error": f"Registered tool execution exception: {exc}",
+            "exception": type(exc).__name__,
+            "malformed_output": False,
+        }
+
+
+def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if result.get("timed_out"):
+        return {"type": "timeout", "message": str(result.get("error") or result.get("stderr") or "Tool timed out.")}
+    if result.get("exception"):
+        return {"type": "exception", "message": str(result.get("error") or result.get("stderr") or "Tool raised an exception.")}
+    if result.get("malformed_output"):
+        return {"type": "malformed_output", "message": str(result.get("error") or "Tool output was malformed.")}
+    try:
+        exit_code = int(result.get("exit_code", 0))
+    except (TypeError, ValueError):
+        exit_code = -1
+    if exit_code != 0:
+        return {"type": "nonzero_exit", "message": str(result.get("stderr") or result.get("error") or f"Tool exited with code {exit_code}.")}
+    return None
+
+
+def registered_tool_failed(result: dict[str, Any], tool: dict[str, Any] | None = None) -> bool:
+    return classify_registered_tool_failure(result, tool) is not None
+
+
+def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any], attempt_number: int, max_attempts: int) -> str:
+    metadata = load_tool_metadata(tool)
+    failure = classify_registered_tool_failure(result, tool) or {"type": "unknown", "message": "Tool failed."}
+    payload = {
+        "tool": {key: tool.get(key) for key in ("name", "description", "filepath", "parameters", "requires_approval")},
+        "metadata": metadata,
+        "arguments": arguments,
+        "failure": failure,
+        "result": result,
+        "attempt_number": attempt_number,
+        "max_attempts": max_attempts,
     }
+    return textwrap.dedent(
+        f"""
+        A registered tool failed. Repair it before continuing.
+
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
 
 def register_tool(
@@ -1224,6 +1375,9 @@ def register_tool(
         }
     
     registry = load_registry()
+    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
+    metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
+    metadata.setdefault("repair_attempts", [])
     entry = {
         "name": name,
         "description": description,
@@ -1231,6 +1385,7 @@ def register_tool(
         "filepath": str(filepath),
         "builtin": False,
         "requires_approval": bool(requires_approval),
+        "metadata": metadata,
     }
     registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
     registry["tools"].append(entry)
@@ -1687,8 +1842,11 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
         yield sse("meta", {"session_id": session_id, "model": request.model})
+        repair_attempts_by_tool: dict[str, int] = {}
         try:
-            for _ in range(4):
+            max_repair_attempts = tool_repair_max_attempts()
+            max_model_turns = 4 + (max_repair_attempts * 2)
+            for _ in range(max_model_turns):
                 text = ""
                 provider = request.provider or load_settings().get("default_provider", "pollinations")
                 model = request.model or load_settings().get("default_model", "openai-fast")
@@ -1797,6 +1955,32 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
+
+                    if tool is not None and not tool.get("builtin") and registered_tool_failed(result, tool):
+                        attempt_number = repair_attempts_by_tool.get(tool_name, 0) + 1
+                        if attempt_number <= max_repair_attempts:
+                            repair_attempts_by_tool[tool_name] = attempt_number
+                            repair_attempt = append_tool_repair_attempt(tool, arguments, result)
+                            repair_message = build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)
+                            yield sse(
+                                "tool_repair",
+                                {
+                                    "tool_name": tool_name,
+                                    "attempt": attempt_number,
+                                    "max_attempts": max_repair_attempts,
+                                    "failure": repair_attempt.get("failure"),
+                                },
+                            )
+                            conversation.append({"role": "system", "content": repair_message})
+                            break
+                        result = {
+                            "error": f"Registered tool {tool_name} failed and exhausted {max_repair_attempts} repair attempts.",
+                            "last_result": result,
+                        }
+                        conversation.append({"role": "tool", "content": json.dumps(result)})
+                else:
+                    continue
+                continue
             # Remove the automatic summary call from stream, frontend will call /memory/save
             yield sse("done", {"session_id": session_id})
         except Exception as exc:
