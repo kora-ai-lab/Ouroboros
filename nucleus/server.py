@@ -314,12 +314,20 @@ class PendingApproval:
         arguments: dict[str, Any],
         risk_summary: str = "Approval required before tool execution.",
         policy_reasons: list[str] | None = None,
+        sandbox_tier: str = "read_only",
+        affected_paths: list[str] | None = None,
+        network_risk: bool = False,
+        process_risk: bool = False,
     ) -> None:
         self.id = str(uuid.uuid4())
         self.tool_name = tool_name
         self.arguments = arguments
         self.risk_summary = risk_summary
         self.policy_reasons = policy_reasons or []
+        self.sandbox_tier = sandbox_tier
+        self.affected_paths = affected_paths or []
+        self.network_risk = network_risk
+        self.process_risk = process_risk
         self.event = asyncio.Event()
         self.approved: bool | None = None
 
@@ -1394,6 +1402,22 @@ NETWORK_IMPORTS = {"socket", "http.client", "httpx", "requests", "urllib", "urll
 BLOCKED_IMPORTS = {"ctypes"}
 DYNAMIC_EXECUTION_CALLS = {"eval", "exec", "compile", "__import__"}
 OS_PROCESS_CALLS = {"system", "popen", "spawnl", "spawnlp", "spawnv", "spawnvp", "execv", "execvp"}
+SANDBOX_TIERS = ("read_only", "workspace_write", "network_enabled", "host_full")
+SANDBOX_TIER_RANK = {tier: index for index, tier in enumerate(SANDBOX_TIERS)}
+SAFE_EXECUTION_ENV_VARS = {
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "PATH",
+    "PYTHONIOENCODING",
+    "PYTHONPATH",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+    "TZ",
+    "WINDIR",
+}
 DESTRUCTIVE_GIT_REASON = "destructive git command requires explicit approval"
 DESTRUCTIVE_GIT_PATTERNS = (
     re.compile(r"\bgit\s+reset\s+[^\n;&|]*--hard\b", re.IGNORECASE),
@@ -1415,6 +1439,125 @@ def path_in_approved_roots(path: Path) -> bool:
     return False
 
 
+def path_in_workspace(path: Path) -> bool:
+    resolved = path.resolve()
+    workspace = ROOT_DIR.resolve()
+    return resolved == workspace or workspace in resolved.parents
+
+
+def higher_sandbox_tier(current: str, candidate: str) -> str:
+    if SANDBOX_TIER_RANK[candidate] > SANDBOX_TIER_RANK[current]:
+        return candidate
+    return current
+
+
+def sandbox_tier_for_reasons(reasons: list[str]) -> str:
+    tier = "read_only"
+    for reason in reasons:
+        if reason == "network access":
+            tier = higher_sandbox_tier(tier, "network_enabled")
+        elif reason in {"subprocess/process access", "home-directory access"} or reason.startswith("absolute path outside approved roots"):
+            tier = higher_sandbox_tier(tier, "host_full")
+        elif reason == "filesystem write or mutation":
+            tier = higher_sandbox_tier(tier, "workspace_write")
+    return tier
+
+
+def build_python_execution_env(sandbox_tier: str) -> dict[str, str]:
+    if sandbox_tier == "host_full":
+        return os.environ.copy()
+    env = {key: value for key, value in os.environ.items() if key in SAFE_EXECUTION_ENV_VARS}
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    env["OUROBOROS_SANDBOX_TIER"] = sandbox_tier
+    env["OUROBOROS_WORKSPACE_ROOT"] = str(ROOT_DIR.resolve())
+    return env
+
+
+def python_sandbox_guard(sandbox_tier: str) -> str:
+    if sandbox_tier == "host_full":
+        return ""
+    workspace = str(ROOT_DIR.resolve())
+    read_only = sandbox_tier == "read_only"
+    return f"""
+import builtins as _ouro_builtins
+import os as _ouro_os
+import pathlib as _ouro_pathlib
+import shutil as _ouro_shutil
+
+_OURO_WORKSPACE = {workspace!r}
+_OURO_READ_ONLY = {read_only!r}
+_OURO_WRITE_FLAGS = ("w", "a", "x", "+")
+
+def _ouro_resolve(path):
+    return _ouro_os.path.realpath(_ouro_os.path.abspath(_ouro_os.fspath(path)))
+
+def _ouro_is_workspace_path(path):
+    resolved = _ouro_resolve(path)
+    return resolved == _OURO_WORKSPACE or resolved.startswith(_OURO_WORKSPACE + _ouro_os.sep)
+
+def _ouro_check_write_path(path):
+    if _OURO_READ_ONLY:
+        raise PermissionError("read_only sandbox blocks filesystem writes")
+    if not _ouro_is_workspace_path(path):
+        raise PermissionError("workspace_write sandbox blocks writes outside workspace: " + _ouro_os.fspath(path))
+
+def _ouro_mode_writes(mode):
+    return any(flag in str(mode) for flag in _OURO_WRITE_FLAGS)
+
+_ouro_open = _ouro_builtins.open
+def open(file, mode="r", *args, **kwargs):
+    if _ouro_mode_writes(mode):
+        _ouro_check_write_path(file)
+    return _ouro_open(file, mode, *args, **kwargs)
+_oouro_unused = setattr(_ouro_builtins, "open", open)
+
+_ouro_path_open = _ouro_pathlib.Path.open
+def _ouro_guarded_path_open(self, mode="r", *args, **kwargs):
+    if _ouro_mode_writes(mode):
+        _ouro_check_write_path(self)
+    return _ouro_path_open(self, mode, *args, **kwargs)
+_oouro_unused = setattr(_ouro_pathlib.Path, "open", _ouro_guarded_path_open)
+
+def _ouro_wrap_path_write(name):
+    original = getattr(_ouro_pathlib.Path, name)
+    def wrapper(self, *args, **kwargs):
+        _ouro_check_write_path(self)
+        return original(self, *args, **kwargs)
+    setattr(_ouro_pathlib.Path, name, wrapper)
+for _ouro_name in ("write_text", "write_bytes", "touch", "unlink", "mkdir", "rmdir"):
+    _ouro_wrap_path_write(_ouro_name)
+
+def _ouro_wrap_os_write(name, path_indexes=(0,)):
+    original = getattr(_ouro_os, name, None)
+    if original is None:
+        return
+    def wrapper(*args, **kwargs):
+        for index in path_indexes:
+            if len(args) > index:
+                _ouro_check_write_path(args[index])
+        return original(*args, **kwargs)
+    setattr(_ouro_os, name, wrapper)
+for _ouro_name in ("remove", "unlink", "rmdir", "mkdir", "makedirs"):
+    _ouro_wrap_os_write(_ouro_name)
+for _ouro_name in ("rename", "replace"):
+    _ouro_wrap_os_write(_ouro_name, (0, 1))
+
+def _ouro_wrap_shutil_write(name, path_indexes):
+    original = getattr(_ouro_shutil, name, None)
+    if original is None:
+        return
+    def wrapper(*args, **kwargs):
+        for index in path_indexes:
+            if len(args) > index:
+                _ouro_check_write_path(args[index])
+        return original(*args, **kwargs)
+    setattr(_ouro_shutil, name, wrapper)
+_oouro_unused = _ouro_wrap_shutil_write("copy", (1,))
+_oouro_unused = _ouro_wrap_shutil_write("copy2", (1,))
+_oouro_unused = _ouro_wrap_shutil_write("copyfile", (1,))
+_oouro_unused = _ouro_wrap_shutil_write("move", (0, 1))
+_oouro_unused = _ouro_wrap_shutil_write("rmtree", (0,))
+"""
 def command_text_contains_destructive_git(command_text: str) -> bool:
     normalized = re.sub(r"\s+", " ", command_text.strip())
     return any(pattern.search(normalized) for pattern in DESTRUCTIVE_GIT_PATTERNS)
@@ -1476,6 +1619,9 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         reasons.append(DESTRUCTIVE_GIT_REASON)
         manual_approval_required = True
     blocked: list[str] = []
+    affected_paths: list[str] = []
+    network_risk = False
+    process_risk = False
     module_aliases: dict[str, str] = {}
     risky_call_aliases: dict[str, str] = {}
     try:
@@ -1492,8 +1638,10 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                     module_aliases[alias.asname or top_level] = top_level
                     if alias.name in SUBPROCESS_IMPORTS or top_level in SUBPROCESS_IMPORTS:
                         reasons.append("subprocess/process access")
+                        process_risk = True
                     if alias.name in NETWORK_IMPORTS or top_level in NETWORK_IMPORTS:
                         reasons.append("network access")
+                        network_risk = True
                     if alias.name in BLOCKED_IMPORTS or top_level in BLOCKED_IMPORTS:
                         blocked.append(f"blocked import: {alias.name}")
             elif isinstance(node, ast.ImportFrom) and node.module:
@@ -1501,8 +1649,10 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                 top_level = module_name.split(".")[0]
                 if module_name in SUBPROCESS_IMPORTS or top_level in SUBPROCESS_IMPORTS:
                     reasons.append("subprocess/process access")
+                    process_risk = True
                 if module_name in NETWORK_IMPORTS or top_level in NETWORK_IMPORTS:
                     reasons.append("network access")
+                    network_risk = True
                 if module_name in BLOCKED_IMPORTS or top_level in BLOCKED_IMPORTS:
                     blocked.append(f"blocked import: {module_name}")
                 if module_name == "os":
@@ -1525,6 +1675,7 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                     func_name = node.func.id
                     if func_name in risky_call_aliases:
                         reasons.append(risky_call_aliases[func_name])
+                        process_risk = True
                 elif isinstance(node.func, ast.Attribute):
                     func_name = node.func.attr
                     if isinstance(node.func.value, ast.Name):
@@ -1532,6 +1683,7 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                         owner_module = module_aliases.get(owner, owner)
                         if owner_module == "os" and func_name in OS_PROCESS_CALLS:
                             reasons.append("subprocess/process access")
+                            process_risk = True
                 if func_name in DYNAMIC_EXECUTION_CALLS:
                     blocked.append(f"dynamic code execution via {func_name}()")
                 if func_name in WRITE_CALLS:
@@ -1555,25 +1707,47 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                 if text.startswith("~"):
                     reasons.append("home-directory access")
                 path = Path(text)
+                if text.startswith(("/", "./", "../")) or "/" in text or "\\" in text:
+                    affected_paths.append(text)
                 if path.is_absolute() and not path_in_approved_roots(path):
                     reasons.append(f"absolute path outside approved roots: {text}")
 
             if isinstance(node, ast.Attribute) and node.attr in {"home", "expanduser"}:
                 reasons.append("home-directory access")
 
+    unique_paths = sorted(set(affected_paths))
     if blocked:
         unique_blocked = sorted(set(blocked))
         return {
             "action": "block",
+            "sandbox_tier": "host_full",
             "risk_summary": "Policy blocked execution: " + "; ".join(unique_blocked) + ".",
             "reasons": unique_blocked,
+            "affected_paths": unique_paths,
+            "network_risk": network_risk,
+            "process_risk": process_risk,
         }
     unique_reasons = sorted(set(reasons))
+    sandbox_tier = sandbox_tier_for_reasons(unique_reasons)
     if unique_reasons:
         response = {
             "action": "require_approval",
-            "risk_summary": "Requires approval: " + "; ".join(unique_reasons) + ".",
+            "sandbox_tier": sandbox_tier,
+            "risk_summary": f"Requires {sandbox_tier} sandbox approval: " + "; ".join(unique_reasons) + ".",
             "reasons": unique_reasons,
+            "affected_paths": unique_paths,
+            "network_risk": network_risk,
+            "process_risk": process_risk,
+        }
+    return {
+        "action": "allow",
+        "sandbox_tier": "read_only",
+        "risk_summary": "Read-only Python execution appears low risk.",
+        "reasons": [],
+        "affected_paths": unique_paths,
+        "network_risk": network_risk,
+        "process_risk": process_risk,
+    }
             "manual_approval_required": manual_approval_required,
         }
     return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
@@ -1590,14 +1764,17 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
     if policy["action"] == "require_approval" and not policy_approved:
         return {"error": "Python execution requires approval by policy.", "policy": policy, "exit_code": -1, "timed_out": False}
 
+    sandbox_tier = policy.get("sandbox_tier", "read_only")
+    guarded_code = python_sandbox_guard(sandbox_tier) + "\n" + code
     checkpoint_metadata = create_filesystem_mutation_checkpoint(code, policy) if policy_approved else None
 
     start = time.time()
     proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-c", code,
+        sys.executable, "-c", guarded_code,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        cwd=str(ROOT_DIR)
+        cwd=str(ROOT_DIR.resolve()),
+        env=build_python_execution_env(sandbox_tier),
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -2582,12 +2759,29 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if requires_approval:
                         risk_summary = "Approval required before tool execution."
                         policy_reasons: list[str] = []
+                        sandbox_tier = "read_only"
+                        affected_paths: list[str] = []
+                        network_risk = False
+                        process_risk = False
                         if policy is not None:
                             risk_summary = policy.get("risk_summary", risk_summary)
                             policy_reasons = policy.get("reasons", [])
+                            sandbox_tier = policy.get("sandbox_tier", sandbox_tier)
+                            affected_paths = policy.get("affected_paths", [])
+                            network_risk = bool(policy.get("network_risk", False))
+                            process_risk = bool(policy.get("process_risk", False))
                         elif tool is not None and tool.get("requires_approval"):
                             risk_summary = "Approval required by tool registry."
-                        pending = PendingApproval(tool_name, arguments, risk_summary, policy_reasons)
+                        pending = PendingApproval(
+                            tool_name,
+                            arguments,
+                            risk_summary,
+                            policy_reasons,
+                            sandbox_tier,
+                            affected_paths,
+                            network_risk,
+                            process_risk,
+                        )
                         app.state.pending_approvals[pending.id] = pending
                         yield sse(
                             "approval_request",
@@ -2597,6 +2791,10 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                 "arguments": arguments,
                                 "risk_summary": pending.risk_summary,
                                 "policy_reasons": pending.policy_reasons,
+                                "sandbox_tier": pending.sandbox_tier,
+                                "affected_paths": pending.affected_paths,
+                                "network_risk": pending.network_risk,
+                                "process_risk": pending.process_risk,
                                 "checkpoint": policy.get("checkpoint") if policy is not None else None,
                                 "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
                             },
