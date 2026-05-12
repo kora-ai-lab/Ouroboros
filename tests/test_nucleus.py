@@ -590,6 +590,65 @@ def test_capability_refusal_detection_does_not_create_tool_code():
     assert "urllib" not in retry.lower()
     assert server.is_capability_refusal("Here is the result.") is False
 
+
+def test_workspace_index_scan_handles_sources_docs_binaries_and_generated_artifacts(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    src_dir = workspace / "src"
+    docs_dir = workspace / "docs"
+    generated_dir = workspace / "dist"
+    src_dir.mkdir(parents=True)
+    docs_dir.mkdir()
+    generated_dir.mkdir()
+    source = src_dir / "app.py"
+    doc = docs_dir / "readme.md"
+    binary = workspace / "image.bin"
+    huge = workspace / "huge.txt"
+    generated = generated_dir / "bundle.js"
+    source.write_text("def run():\n    return 'workspace source'\n", encoding="utf-8")
+    doc.write_text("# Workspace docs\nExplains the local index feature.\n", encoding="utf-8")
+    binary.write_bytes(b"\x00\x01\x02\x03")
+    huge.write_text("x" * (server.WORKSPACE_INDEX_MAX_TEXT_BYTES + 1), encoding="utf-8")
+    generated.write_text("console.log('generated artifact');\n", encoding="utf-8")
+
+    response = client.post(
+        "/workspace-index/scan",
+        json={"roots": [str(workspace)], "task_id": "task-123", "max_files": 20},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["indexed"] == 5
+    entries = {Path(entry["path"]).name: entry for entry in body["entries"]}
+    assert entries["app.py"]["kind"] == "source"
+    assert entries["readme.md"]["kind"] == "doc"
+    assert entries["bundle.js"]["kind"] == "generated"
+    assert entries["image.bin"]["hash"] is None
+    assert "content skipped" in entries["image.bin"]["summary"]
+    assert entries["huge.txt"]["hash"] is None
+    assert entries["app.py"]["last_seen_task_id"] == "task-123"
+
+    index_response = client.get("/workspace-index", params={"q": "local index", "limit": 10})
+    assert index_response.status_code == 200
+    index_body = index_response.json()
+    assert any(Path(entry["path"]).name == "readme.md" for entry in index_body["entries"])
+    assert "workspace" in index_body["context"].lower()
+
+
+def test_workspace_index_context_is_injected_into_system_prompt(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    note = workspace / "plan.md"
+    note.write_text("# Build plan\nIndex files and generated artifacts.\n", encoding="utf-8")
+    asyncio.run(server.scan_workspace_index([str(workspace)], task_id="task-context", max_files=10))
+
+    request = server.ChatRequest(messages=[server.ChatMessage(role="user", content="What is in the build plan?")])
+    prompt = server.build_system_prompt(request)
+
+    assert "WORKSPACE INDEX CONTEXT:" in prompt
+    assert "plan.md" in prompt
+    assert "task=task-context" in prompt
 def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monkeypatch):
     client = make_client(tmp_path, monkeypatch)
     tool_path = tmp_path / "tools" / "flaky_tool.py"
