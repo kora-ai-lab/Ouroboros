@@ -123,11 +123,107 @@ def test_register_tool_validates_and_persists(tmp_path, monkeypatch):
         description="Echo JSON input",
         parameters_schema={"type": "object"},
         filepath="tools/echo_tool.py",
+        test_plan="Echo stdin JSON for smoke validation.",
+        sample_arguments={"message": "hello"},
     )
-    assert entry["registered"] == "echo_tool"
+    assert entry == {
+        "registered": "echo_tool",
+        "version": "1.0.0",
+        "permanent": True,
+        "trusted": False,
+    }
     registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
-    assert any(tool["name"] == "echo_tool" for tool in registry["tools"])
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "echo_tool")
+    assert tool["last_test_status"] == "pending"
+    assert tool["trusted"] is False
+    assert tool["use_count"] == 0
 
+
+def test_register_tool_requires_test_evidence(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "untested_tool.py"
+    tool_path.write_text("print('untested')\n", encoding="utf-8")
+
+    entry = server.register_tool(
+        name="untested_tool",
+        description="No test metadata",
+        parameters_schema={"type": "object"},
+        filepath="tools/untested_tool.py",
+    )
+
+    assert "test_command, test_plan, or sample_arguments" in entry["error"]
+
+
+def test_validate_registered_tool_updates_status_and_use_count(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "adder_tool.py"
+    tool_path.write_text(
+        "import json, sys\n"
+        "payload = json.loads(sys.stdin.read() or '{}')\n"
+        "print(payload['a'] + payload['b'])\n",
+        encoding="utf-8",
+    )
+    server.register_tool(
+        name="adder_tool",
+        description="Add two numbers",
+        parameters_schema={"type": "object"},
+        filepath="tools/adder_tool.py",
+        version="1.0.0",
+        source_task_id="task-123",
+        test_command="python nucleus/tools/adder_tool.py < sample.json",
+        sample_arguments={"a": 1, "b": 2},
+    )
+
+    validation = server.validate_registered_tool("adder_tool")
+
+    assert validation["validated"] is True
+    assert validation["result"]["stdout"].strip() == "3"
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    tool = next(tool for tool in registry["tools"] if tool["name"] == "adder_tool")
+    assert tool["trusted"] is True
+    assert tool["last_test_status"] == "passed"
+    assert tool["last_error"] is None
+
+    result = server.run_registered_tool(tool, {"a": 2, "b": 5})
+    assert result["stdout"].strip() == "7"
+    update = server.update_registered_tool_status(
+        "adder_tool",
+        "1.0.0",
+        last_test_status="passed",
+        increment_use_count=True,
+    )
+    assert update["tool"]["use_count"] == 1
+
+
+def test_register_tool_preserves_older_versions(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "versioned_tool.py"
+    tool_path.write_text("print('ok')\n", encoding="utf-8")
+
+    first = server.register_tool(
+        name="versioned_tool",
+        description="First version",
+        parameters_schema={"type": "object"},
+        filepath="tools/versioned_tool.py",
+        version="1.0.0",
+        test_plan="Smoke test v1.",
+    )
+    second = server.register_tool(
+        name="versioned_tool",
+        description="Second version",
+        parameters_schema={"type": "object"},
+        filepath="tools/versioned_tool.py",
+        version="1.1.0",
+        test_plan="Smoke test v2.",
+    )
+
+    assert first["version"] == "1.0.0"
+    assert second["version"] == "1.1.0"
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    versions = [tool for tool in registry["tools"] if tool["name"] == "versioned_tool"]
+    assert [tool["version"] for tool in versions] == ["1.0.0", "1.1.0"]
+    assert versions[1]["supersedes"] == "1.0.0"
+    assert server.find_tool("versioned_tool")["version"] == "1.1.0"
 
 def test_retrieve_relevant_memory(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
