@@ -2815,6 +2815,29 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         conversation.extend(sanitized_messages)
         public_messages = sanitized_messages.copy()
         yield sse("meta", {"session_id": session_id, "model": request.model})
+        yield sse(
+            "task_started",
+            {
+                "session_id": session_id,
+                "model": request.model,
+                "provider": request.provider or load_settings().get("default_provider", "pollinations"),
+            },
+        )
+        yield sse(
+            "task_plan",
+            {
+                "steps": [
+                    "Prepare conversation context",
+                    "Stream assistant response",
+                    "Evaluate requested tool calls",
+                    "Run compatible tools when needed",
+                    "Return final answer",
+                ],
+                "max_attempts": 4,
+            },
+        )
+        try:
+            for attempt in range(1, 5):
         repair_attempts_by_tool: dict[str, int] = {}
         try:
             max_repair_attempts = tool_repair_max_attempts()
@@ -2835,12 +2858,39 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 
                 # Auto-compaction / Pruning before calling model
                 active_conversation = prune_conversation(conversation)
+                yield sse(
+                    "task_step",
+                    {
+                        "attempt": attempt,
+                        "step": "assistant_response",
+                        "provider": provider,
+                        "model": model,
+                    },
+                )
                 
                 async for token in app.state.model_adapter.complete(active_conversation, model, provider):
                     text += token
                     yield sse("delta", {"content": token})
                 display_text = strip_tool_calls(text).strip()
                 calls = extract_tool_calls(text)
+                yield sse(
+                    "task_observation",
+                    {
+                        "attempt": attempt,
+                        "observation": "assistant_response_received",
+                        "content_length": len(text),
+                        "tool_call_count": len(calls),
+                    },
+                )
+                if not calls and is_capability_refusal(text):
+                    yield sse(
+                        "task_retry",
+                        {
+                            "attempt": attempt,
+                            "reason": "capability_refusal",
+                            "next_step": "self_evolution_retry",
+                        },
+                    )
                 if not task_state.steps:
                     task_state.add_plan(display_text or text)
                     save_task_state(task_state, DATA_DIR)
@@ -2858,18 +2908,36 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     yield sse("assistant_replace", {"content": display_text})
                 conversation.append({"role": "assistant", "content": text})
                 public_messages.append({"role": "assistant", "content": display_text or text})
+                yield sse(
+                    "task_evaluation",
+                    {
+                        "attempt": attempt,
+                        "status": "tool_calls_requested" if calls else "complete",
+                        "tool_call_count": len(calls),
+                    },
+                )
                 if not calls:
                     task_state.done = True
                     task_state.artifacts["final_answer"] = display_text or text
                     save_task_state(task_state, DATA_DIR)
                     yield emit_task_phase("final", {"answer": display_text or text})
                     break
+                for step_number, call in enumerate(calls, start=1):
                 yield emit_task_phase("act", {"tool_call_count": len(calls)})
                 for call in calls:
                     tool_name = str(call["name"])
                     arguments = call.get("arguments", {})
                     if not isinstance(arguments, dict):
                         arguments = {}
+                    yield sse(
+                        "task_step",
+                        {
+                            "attempt": attempt,
+                            "step": "tool_execution",
+                            "step_number": step_number,
+                            "tool_name": tool_name,
+                        },
+                    )
                     step = task_state.add_step(tool_name, arguments)
                     save_task_state(task_state, DATA_DIR)
                     yield emit_task_phase("act", {"step": step})
@@ -2883,6 +2951,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             observation = task_state.add_observation(step, result, False)
                             save_task_state(task_state, DATA_DIR)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield sse(
+                                "task_observation",
+                                {
+                                    "attempt": attempt,
+                                    "observation": "tool_blocked",
+                                    "tool_name": tool_name,
+                                    "result": result,
+                                },
+                            )
                             yield emit_task_phase("observe", {"observation": observation})
                             conversation.append({"role": "tool", "content": json.dumps(result)})
                             evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
@@ -2948,6 +3025,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             observation = task_state.add_observation(step, result, False)
                             save_task_state(task_state, DATA_DIR)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield sse(
+                                "task_observation",
+                                {
+                                    "attempt": attempt,
+                                    "observation": "tool_rejected",
+                                    "tool_name": tool_name,
+                                    "result": result,
+                                },
+                            )
                             yield emit_task_phase("observe", {"observation": observation})
                             
                             result_str = json.dumps(result)
@@ -2993,6 +3079,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     observation = task_state.add_observation(step, result, True)
                     save_task_state(task_state, DATA_DIR)
                     yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
+                    yield sse(
+                        "task_observation",
+                        {
+                            "attempt": attempt,
+                            "observation": "tool_result_received",
+                            "tool_name": tool_name,
+                            "result": result,
+                        },
+                    )
                     yield emit_task_phase("observe", {"observation": observation})
                     
                     # Cap result for conversation history to avoid 400 errors
@@ -3000,6 +3095,17 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
+                    yield sse(
+                        "task_checkpoint",
+                        {
+                            "attempt": attempt,
+                            "checkpoint": "tool_result_added_to_context",
+                            "tool_name": tool_name,
+                        },
+                    )
+            # Remove the automatic summary call from stream, frontend will call /memory/save
+            yield sse("task_done", {"session_id": session_id, "status": "complete"})
+            yield sse("done", {"session_id": session_id})
 
                     if tool is not None and not tool.get("builtin") and registered_tool_failed(result, tool):
                         attempt_number = repair_attempts_by_tool.get(tool_name, 0) + 1
