@@ -341,11 +341,109 @@ def test_register_tool_preserves_older_versions(tmp_path, monkeypatch):
 
     assert first["version"] == "1.0.0"
     assert second["version"] == "1.1.0"
+    server.update_registered_tool_status("versioned_tool", "1.0.0", trusted=True, last_test_status="passed")
+    server.update_registered_tool_status("versioned_tool", "1.1.0", trusted=True, last_test_status="passed")
     registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
     versions = [tool for tool in registry["tools"] if tool["name"] == "versioned_tool"]
     assert [tool["version"] for tool in versions] == ["1.0.0", "1.1.0"]
     assert versions[1]["supersedes"] == "1.0.0"
     assert server.find_tool("versioned_tool")["version"] == "1.1.0"
+
+def test_find_tool_keeps_trusted_old_version_when_new_version_fails(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "versioned_tool.py"
+    tool_path.write_text("print('ok')\n", encoding="utf-8")
+
+    server.register_tool(
+        name="safe_versioned_tool",
+        description="Stable version",
+        parameters_schema={"type": "object"},
+        filepath="tools/versioned_tool.py",
+        version="1.0.0",
+        test_plan="Stable smoke test.",
+        source_task_id="task-old",
+    )
+    server.update_registered_tool_status("safe_versioned_tool", "1.0.0", trusted=True, last_test_status="passed")
+    server.register_tool(
+        name="safe_versioned_tool",
+        description="Broken candidate",
+        parameters_schema={"type": "object"},
+        filepath="tools/versioned_tool.py",
+        version="1.1.0",
+        test_plan="Candidate smoke test.",
+        eval_score=0.1,
+    )
+    server.update_registered_tool_status(
+        "safe_versioned_tool",
+        "1.1.0",
+        trusted=False,
+        last_test_status="failed",
+        last_error="candidate failed",
+    )
+
+    assert server.find_tool("safe_versioned_tool")["version"] == "1.0.0"
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    versions = {tool["version"]: tool for tool in registry["tools"] if tool["name"] == "safe_versioned_tool"}
+    assert set(versions) == {"1.0.0", "1.1.0"}
+    assert versions["1.0.0"]["created_by_task_id"] == "task-old"
+    assert versions["1.1.0"]["eval_score"] == 0.1
+    assert versions["1.1.0"]["trusted"] is False
+
+
+def test_rollback_tool_version_restores_prior_trusted_version(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "rollback_tool.py"
+    tool_path.write_text("print('ok')\n", encoding="utf-8")
+
+    for version in ("1.0.0", "1.1.0"):
+        server.register_tool(
+            name="rollback_tool",
+            description=f"Version {version}",
+            parameters_schema={"type": "object"},
+            filepath="tools/rollback_tool.py",
+            version=version,
+            test_plan=f"Smoke test {version}.",
+        )
+        server.update_registered_tool_status("rollback_tool", version, trusted=True, last_test_status="passed")
+
+    assert server.find_tool("rollback_tool")["version"] == "1.1.0"
+    rollback = server.rollback_tool_version("rollback_tool", "1.0.0")
+
+    assert rollback["rolled_back"] == "rollback_tool"
+    assert server.find_tool("rollback_tool")["version"] == "1.0.0"
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    versions = {tool["version"]: tool for tool in registry["tools"] if tool["name"] == "rollback_tool"}
+    assert versions["1.0.0"]["trusted"] is True
+    assert versions["1.0.0"]["deprecated"] is False
+    assert versions["1.1.0"]["trusted"] is False
+    assert versions["1.1.0"]["deprecated"] is True
+    assert versions["1.1.0"]["rollback_to"] == "1.0.0"
+
+
+def test_deprecate_tool_version_excludes_version_from_selection(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    tool_path = tmp_path / "tools" / "deprecate_tool.py"
+    tool_path.write_text("print('ok')\n", encoding="utf-8")
+
+    for version in ("1.0.0", "1.1.0"):
+        server.register_tool(
+            name="deprecate_tool",
+            description=f"Version {version}",
+            parameters_schema={"type": "object"},
+            filepath="tools/deprecate_tool.py",
+            version=version,
+            test_plan=f"Smoke test {version}.",
+        )
+        server.update_registered_tool_status("deprecate_tool", version, trusted=True, last_test_status="passed")
+
+    result = server.deprecate_tool_version("deprecate_tool", "1.1.0", "regression")
+
+    assert result["deprecated"] == "deprecate_tool"
+    assert server.find_tool("deprecate_tool")["version"] == "1.0.0"
+    deprecated = server.find_tool_version("deprecate_tool", "1.1.0")
+    assert deprecated["deprecated"] is True
+    assert deprecated["deprecation_reason"] == "regression"
+
 
 def test_retrieve_relevant_memory(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
@@ -824,13 +922,15 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         description="Return the provided value as JSON.",
         parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         filepath="tools/flaky_tool.py",
+        test_plan="Exercise repair flow with a deliberately failing tool.",
     )
     assert registered["registered"] == "flaky_tool"
+    server.update_registered_tool_status("flaky_tool", "1.0.0", trusted=True, last_test_status="passed")
 
     patch_code = "\n".join(
         [
             "from pathlib import Path",
-            "Path('tools/flaky_tool.py').write_text(\"import json, sys\\nargs = json.loads(sys.stdin.read() or '{}')\\nprint(json.dumps({'status': 'ok', 'value': args.get('value')}))\\n\", encoding='utf-8')",
+            "Path('tools/flaky_tool.py').write_text(" + repr("import json, sys\\nargs = json.loads(sys.stdin.read() or '{}')\\nprint(json.dumps({'status': 'ok', 'value': args.get('value')}))\\n") + ", encoding='utf-8')",
         ]
     )
     adapter = SequenceAdapter(
@@ -847,6 +947,32 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         "/chat",
         json={
             "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
+            "model": "openai-fast",
+            "provider": "pollinations",
+            "context_files": [],
+            "auto_approve": True,
+            "max_task_steps": 6,
+        },
+    )
+
+    assert response.status_code == 200
+    assert "event: tool_repair" in response.text
+    assert "nonzero_exit" in response.text
+    assert "second-run" in response.text
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
+    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
+
+    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
+    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
+    attempts = flaky["metadata"]["repair_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["failure"]["type"] == "nonzero_exit"
+
+    repaired = server.run_registered_tool(flaky, {"value": "direct"})
+    assert repaired["exit_code"] == 0
+    assert json.loads(repaired["stdout"])["value"] == "direct"
+
 
 def _run_git(repo: Path, *args: str) -> None:
     import subprocess
@@ -954,24 +1080,6 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     )
 
     assert response.status_code == 200
-    assert "event: tool_repair" in response.text
-    assert "nonzero_exit" in response.text
-    assert "The repaired tool succeeded." in response.text
-    assert "second-run" in response.text
-    assert len(adapter.calls) == 4
-    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
-    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
-    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
-
-    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
-    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
-    attempts = flaky["metadata"]["repair_attempts"]
-    assert len(attempts) == 1
-    assert attempts[0]["failure"]["type"] == "nonzero_exit"
-
-    repaired = server.run_registered_tool(flaky, {"value": "direct"})
-    assert repaired["exit_code"] == 0
-    assert json.loads(repaired["stdout"])["value"] == "direct"
     assert "event: task_plan" in response.text
     assert "event: task_step" in response.text
     assert "event: task_observation" in response.text

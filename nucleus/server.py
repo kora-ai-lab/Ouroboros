@@ -645,8 +645,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
-    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
-    for path in (DATA_DIR, ARCHIVE_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -776,13 +775,13 @@ def load_registry() -> dict[str, Any]:
     registry = load_json(REGISTRY_PATH, DEFAULT_REGISTRY)
     if "tools" not in registry or not isinstance(registry["tools"], list):
         raise HTTPException(status_code=500, detail="registry.json is invalid")
-    existing_names = {tool.get("name") for tool in registry["tools"] if isinstance(tool, dict)}
+    normalized_tools = [normalize_registry_entry(tool) for tool in registry["tools"] if isinstance(tool, dict)]
+    existing_names = {tool.get("name") for tool in normalized_tools}
     missing_builtins = [
-        tool for tool in DEFAULT_REGISTRY["tools"]
+        normalize_registry_entry(tool) for tool in DEFAULT_REGISTRY["tools"]
         if tool.get("builtin") and tool.get("name") not in existing_names
     ]
-    if missing_builtins:
-        registry["tools"] = registry["tools"] + missing_builtins
+    registry["tools"] = normalized_tools + missing_builtins
     return registry
 
 
@@ -882,7 +881,10 @@ def parse_version_key(version: Any) -> tuple[int, ...]:
 
 
 def find_tool(name: str) -> dict[str, Any] | None:
-    matches = [tool for tool in load_registry()["tools"] if tool.get("name") == name]
+    matches = [
+        tool for tool in load_registry()["tools"]
+        if tool.get("name") == name and tool.get("trusted") is True and not tool.get("deprecated", False)
+    ]
     if not matches:
         return None
     return sorted(
@@ -898,7 +900,12 @@ def find_tool_version(name: str, version: str | None = None) -> dict[str, Any] |
             if str(tool.get("version", "")) == str(version):
                 return tool
         return None
-    return find_tool(name)
+    if not matches:
+        return None
+    return sorted(
+        matches,
+        key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
+    )[-1]
 
 
 def tool_repair_max_attempts() -> int:
@@ -911,43 +918,29 @@ def tool_repair_max_attempts() -> int:
         return DEFAULT_TOOL_REPAIR_MAX_ATTEMPTS
 
 
-def load_tool_metadata(tool: dict[str, Any]) -> dict[str, Any]:
-    metadata = tool.get("metadata")
-    return metadata if isinstance(metadata, dict) else {}
+def load_tool_metadata(source: dict[str, Any] | Path) -> dict[str, Any]:
+    if isinstance(source, dict):
+        metadata = source.get("metadata")
+        return metadata if isinstance(metadata, dict) else {}
 
+    metadata_path = source / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"metadata.json is invalid JSON: {exc.msg}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata.json must contain a JSON object.")
+    version = metadata.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("metadata.json must include a non-empty string version.")
+    deprecated = metadata.get("deprecated", False)
+    if not isinstance(deprecated, bool):
+        raise ValueError("metadata.json deprecated must be a boolean when present.")
+    deprecation_reason = metadata.get("deprecation_reason", "")
+    if deprecation_reason is not None and not isinstance(deprecation_reason, str):
+        raise ValueError("metadata.json deprecation_reason must be a string when present.")
+    return metadata
 
-def save_tool_metadata(tool_name: str, metadata: dict[str, Any]) -> None:
-    registry = load_registry()
-    updated = False
-    for entry in registry["tools"]:
-        if entry.get("name") == tool_name:
-            entry["metadata"] = metadata
-            updated = True
-            break
-    if updated:
-        save_json(REGISTRY_PATH, registry)
-
-
-def append_tool_repair_attempt(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
-    metadata = dict(load_tool_metadata(tool))
-    attempts = metadata.get("repair_attempts")
-    if not isinstance(attempts, list):
-        attempts = []
-    failure = classify_registered_tool_failure(result, tool)
-    attempts.append(
-        {
-            "timestamp": now_iso(),
-            "arguments": arguments,
-            "failure": failure,
-            "result": result,
-        }
-    )
-    metadata["repair_attempts"] = attempts
-    metadata["last_repair_attempt_at"] = attempts[-1]["timestamp"]
-    metadata["repair_attempt_count"] = len(attempts)
-    save_tool_metadata(str(tool.get("name", "")), metadata)
-    tool["metadata"] = metadata
-    return attempts[-1]
 
 
 def load_kora_context() -> str:
@@ -1409,26 +1402,6 @@ def resolve_tool_path(filepath: str) -> Path:
     return candidate
 
 
-def load_tool_metadata(package_dir: Path) -> dict[str, Any]:
-    metadata_path = package_dir / "metadata.json"
-    try:
-        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"metadata.json is invalid JSON: {exc.msg}") from exc
-    if not isinstance(metadata, dict):
-        raise ValueError("metadata.json must contain a JSON object.")
-    version = metadata.get("version")
-    if not isinstance(version, str) or not version.strip():
-        raise ValueError("metadata.json must include a non-empty string version.")
-    deprecated = metadata.get("deprecated", False)
-    if not isinstance(deprecated, bool):
-        raise ValueError("metadata.json deprecated must be a boolean when present.")
-    deprecation_reason = metadata.get("deprecation_reason", "")
-    if deprecation_reason is not None and not isinstance(deprecation_reason, str):
-        raise ValueError("metadata.json deprecation_reason must be a string when present.")
-    return metadata
-
-
 def validate_json_schema(schema: dict[str, Any]) -> None:
     if not isinstance(schema, dict):
         raise ValueError("schema.json must contain a JSON object.")
@@ -1839,7 +1812,11 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": manual_approval_required,
         }
+        if "filesystem write or mutation" in unique_reasons:
+            response["checkpoint"] = filesystem_checkpoint_metadata(code)
+        return response
     return {
         "action": "allow",
         "sandbox_tier": "read_only",
@@ -1848,14 +1825,8 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         "affected_paths": unique_paths,
         "network_risk": network_risk,
         "process_risk": process_risk,
+        "manual_approval_required": False,
     }
-            "manual_approval_required": manual_approval_required,
-        }
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
-        if "filesystem write or mutation" in unique_reasons:
-            response["checkpoint"] = filesystem_checkpoint_metadata(code)
-        return response
-    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
 
 
 async def execute_python(code: str, policy_approved: bool = False) -> dict[str, Any]:
@@ -1940,16 +1911,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
-    filepath = tool.get("filepath")
-    if not filepath:
-        raise ValueError(f"Tool {tool.get('name')} has no filepath.")
-    path = resolve_tool_path(filepath)
-    try:
         completed = subprocess.run(
             [sys.executable, str(path)],
             cwd=ROOT_DIR,
@@ -1961,10 +1922,6 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             check=False,
         )
         result = {
-            timeout=120,
-            check=False,
-        )
-        return {
             "stdout": completed.stdout[-100_000:],
             "stderr": completed.stderr[-100_000:],
             "exit_code": completed.returncode,
@@ -1995,6 +1952,37 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         }
 
 
+def save_tool_metadata(tool_name: str, metadata: dict[str, Any]) -> None:
+    registry = load_registry()
+    for entry in registry["tools"]:
+        if entry.get("name") == tool_name:
+            entry["metadata"] = metadata
+            entry["updated_at"] = now_iso()
+            save_json(REGISTRY_PATH, registry)
+            return
+
+
+def append_tool_repair_attempt(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(load_tool_metadata(tool))
+    attempts = metadata.get("repair_attempts")
+    if not isinstance(attempts, list):
+        attempts = []
+    failure = classify_registered_tool_failure(result, tool)
+    attempt = {
+        "timestamp": now_iso(),
+        "arguments": arguments,
+        "failure": failure,
+        "result": result,
+    }
+    attempts.append(attempt)
+    metadata["repair_attempts"] = attempts
+    metadata["last_repair_attempt_at"] = attempt["timestamp"]
+    metadata["repair_attempt_count"] = len(attempts)
+    save_tool_metadata(str(tool.get("name", "")), metadata)
+    tool["metadata"] = metadata
+    return attempt
+
+
 def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any] | None = None) -> dict[str, Any] | None:
     if result.get("timed_out"):
         return {"type": "timeout", "message": str(result.get("error") or result.get("stderr") or "Tool timed out.")}
@@ -2019,21 +2007,31 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
     metadata = load_tool_metadata(tool)
     failure = classify_registered_tool_failure(result, tool) or {"type": "unknown", "message": "Tool failed."}
     payload = {
-        "tool": {key: tool.get(key) for key in ("name", "description", "filepath", "parameters", "requires_approval")},
+        "tool": {key: tool.get(key) for key in ("name", "description", "filepath", "parameters", "requires_approval", "version")},
         "metadata": metadata,
         "arguments": arguments,
         "failure": failure,
         "result": result,
         "attempt_number": attempt_number,
         "max_attempts": max_attempts,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
-            "stderr": "Timed out after 120s",
-            "exit_code": -1,
-            "timed_out": True,
-        }
+    }
+    return textwrap.dedent(
+        f"""
+        A registered tool failed. Repair it before continuing.
+
+        Generic repair instruction:
+        1. Inspect the tool file and its registry metadata.
+        2. Patch the tool using execute_python.
+        3. Test the patched tool with the failing arguments.
+        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
+        5. Then retry the original tool call or continue with the user's request.
+
+        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+
+        Failure context JSON:
+        {json.dumps(payload, indent=2)}
+        """
+    ).strip()
 
 
 def update_registered_tool_status(
@@ -2111,23 +2109,72 @@ def validate_registered_tool(
         "result": result,
         "tool": status.get("tool"),
     }
-    return textwrap.dedent(
-        f"""
-        A registered tool failed. Repair it before continuing.
+def registry_entry_defaults() -> dict[str, Any]:
+    return {
+        "version": "1.0.0",
+        "supersedes": None,
+        "created_by_task_id": None,
+        "eval_score": None,
+        "rollback_to": None,
+        "deprecation_reason": "",
+        "deprecated": False,
+    }
 
-        Generic repair instruction:
-        1. Inspect the tool file and its registry metadata.
-        2. Patch the tool using execute_python.
-        3. Test the patched tool with the failing arguments.
-        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
-        5. Then retry the original tool call or continue with the user's request.
 
-        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
+def normalize_registry_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(registry_entry_defaults())
+    normalized.update(entry)
+    if normalized.get("created_by_task_id") is None and normalized.get("source_task_id") is not None:
+        normalized["created_by_task_id"] = normalized.get("source_task_id")
+    normalized["deprecated"] = bool(normalized.get("deprecated", False))
+    normalized["deprecation_reason"] = str(normalized.get("deprecation_reason") or "")
+    if normalized.get("builtin") and "trusted" not in entry:
+        normalized["trusted"] = True
+    return normalized
 
-        Failure context JSON:
-        {json.dumps(payload, indent=2)}
-        """
-    ).strip()
+
+def deprecate_tool_version(name: str, version: str, reason: str) -> dict[str, Any]:
+    registry = load_registry()
+    for tool in registry["tools"]:
+        if tool.get("name") == name and str(tool.get("version", "")) == str(version):
+            tool["deprecated"] = True
+            tool["deprecation_reason"] = reason
+            tool["trusted"] = False
+            tool["updated_at"] = now_iso()
+            save_json(REGISTRY_PATH, registry)
+            return {"deprecated": name, "version": str(version), "reason": reason}
+    return {"error": f"Tool {name} version {version} not found."}
+
+
+def rollback_tool_version(name: str, target_version: str) -> dict[str, Any]:
+    registry = load_registry()
+    target: dict[str, Any] | None = None
+    for tool in registry["tools"]:
+        if tool.get("name") == name and str(tool.get("version", "")) == str(target_version):
+            target = tool
+            break
+    if target is None:
+        return {"error": f"Tool {name} version {target_version} not found."}
+
+    timestamp = now_iso()
+    target["trusted"] = True
+    target["deprecated"] = False
+    target["deprecation_reason"] = ""
+    target["rollback_to"] = None
+    target["updated_at"] = timestamp
+
+    for tool in registry["tools"]:
+        if tool is target or tool.get("name") != name:
+            continue
+        if parse_version_key(tool.get("version")) > parse_version_key(target_version):
+            tool["trusted"] = False
+            tool["deprecated"] = True
+            tool["rollback_to"] = str(target_version)
+            tool["deprecation_reason"] = f"Rolled back to {target_version}."
+            tool["updated_at"] = timestamp
+
+    save_json(REGISTRY_PATH, registry)
+    return {"rolled_back": name, "version": str(target_version), "tool": target}
 
 
 def register_tool(
@@ -2142,44 +2189,40 @@ def register_tool(
     test_plan: str | None = None,
     sample_arguments: dict[str, Any] | None = None,
     supersedes: str | None = None,
+    created_by_task_id: str | None = None,
+    eval_score: float | None = None,
 ) -> dict[str, Any]:
-    validate_tool_name(name)
     try:
+        validate_tool_name(name)
         path = resolve_tool_candidate(filepath)
         package_info: dict[str, Any] | None = None
-        metadata: dict[str, Any] = {"version": "0.0.0", "deprecated": False, "deprecation_reason": ""}
+        metadata: dict[str, Any] = {}
         entry_filepath = str(Path(filepath))
 
         if path.is_dir():
             package_info = load_tool_package(path)
             parameters = package_info["schema"]
             metadata = package_info["metadata"]
-            entry_filepath = str(Path(filepath))
+            version = str(metadata.get("version", version))
+            test_plan = test_plan or "Skill package tests.py passed before registration."
         else:
             if path.suffix.lower() != ".py":
                 raise ValueError("Legacy tool registrations must point to a Python file.")
-            parameters = parameters_schema or {"type": "object"}
+            if not isinstance(parameters_schema, dict):
+                return {"error": "parameters_schema must be an object."}
+            parameters = parameters_schema
             validate_json_schema(parameters)
     except ValueError as exc:
         return {"error": str(exc)}
 
-        path = resolve_tool_path(filepath)
-    except ValueError as exc:
-        return {"error": str(exc)}
-
-    if not isinstance(parameters_schema, dict):
-        return {"error": "parameters_schema must be an object."}
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
-    if not any([test_command, test_plan, sample_arguments is not None]):
+    if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
         return {
             "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
         }
 
     registry = load_registry()
-    existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
-    metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
-    metadata.setdefault("repair_attempts", [])
     existing_versions = [
         tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
     ]
@@ -2193,38 +2236,20 @@ def register_tool(
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
-    entry = {
+    effective_task_id = created_by_task_id if created_by_task_id is not None else source_task_id
+    entry = normalize_registry_entry({
         "name": name,
         "description": description,
         "parameters": parameters,
         "filepath": entry_filepath,
         "builtin": False,
         "requires_approval": bool(requires_approval),
-        "version": str(metadata.get("version", "0.0.0")),
-        "deprecated": bool(metadata.get("deprecated", False)),
-        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
-    }
-    if path.is_dir():
-        entry["package"] = True
-        entry["package_dir"] = entry_filepath
-    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
-    registry["tools"].append(entry)
-    save_json(REGISTRY_PATH, registry)
-    result = {"registered": name, "permanent": True}
-    if package_info is not None:
-        result["package"] = True
-        result["version"] = entry["version"]
-        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
-    return result
-        "parameters": parameters_schema,
-        "filepath": str(path.relative_to(BASE_DIR)),
-        "builtin": False,
-        "requires_approval": bool(requires_approval),
-        "metadata": metadata,
+        "metadata": {"repair_attempts": [], **metadata},
         "version": str(version),
         "created_at": timestamp,
         "updated_at": timestamp,
         "source_task_id": source_task_id,
+        "created_by_task_id": effective_task_id,
         "test_command": test_command,
         "test_plan": test_plan,
         "sample_arguments": sample_arguments or {},
@@ -2233,10 +2258,22 @@ def register_tool(
         "use_count": 0,
         "supersedes": supersedes,
         "trusted": False,
-    }
+        "eval_score": eval_score,
+        "rollback_to": None,
+        "deprecated": bool(metadata.get("deprecated", False)),
+        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
+    })
+    if path.is_dir():
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
+    if package_info is not None:
+        result["package"] = True
+        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
+    return result
 
 
 def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
@@ -2816,10 +2853,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         public_messages = sanitized_messages.copy()
         yield sse("meta", {"session_id": session_id, "model": request.model})
         repair_attempts_by_tool: dict[str, int] = {}
-        try:
-            max_repair_attempts = tool_repair_max_attempts()
-            max_model_turns = 4 + (max_repair_attempts * 2)
-            for _ in range(max_model_turns):
+        max_repair_attempts = tool_repair_max_attempts()
         yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
         yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
         try:
@@ -3023,13 +3057,12 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             "last_result": result,
                         }
                         conversation.append({"role": "tool", "content": json.dumps(result)})
-                else:
-                    continue
-                continue
-                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
-                    yield sse("evaluation", evaluation)
-                    if evaluation["decision"] == "final":
-                        break
+                evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                yield sse("evaluation", evaluation)
+                if evaluation["decision"] == "final":
+                    conversation.append({"role": "system", "content": "Evaluation decision: final. Provide the final answer now."})
+                elif evaluation["decision"] == "retry":
+                    conversation.append({"role": "system", "content": "Evaluation decision: retry. Retry or adjust the previous action."})
                 yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
             if not task_state.done:
                 task_state.failure_count += 1
