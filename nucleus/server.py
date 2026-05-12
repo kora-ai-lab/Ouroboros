@@ -16,12 +16,15 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Sequence
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+import checkpoints
+from agent_loop import TaskState, load_task_state, save_task_state, task_event_name
 
 
 @asynccontextmanager
@@ -41,6 +44,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ROOT_DIR = BASE_DIR.parent
 DATA_DIR = BASE_DIR / "data"
 ARCHIVE_DIR = DATA_DIR / "archive"
+CHECKPOINTS_DIR = DATA_DIR / "checkpoints"
 TOOLS_DIR = BASE_DIR / "tools"
 KORA_DIR = BASE_DIR / "kora"
 REGISTRY_PATH = BASE_DIR / "registry.json"
@@ -51,6 +55,8 @@ ENV_PATHS = [ROOT_DIR / ".env", BASE_DIR / ".env"]
 POLLINATIONS_BASE_URL = "https://gen.pollinations.ai/v1"
 LLAMA_CACHE: dict[str, Any] = {}
 MODEL_FILE_EXTENSIONS = {".gguf", ".bin", ".safetensors", ".pt", ".pth"}
+EVALUATION_DECISIONS = {"continue", "retry", "register_tool", "rollback", "final"}
+
 MODEL_OPTIONS = {
     "pollinations": [
         "openai-fast",
@@ -108,10 +114,29 @@ DEFAULT_REGISTRY = {
             },
             "builtin": True,
             "requires_approval": True,
+            "version": "1.0.0",
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "source_task_id": None,
+            "test_command": None,
+            "test_plan": "Built-in tool covered by application tests.",
+            "sample_arguments": {},
+            "last_test_status": "built_in",
+            "last_error": None,
+            "use_count": 0,
+            "supersedes": None,
+            "trusted": True,
+        },
+        {
+            "name": "rollback_latest_checkpoint",
+            "description": "Restore the latest file mutation checkpoint created before an approved risky Python execution.",
+            "parameters": {"type": "object", "properties": {}},
+            "builtin": True,
+            "requires_approval": True,
         },
         {
             "name": "register_tool",
-            "description": "Permanently register a new tool from a Python file you have already written and tested via execute_python.",
+            "description": "Permanently register a tested Python file as a versioned tool.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -120,11 +145,29 @@ DEFAULT_REGISTRY = {
                     "parameters_schema": {"type": "object"},
                     "filepath": {"type": "string"},
                     "requires_approval": {"type": "boolean"},
+                    "version": {"type": "string", "default": "1.0.0"},
+                    "source_task_id": {"type": "string"},
+                    "test_command": {"type": "string"},
+                    "test_plan": {"type": "string"},
+                    "sample_arguments": {"type": "object"},
+                    "supersedes": {"type": "string"},
                 },
                 "required": ["name", "description", "parameters_schema", "filepath"],
             },
             "builtin": True,
             "requires_approval": False,
+            "version": "1.0.0",
+            "created_at": "2026-05-12T00:00:00+00:00",
+            "updated_at": "2026-05-12T00:00:00+00:00",
+            "source_task_id": None,
+            "test_command": None,
+            "test_plan": "Built-in tool covered by application tests.",
+            "sample_arguments": {},
+            "last_test_status": "built_in",
+            "last_error": None,
+            "use_count": 0,
+            "supersedes": None,
+            "trusted": True,
         },
     ]
 }
@@ -170,9 +213,10 @@ BEHAVIORAL RULES:
 3. Tool-call contract: output exactly `<tool_call>{{"name":"execute_python","arguments":{{"code":"..."}}}}</tool_call>`. Do not use markdown fences for tool calls.
 4. You are direct and strategic. No corporate fluff. No emotional validation. You report facts and actions.
 5. You can modify your own nucleus code (read/write files in the nucleus directory) when approved by policy.
-6. You do not ask for confirmation more than once per action. If the user asked for something, do it.
-7. After a tool result is returned, you MUST respond to it: summarize findings or confirm execution.
-8. For PDFs, the pymupdf library is pre-installed.
+6. For self-modifying repository work, inspect `git status` before edits and again after edits so the user can see the checkpoint state. Use the reusable `nucleus/git_harness.py` helpers through execute_python when useful, or register thin wrappers only when needed.
+7. You do not ask for confirmation more than once per action. If the user asked for something, do it.
+8. After a tool result is returned, you MUST respond to it: summarize findings or confirm execution.
+9. For PDFs, the pymupdf library is pre-installed.
 
 CURRENT REGISTERED TOOLS:
 {tool_registry}
@@ -205,6 +249,8 @@ class ChatRequest(BaseModel):
     provider: str = "pollinations"
     context_files: list[ContextFile] = Field(default_factory=list)
     auto_approve: bool = False
+    task_id: str | None = None
+    max_task_steps: int = 12
 
 
 class ApprovalDecision(BaseModel):
@@ -563,7 +609,8 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
-    for path in (DATA_DIR, ARCHIVE_DIR, TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, TOOLS_DIR, KORA_DIR):
+    for path in (DATA_DIR, ARCHIVE_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
         REGISTRY_PATH.write_text(json.dumps(DEFAULT_REGISTRY, indent=2), encoding="utf-8")
@@ -646,6 +693,18 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS evaluation_decision (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                decision TEXT NOT NULL,
+                rationale TEXT NOT NULL,
+                raw_response TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            )
+            """
+        )
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_keywords ON episodic_memory(keywords)")
         conn.commit()
 
@@ -665,6 +724,13 @@ def load_registry() -> dict[str, Any]:
     registry = load_json(REGISTRY_PATH, DEFAULT_REGISTRY)
     if "tools" not in registry or not isinstance(registry["tools"], list):
         raise HTTPException(status_code=500, detail="registry.json is invalid")
+    existing_names = {tool.get("name") for tool in registry["tools"] if isinstance(tool, dict)}
+    missing_builtins = [
+        tool for tool in DEFAULT_REGISTRY["tools"]
+        if tool.get("builtin") and tool.get("name") not in existing_names
+    ]
+    if missing_builtins:
+        registry["tools"] = registry["tools"] + missing_builtins
     return registry
 
 
@@ -758,11 +824,29 @@ def upsert_provider(update: ProviderUpdate) -> dict[str, Any]:
     return provider_status()
 
 
+def parse_version_key(version: Any) -> tuple[int, ...]:
+    parts = re.findall(r"\d+", str(version or "0"))
+    return tuple(int(part) for part in parts) or (0,)
+
+
 def find_tool(name: str) -> dict[str, Any] | None:
-    for tool in load_registry()["tools"]:
-        if tool.get("name") == name:
-            return tool
-    return None
+    matches = [tool for tool in load_registry()["tools"] if tool.get("name") == name]
+    if not matches:
+        return None
+    return sorted(
+        matches,
+        key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
+    )[-1]
+
+
+def find_tool_version(name: str, version: str | None = None) -> dict[str, Any] | None:
+    matches = [tool for tool in load_registry()["tools"] if tool.get("name") == name]
+    if version is not None:
+        for tool in matches:
+            if str(tool.get("version", "")) == str(version):
+                return tool
+        return None
+    return find_tool(name)
 
 
 def tool_repair_max_attempts() -> int:
@@ -1086,6 +1170,12 @@ NETWORK_IMPORTS = {"socket", "http.client", "httpx", "requests", "urllib", "urll
 BLOCKED_IMPORTS = {"ctypes"}
 DYNAMIC_EXECUTION_CALLS = {"eval", "exec", "compile", "__import__"}
 OS_PROCESS_CALLS = {"system", "popen", "spawnl", "spawnlp", "spawnv", "spawnvp", "execv", "execvp"}
+DESTRUCTIVE_GIT_REASON = "destructive git command requires explicit approval"
+DESTRUCTIVE_GIT_PATTERNS = (
+    re.compile(r"\bgit\s+reset\s+[^\n;&|]*--hard\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+clean\s+[^\n;&|]*(?:-[a-z]*f[a-z]*d|-d[a-z]*f)\b", re.IGNORECASE),
+    re.compile(r"\bgit\s+push\s+[^\n;&|]*(?:--force(?:-with-lease)?\b|-f\b)", re.IGNORECASE),
+)
 
 
 def approved_execution_roots() -> list[Path]:
@@ -1101,8 +1191,66 @@ def path_in_approved_roots(path: Path) -> bool:
     return False
 
 
+def command_text_contains_destructive_git(command_text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", command_text.strip())
+    return any(pattern.search(normalized) for pattern in DESTRUCTIVE_GIT_PATTERNS)
+
+
+def command_parts_contain_destructive_git(parts: Sequence[str]) -> bool:
+    lowered = [part.lower() for part in parts]
+    if "git" not in lowered:
+        return False
+    git_index = lowered.index("git")
+    tail = lowered[git_index + 1 :]
+    if len(tail) >= 2 and tail[0] == "reset" and "--hard" in tail:
+        return True
+    if tail and tail[0] == "clean":
+        return any(part.startswith("-") and "f" in part and "d" in part for part in tail[1:])
+    if tail and tail[0] == "push":
+        return any(part in {"-f", "--force", "--force-with-lease"} or part.startswith("--force=") for part in tail[1:])
+    return False
+def filesystem_checkpoint_metadata(code: str) -> dict[str, Any]:
+    affected_paths = checkpoints.infer_affected_files(code, ROOT_DIR)
+    strategy = "files" if affected_paths else "git_repo" if (ROOT_DIR / ".git").exists() else "none"
+    return {
+        "enabled": strategy != "none",
+        "strategy": strategy,
+        "affected_paths_inferred": bool(affected_paths),
+        "affected_paths": [str(path) for path in affected_paths],
+        "storage_dir": str(CHECKPOINTS_DIR),
+    }
+
+
+def create_filesystem_mutation_checkpoint(code: str, policy: dict[str, Any]) -> dict[str, Any] | None:
+    if "filesystem write or mutation" not in policy.get("reasons", []):
+        return None
+    affected_paths = [Path(path) for path in policy.get("checkpoint", {}).get("affected_paths", [])]
+    checkpoint = checkpoints.create_checkpoint(
+        affected_paths,
+        root_dir=ROOT_DIR,
+        data_dir=DATA_DIR,
+        reason="approved execute_python filesystem mutation",
+        code=code,
+    )
+    return {
+        "id": checkpoint["id"],
+        "created_at": checkpoint["created_at"],
+        "strategy": checkpoint["strategy"],
+        "path_count": checkpoint["path_count"],
+        "storage_dir": str(CHECKPOINTS_DIR),
+    }
+
+
+def rollback_latest_checkpoint() -> dict[str, Any]:
+    return checkpoints.restore_latest_checkpoint(data_dir=DATA_DIR)
+
+
 def summarize_python_execution_policy(code: str) -> dict[str, Any]:
     reasons: list[str] = []
+    manual_approval_required = False
+    if command_text_contains_destructive_git(code):
+        reasons.append(DESTRUCTIVE_GIT_REASON)
+        manual_approval_required = True
     blocked: list[str] = []
     module_aliases: dict[str, str] = {}
     risky_call_aliases: dict[str, str] = {}
@@ -1139,6 +1287,12 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
                             risky_call_aliases[alias.asname or alias.name] = "subprocess/process access"
 
         for node in ast.walk(tree):
+            if isinstance(node, (ast.List, ast.Tuple)):
+                string_parts = [element.value for element in node.elts if isinstance(element, ast.Constant) and isinstance(element.value, str)]
+                if command_parts_contain_destructive_git(string_parts):
+                    reasons.append(DESTRUCTIVE_GIT_REASON)
+                    manual_approval_required = True
+
             if isinstance(node, ast.Call):
                 func_name = ""
                 owner = ""
@@ -1171,6 +1325,9 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
 
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 text = node.value
+                if command_text_contains_destructive_git(text):
+                    reasons.append(DESTRUCTIVE_GIT_REASON)
+                    manual_approval_required = True
                 if text.startswith("~"):
                     reasons.append("home-directory access")
                 path = Path(text)
@@ -1189,11 +1346,16 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
         }
     unique_reasons = sorted(set(reasons))
     if unique_reasons:
-        return {
+        response = {
             "action": "require_approval",
             "risk_summary": "Requires approval: " + "; ".join(unique_reasons) + ".",
             "reasons": unique_reasons,
+            "manual_approval_required": manual_approval_required,
         }
+    return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": [], "manual_approval_required": False}
+        if "filesystem write or mutation" in unique_reasons:
+            response["checkpoint"] = filesystem_checkpoint_metadata(code)
+        return response
     return {"action": "allow", "risk_summary": "Read-only Python execution appears low risk.", "reasons": []}
 
 
@@ -1203,6 +1365,8 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
         return {"error": policy["risk_summary"], "policy": policy, "exit_code": -1, "timed_out": False}
     if policy["action"] == "require_approval" and not policy_approved:
         return {"error": "Python execution requires approval by policy.", "policy": policy, "exit_code": -1, "timed_out": False}
+
+    checkpoint_metadata = create_filesystem_mutation_checkpoint(code, policy) if policy_approved else None
 
     start = time.time()
     proc = await asyncio.create_subprocess_exec(
@@ -1215,25 +1379,31 @@ async def execute_python(code: str, policy_approved: bool = False) -> dict[str, 
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(), timeout=30
         )
-        return {
+        result = {
             "stdout": stdout.decode()[-100_000:],
             "stderr": stderr.decode()[-100_000:],
             "exit_code": proc.returncode,
             "timed_out": False,
             "duration_ms": int((time.time() - start) * 1000)
         }
+        if checkpoint_metadata is not None:
+            result["checkpoint"] = checkpoint_metadata
+        return result
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except OSError:
             pass
-        return {
+        result = {
             "stdout": "",
             "stderr": "Timed out after 30s",
             "exit_code": -1,
             "timed_out": True,
             "duration_ms": int((time.time() - start) * 1000)
         }
+        if checkpoint_metadata is not None:
+            result["checkpoint"] = checkpoint_metadata
+        return result
 
 
 
@@ -1268,6 +1438,16 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
         if not filepath:
             raise ValueError(f"Tool {tool.get('name')} has no filepath.")
         path = resolve_tool_path(filepath)
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
+    filepath = tool.get("filepath")
+    if not filepath:
+        raise ValueError(f"Tool {tool.get('name')} has no filepath.")
+    path = resolve_tool_path(filepath)
+    try:
         completed = subprocess.run(
             [sys.executable, str(path)],
             cwd=ROOT_DIR,
@@ -1279,6 +1459,10 @@ def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict
             check=False,
         )
         result = {
+            timeout=120,
+            check=False,
+        )
+        return {
             "stdout": completed.stdout[-100_000:],
             "stderr": completed.stderr[-100_000:],
             "exit_code": completed.returncode,
@@ -1340,6 +1524,90 @@ def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], r
         "result": result,
         "attempt_number": attempt_number,
         "max_attempts": max_attempts,
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "stdout": (exc.stdout or "")[-100_000:] if isinstance(exc.stdout, str) else "",
+            "stderr": "Timed out after 120s",
+            "exit_code": -1,
+            "timed_out": True,
+        }
+
+
+def update_registered_tool_status(
+    name: str,
+    version: str | None = None,
+    *,
+    last_test_status: str | None = None,
+    last_error: str | None = None,
+    trusted: bool | None = None,
+    increment_use_count: bool = False,
+) -> dict[str, Any]:
+    registry = load_registry()
+    target: dict[str, Any] | None = None
+    for tool in registry["tools"]:
+        if tool.get("name") == name and (version is None or str(tool.get("version", "")) == str(version)):
+            if target is None or parse_version_key(tool.get("version")) >= parse_version_key(target.get("version")):
+                target = tool
+    if target is None:
+        return {"error": f"Tool {name} not found."}
+
+    if last_test_status is not None:
+        target["last_test_status"] = last_test_status
+    if last_error is not None or last_test_status == "passed":
+        target["last_error"] = last_error
+    if trusted is not None:
+        target["trusted"] = trusted
+    if increment_use_count:
+        target["use_count"] = int(target.get("use_count", 0)) + 1
+    target["updated_at"] = now_iso()
+    save_json(REGISTRY_PATH, registry)
+    return {"updated": target["name"], "version": target.get("version"), "tool": target}
+
+
+def validate_registered_tool(
+    name: str,
+    version: str | None = None,
+    sample_arguments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    tool = find_tool_version(name, version)
+    if tool is None:
+        return {"error": f"Tool {name} not found."}
+    if tool.get("builtin"):
+        return {"error": f"Builtin tool {name} cannot be validated as a registered file tool."}
+
+    arguments = sample_arguments if sample_arguments is not None else tool.get("sample_arguments", {})
+    if not isinstance(arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+
+    try:
+        result = run_registered_tool(tool, arguments)
+    except Exception as exc:  # noqa: BLE001 - validation must persist failure details
+        message = str(exc)
+        update_registered_tool_status(
+            name,
+            str(tool.get("version", "")),
+            last_test_status="failed",
+            last_error=message,
+            trusted=False,
+        )
+        return {"validated": False, "error": message}
+
+    passed = result.get("exit_code") == 0 and not result.get("timed_out")
+    error = None if passed else (result.get("stderr") or f"Exited with code {result.get('exit_code')}")
+    status = update_registered_tool_status(
+        name,
+        str(tool.get("version", "")),
+        last_test_status="passed" if passed else "failed",
+        last_error=error,
+        trusted=passed,
+    )
+    return {
+        "validated": passed,
+        "name": name,
+        "version": status.get("version"),
+        "result": result,
+        "tool": status.get("tool"),
     }
     return textwrap.dedent(
         f"""
@@ -1366,39 +1634,78 @@ def register_tool(
     parameters_schema: dict[str, Any],
     filepath: str,
     requires_approval: bool = False,
+    version: str = "1.0.0",
+    source_task_id: str | None = None,
+    test_command: str | None = None,
+    test_plan: str | None = None,
+    sample_arguments: dict[str, Any] | None = None,
+    supersedes: str | None = None,
 ) -> dict[str, Any]:
     validate_tool_name(name)
-    full_path = ROOT_DIR / filepath
-    if not full_path.exists():
+    try:
+        path = resolve_tool_path(filepath)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    if not isinstance(parameters_schema, dict):
+        return {"error": "parameters_schema must be an object."}
+    if sample_arguments is not None and not isinstance(sample_arguments, dict):
+        return {"error": "sample_arguments must be an object."}
+    if not any([test_command, test_plan, sample_arguments is not None]):
         return {
-            "error": f"File not found: {filepath}. Write the file first via execute_python before registering."
+            "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
         }
-    
+
     registry = load_registry()
     existing = next((tool for tool in registry["tools"] if tool.get("name") == name), {})
     metadata = dict(load_tool_metadata(existing)) if existing else {"repair_attempts": []}
     metadata.setdefault("repair_attempts", [])
+    existing_versions = [
+        tool for tool in registry["tools"] if tool.get("name") == name and not tool.get("builtin")
+    ]
+    if any(str(tool.get("version", "")) == str(version) for tool in existing_versions):
+        return {"error": f"Tool {name} version {version} is already registered."}
+    if supersedes is None and existing_versions:
+        previous = sorted(
+            existing_versions,
+            key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
+        )[-1]
+        supersedes = str(previous.get("version", "")) or None
+
+    timestamp = now_iso()
     entry = {
         "name": name,
         "description": description,
         "parameters": parameters_schema,
-        "filepath": str(filepath),
+        "filepath": str(path.relative_to(BASE_DIR)),
         "builtin": False,
         "requires_approval": bool(requires_approval),
         "metadata": metadata,
+        "version": str(version),
+        "created_at": timestamp,
+        "updated_at": timestamp,
+        "source_task_id": source_task_id,
+        "test_command": test_command,
+        "test_plan": test_plan,
+        "sample_arguments": sample_arguments or {},
+        "last_test_status": "pending",
+        "last_error": None,
+        "use_count": 0,
+        "supersedes": supersedes,
+        "trusted": False,
     }
-    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
     registry["tools"].append(entry)
     save_json(REGISTRY_PATH, registry)
-    return {"registered": name, "permanent": True}
+    return {"registered": name, "version": str(version), "permanent": True, "trusted": False}
 
 
-def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> None:
+def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict[str, Any], approved: bool) -> str:
+    execution_id = str(uuid.uuid4())
     with connect_db() as conn:
         conn.execute(
             "INSERT INTO tool_execution (id, tool_name, arguments, result, timestamp, approved) VALUES (?, ?, ?, ?, ?, ?)",
             (
-                str(uuid.uuid4()),
+                execution_id,
                 tool_name,
                 json.dumps(arguments),
                 json.dumps(result),
@@ -1407,6 +1714,88 @@ def store_tool_execution(tool_name: str, arguments: dict[str, Any], result: dict
             ),
         )
         conn.commit()
+    return execution_id
+
+
+def build_evaluation_prompt() -> str:
+    return textwrap.dedent(
+        """
+        Evaluate the immediately preceding result and choose the next step before any final answer is produced.
+        Be generic: judge only whether the result is adequate for the current task, without assuming any specific domain, data source, environment, or artifact type.
+
+        Choose exactly one decision:
+        - continue: proceed because more ordinary work is needed.
+        - retry: repeat or adjust the previous action because the result is missing, invalid, failed, or insufficient.
+        - register_tool: preserve a newly useful reusable capability before proceeding.
+        - rollback: undo or mitigate the previous action before proceeding.
+        - final: the result is sufficient to produce the final answer.
+
+        Return only JSON in this shape: {"decision":"continue|retry|register_tool|rollback|final","rationale":"brief reason"}
+        """
+    ).strip()
+
+
+def parse_evaluation_decision(raw_response: str) -> dict[str, str]:
+    decision = "continue"
+    rationale = "No rationale provided."
+    try:
+        payload = json.loads(raw_response.strip())
+        if isinstance(payload, dict):
+            candidate = str(payload.get("decision", "")).strip().lower()
+            if candidate in EVALUATION_DECISIONS:
+                decision = candidate
+            if payload.get("rationale"):
+                rationale = str(payload["rationale"]).strip()
+    except json.JSONDecodeError:
+        match = re.search(r"\b(continue|retry|register_tool|rollback|final)\b", raw_response, re.IGNORECASE)
+        if match:
+            decision = match.group(1).lower()
+        cleaned = raw_response.strip()
+        if cleaned:
+            rationale = cleaned[:500]
+    return {"decision": decision, "rationale": rationale}
+
+
+def store_evaluation_decision(session_id: str, decision: str, rationale: str, raw_response: str) -> str:
+    decision_id = str(uuid.uuid4())
+    with connect_db() as conn:
+        conn.execute(
+            "INSERT INTO evaluation_decision (id, session_id, decision, rationale, raw_response, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+            (decision_id, session_id, decision, rationale, raw_response, now_iso()),
+        )
+        conn.commit()
+    return decision_id
+
+
+async def complete_model_text(messages: list[dict[str, str]], model: str, provider: str) -> str:
+    text = ""
+    async for token in app.state.model_adapter.complete(messages, model, provider):
+        text += token
+    return text
+
+
+async def evaluate_tool_result(
+    conversation: list[dict[str, str]],
+    session_id: str,
+    model: str,
+    provider: str,
+) -> dict[str, str]:
+    conversation.append({"role": "system", "content": build_evaluation_prompt()})
+    raw_response = await complete_model_text(prune_conversation(conversation), model, provider)
+    conversation.append({"role": "assistant", "content": raw_response})
+    parsed = parse_evaluation_decision(raw_response)
+    store_evaluation_decision(session_id, parsed["decision"], parsed["rationale"], raw_response)
+    if parsed["decision"] == "retry":
+        conversation.append({"role": "system", "content": "Evaluation decision: retry. Adjust or repeat the previous action before finalizing."})
+    elif parsed["decision"] == "register_tool":
+        conversation.append({"role": "system", "content": "Evaluation decision: register_tool. Preserve the reusable capability before finalizing."})
+    elif parsed["decision"] == "rollback":
+        conversation.append({"role": "system", "content": "Evaluation decision: rollback. Undo or mitigate the previous action before finalizing."})
+    elif parsed["decision"] == "final":
+        conversation.append({"role": "system", "content": "Evaluation decision: final. Produce the final answer now."})
+    else:
+        conversation.append({"role": "system", "content": "Evaluation decision: continue. Proceed with the next appropriate step."})
+    return parsed
 
 
 async def call_model_simple(prompt: str, model: str = "openai-fast") -> str:
@@ -1756,6 +2145,14 @@ async def reject(decision: ApprovalDecision) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.post("/checkpoints/rollback")
+async def rollback_checkpoint_endpoint() -> JSONResponse:
+    result = rollback_latest_checkpoint()
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+    return JSONResponse(result)
+
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...)) -> JSONResponse:
     raw = await file.read()
@@ -1829,6 +2226,25 @@ def prune_conversation(messages: list[dict[str, str]], max_chars: int = 32000) -
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
         session_id = str(uuid.uuid4())
+        goal = last_user_message(request.messages)
+        task_state = load_task_state(DATA_DIR, request.task_id) if request.task_id else None
+        if task_state is None:
+            task_state = TaskState(task_id=request.task_id or str(uuid.uuid4()), goal=goal)
+        elif goal:
+            task_state.goal = goal
+        save_task_state(task_state, DATA_DIR)
+
+        def emit_task_phase(phase: str, payload: dict[str, Any] | None = None) -> str:
+            task_state.mark_phase(phase)
+            save_task_state(task_state, DATA_DIR)
+            event_payload: dict[str, Any] = {
+                "task_id": task_state.task_id,
+                "phase": task_state.phase,
+                "done": task_state.done,
+            }
+            if payload:
+                event_payload.update(payload)
+            return sse(task_event_name(phase), event_payload)
         
         # Sanitize incoming messages: cap extremely long ones
         sanitized_messages = []
@@ -1847,6 +2263,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             max_repair_attempts = tool_repair_max_attempts()
             max_model_turns = 4 + (max_repair_attempts * 2)
             for _ in range(max_model_turns):
+        yield sse("meta", {"session_id": session_id, "model": request.model, "task_id": task_state.task_id})
+        yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
+        try:
+            max_task_steps = max(1, int(request.max_task_steps or 12))
+            model_turns = 0
+            while not task_state.done and model_turns < max_task_steps:
+                model_turns += 1
+                if task_state.observations:
+                    yield emit_task_phase("revise", {"observations": task_state.observations[-3:]})
                 text = ""
                 provider = request.provider or load_settings().get("default_provider", "pollinations")
                 model = request.model or load_settings().get("default_model", "openai-fast")
@@ -1859,8 +2284,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     yield sse("delta", {"content": token})
                 display_text = strip_tool_calls(text).strip()
                 calls = extract_tool_calls(text)
+                if not task_state.steps:
+                    task_state.add_plan(display_text or text)
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
                 if not calls and is_capability_refusal(text):
+                    task_state.failure_count += 1
+                    save_task_state(task_state, DATA_DIR)
                     yield sse("assistant_replace", {"content": "Retrying under the self-evolution protocol."})
+                    yield emit_task_phase("revise", {"reason": "capability_refusal", "failure_count": task_state.failure_count})
                     conversation.append({"role": "assistant", "content": text})
                     conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
                     continue
@@ -1870,12 +2302,20 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 conversation.append({"role": "assistant", "content": text})
                 public_messages.append({"role": "assistant", "content": display_text or text})
                 if not calls:
+                    task_state.done = True
+                    task_state.artifacts["final_answer"] = display_text or text
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("final", {"answer": display_text or text})
                     break
+                yield emit_task_phase("act", {"tool_call_count": len(calls)})
                 for call in calls:
                     tool_name = str(call["name"])
                     arguments = call.get("arguments", {})
                     if not isinstance(arguments, dict):
                         arguments = {}
+                    step = task_state.add_step(tool_name, arguments)
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("act", {"step": step})
                     tool = find_tool(tool_name)
                     policy: dict[str, Any] | None = None
                     if tool_name == "execute_python":
@@ -1883,14 +2323,19 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         if policy["action"] == "block":
                             result = {"error": policy["risk_summary"], "policy": policy}
                             store_tool_execution(tool_name, arguments, result, False)
+                            observation = task_state.add_observation(step, result, False)
+                            save_task_state(task_state, DATA_DIR)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield emit_task_phase("observe", {"observation": observation})
                             conversation.append({"role": "tool", "content": json.dumps(result)})
+                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                            yield sse("evaluation", evaluation)
                             continue
                     requires_approval = bool(tool is not None and tool.get("requires_approval"))
                     policy_approved = False
                     if policy is not None and policy["action"] == "require_approval":
                         requires_approval = True
-                    if request.auto_approve:
+                    if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
                         requires_approval = False
                         policy_approved = True
                     if requires_approval:
@@ -1911,6 +2356,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                                 "arguments": arguments,
                                 "risk_summary": pending.risk_summary,
                                 "policy_reasons": pending.policy_reasons,
+                                "checkpoint": policy.get("checkpoint") if policy is not None else None,
                                 "code": str(arguments.get("code", "")) if tool_name == "execute_python" else "",
                             },
                         )
@@ -1921,16 +2367,23 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         if not approved:
                             result = {"error": "Tool execution rejected by user.", "risk_summary": pending.risk_summary}
                             store_tool_execution(tool_name, arguments, result, False)
+                            observation = task_state.add_observation(step, result, False)
+                            save_task_state(task_state, DATA_DIR)
                             yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": False})
+                            yield emit_task_phase("observe", {"observation": observation})
                             
                             result_str = json.dumps(result)
                             if len(result_str) > 10000:
                                 result_str = result_str[:10000] + "... [Result truncated]"
                             conversation.append({"role": "tool", "content": result_str})
+                            evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                            yield sse("evaluation", evaluation)
                             continue
                     yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
                     if tool_name == "execute_python":
                         result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+                    elif tool_name == "rollback_latest_checkpoint":
+                        result = rollback_latest_checkpoint()
                     elif tool_name == "register_tool":
                         result = register_tool(
                             name=str(arguments.get("name", "")),
@@ -1938,6 +2391,12 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             parameters_schema=arguments.get("parameters_schema", {}),
                             filepath=str(arguments.get("filepath", "")),
                             requires_approval=bool(arguments.get("requires_approval", False)),
+                            version=str(arguments.get("version", "1.0.0")),
+                            source_task_id=arguments.get("source_task_id"),
+                            test_command=arguments.get("test_command"),
+                            test_plan=arguments.get("test_plan"),
+                            sample_arguments=arguments.get("sample_arguments"),
+                            supersedes=arguments.get("supersedes"),
                         )
                     else:
                         tool = find_tool(tool_name)
@@ -1945,10 +2404,18 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                             result = {"error": f"Builtin tool {tool_name} is not implemented in dispatch loop."}
                         elif tool is not None:
                             result = run_registered_tool(tool, arguments)
+                            update_registered_tool_status(
+                                tool_name,
+                                str(tool.get("version", "")),
+                                increment_use_count=True,
+                            )
                         else:
                             result = {"error": f"Tool {tool_name} not found."}
                     store_tool_execution(tool_name, arguments, result, True)
+                    observation = task_state.add_observation(step, result, True)
+                    save_task_state(task_state, DATA_DIR)
                     yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": True})
+                    yield emit_task_phase("observe", {"observation": observation})
                     
                     # Cap result for conversation history to avoid 400 errors
                     result_str = json.dumps(result)
@@ -1981,8 +2448,19 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 else:
                     continue
                 continue
+                    evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                    yield sse("evaluation", evaluation)
+                    if evaluation["decision"] == "final":
+                        break
+                yield emit_task_phase("evaluate", {"step_count": len(task_state.steps), "observation_count": len(task_state.observations)})
+            if not task_state.done:
+                task_state.failure_count += 1
+                task_state.done = True
+                task_state.artifacts["final_answer"] = "Task stopped after reaching the configured step limit."
+                save_task_state(task_state, DATA_DIR)
+                yield emit_task_phase("final", {"answer": task_state.artifacts["final_answer"], "reason": "step_limit"})
             # Remove the automatic summary call from stream, frontend will call /memory/save
-            yield sse("done", {"session_id": session_id})
+            yield sse("done", {"session_id": session_id, "task_id": task_state.task_id})
         except Exception as exc:
             yield sse("error", {"message": str(exc)})
 
