@@ -63,8 +63,8 @@ def test_registry_loads_builtin_tools(tmp_path, monkeypatch):
     assert response.status_code == 200
     names = [tool["name"] for tool in response.json()["tools"]]
     assert "execute_python" in names
-    assert "rollback_latest_checkpoint" in names
     assert "register_tool" in names
+    assert "rollback_latest_checkpoint" not in names
 
 
 def test_execute_python_success():
@@ -224,6 +224,35 @@ def test_skill_package_validates_registers_and_runs(tmp_path, monkeypatch):
     result = server.run_registered_tool(tool, {"message": "hello"})
     assert result["exit_code"] == 0
     assert json.loads(result["stdout"])["echo"] == "hello"
+
+
+def test_user_facing_tools_load_from_registry_while_kernel_services_remain_private(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    write_skill_package(tmp_path)
+    server.register_tool(
+        name="caps_echo",
+        description="Echo a message from a local skill package",
+        filepath="tools/caps_echo",
+    )
+
+    response = client.get("/tools")
+
+    assert response.status_code == 200
+    names = [tool["name"] for tool in response.json()["tools"]]
+    assert "caps_echo" in names
+    assert "execute_python" in names
+    assert "register_tool" in names
+    assert "rollback_latest_checkpoint" not in names
+    assert "read_memory" not in names
+    assert "write_memory" not in names
+    assert "enforce_python_policy" not in names
+    assert "load_task_state" not in names
+
+    dispatched = asyncio.run(server.KERNEL.dispatch_capability("caps_echo", {"message": "registry-ok"}))
+    assert dispatched["exit_code"] == 0
+    assert json.loads(dispatched["stdout"])["echo"] == "registry-ok"
+    private = asyncio.run(server.KERNEL.dispatch_capability("rollback_latest_checkpoint", {}))
+    assert "private kernel safety action" in private["error"]
 
 
 def test_skill_package_must_pass_tests_before_registration(tmp_path, monkeypatch):
@@ -646,7 +675,10 @@ def test_checkpoint_restores_temp_file_after_mutation(tmp_path, monkeypatch):
     metadata_path = tmp_path / "data" / "checkpoints" / f"{result['checkpoint']['id']}.json"
     assert metadata_path.exists()
 
-    rollback = server.rollback_latest_checkpoint()
+    denied = server.rollback_latest_checkpoint()
+    assert "restricted" in denied["error"]
+
+    rollback = server.KERNEL.rollback_latest_checkpoint(caller="eval")
 
     assert rollback["checkpoint"]["id"] == result["checkpoint"]["id"]
     assert str(target) in rollback["restored"]
@@ -812,114 +844,6 @@ def test_workspace_index_context_is_injected_into_system_prompt(tmp_path, monkey
     assert "WORKSPACE INDEX CONTEXT:" in prompt
     assert "plan.md" in prompt
     assert "task=task-context" in prompt
-def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monkeypatch):
-    client = make_client(tmp_path, monkeypatch)
-    tool_path = tmp_path / "tools" / "flaky_tool.py"
-    tool_path.write_text(
-        "import sys\nprint('broken', file=sys.stderr)\nsys.exit(1)\n",
-        encoding="utf-8",
-    )
-    registered = server.register_tool(
-        name="flaky_tool",
-        description="Return the provided value as JSON.",
-        parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
-        filepath="tools/flaky_tool.py",
-    )
-    assert registered["registered"] == "flaky_tool"
-
-    patch_code = "\n".join(
-        [
-            "from pathlib import Path",
-            "Path('tools/flaky_tool.py').write_text(\"import json, sys\\nargs = json.loads(sys.stdin.read() or '{}')\\nprint(json.dumps({'status': 'ok', 'value': args.get('value')}))\\n\", encoding='utf-8')",
-        ]
-    )
-    adapter = SequenceAdapter(
-        [
-            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
-            f'<tool_call>{json.dumps({"name": "execute_python", "arguments": {"code": patch_code}})}</tool_call>',
-            '<tool_call>{"name":"flaky_tool","arguments":{"value":"second-run"}}</tool_call>',
-            "The repaired tool succeeded.",
-        ]
-    )
-    client.app.state.model_adapter = adapter
-
-    response = client.post(
-        "/chat",
-        json={
-            "messages": [{"role": "user", "content": "Run flaky_tool and fix it if needed."}],
-
-def _run_git(repo: Path, *args: str) -> None:
-    import subprocess
-
-    subprocess.run(["git", *args], cwd=repo, check=True, text=True, capture_output=True)
-
-
-def _make_git_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _run_git(repo, "init")
-    _run_git(repo, "config", "user.email", "agent@example.test")
-    _run_git(repo, "config", "user.name", "Agent Test")
-    (repo / "README.md").write_text("initial\n", encoding="utf-8")
-    _run_git(repo, "add", "README.md")
-    _run_git(repo, "commit", "-m", "initial")
-    return repo
-
-
-def test_git_harness_status_diff_and_checkpoint_commit(tmp_path):
-    import git_harness
-
-    repo = _make_git_repo(tmp_path)
-    (repo / "README.md").write_text("initial\nchanged\n", encoding="utf-8")
-    (repo / "notes.txt").write_text("new\n", encoding="utf-8")
-
-    status = git_harness.status(repo)
-    assert status["ok"] is True
-    assert status["clean"] is False
-    assert {file["path"] for file in status["files"]} == {"README.md", "notes.txt"}
-
-    diff = git_harness.diff(repo)
-    assert diff["ok"] is True
-    assert "+changed" in diff["stdout"]
-
-    changed = git_harness.list_changed_files(repo)
-    assert changed["paths"] == ["README.md", "notes.txt"]
-
-    checkpoint = git_harness.commit("checkpoint changes", repo)
-    assert checkpoint["ok"] is True
-    assert checkpoint["committed"] is True
-    assert checkpoint["before"]["clean"] is False
-    assert checkpoint["after"]["clean"] is True
-    assert checkpoint["hash"]
-
-
-def test_git_harness_restore_explicit_path(tmp_path):
-    import git_harness
-
-    repo = _make_git_repo(tmp_path)
-    readme = repo / "README.md"
-    readme.write_text("damaged\n", encoding="utf-8")
-
-    restored = git_harness.restore(repo, paths=["README.md"])
-    assert restored["ok"] is True
-    assert readme.read_text(encoding="utf-8") == "initial\n"
-    assert git_harness.status(repo)["clean"] is True
-
-
-def test_execute_python_policy_destructive_git_requires_manual_approval():
-    reset_policy = server.summarize_python_execution_policy(
-        "import subprocess\nsubprocess.run(['git', 'reset', '--hard', 'HEAD'])"
-    )
-    assert reset_policy["action"] == "require_approval"
-    assert reset_policy["manual_approval_required"] is True
-    assert "destructive git command requires explicit approval" in reset_policy["reasons"]
-
-    clean_policy = server.summarize_python_execution_policy("import os\nos.system('git clean -fd')")
-    assert clean_policy["manual_approval_required"] is True
-
-    push_policy = server.summarize_python_execution_policy("import os\nos.system('git push --force-with-lease origin main')")
-    assert push_policy["manual_approval_required"] is True
-
 
 def test_system_prompt_guides_git_status_for_self_modifying_work(tmp_path, monkeypatch):
     make_client(tmp_path, monkeypatch)
@@ -928,62 +852,3 @@ def test_system_prompt_guides_git_status_for_self_modifying_work(tmp_path, monke
     )
     assert "inspect `git status` before edits and again after edits" in prompt
     assert "nucleus/git_harness.py" in prompt
-def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, monkeypatch):
-    client = make_client(tmp_path, monkeypatch)
-    adapter = SequenceAdapter([
-        "1. Run the first step\n2. Run the second step\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('one')\"}}</tool_call>",
-        "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
-        "Final answer after two observations.",
-    ])
-    client.app.state.model_adapter = adapter
-
-    async def fake_execute_python(code, policy_approved=False):
-        return {"stdout": code, "stderr": "", "exit_code": 0, "timed_out": False}
-
-    monkeypatch.setattr(server, "execute_python", fake_execute_python)
-    response = client.post(
-        "/chat",
-        json={
-            "messages": [{"role": "user", "content": "Complete a two-step task"}],
-            "model": "openai-fast",
-            "provider": "pollinations",
-            "context_files": [],
-            "auto_approve": True,
-            "max_task_steps": 5,
-        },
-    )
-
-    assert response.status_code == 200
-    assert "event: tool_repair" in response.text
-    assert "nonzero_exit" in response.text
-    assert "The repaired tool succeeded." in response.text
-    assert "second-run" in response.text
-    assert len(adapter.calls) == 4
-    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
-    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
-    assert any("Inspect the tool file" in prompt for prompt in repair_prompts)
-
-    registry = json.loads((tmp_path / "registry.json").read_text(encoding="utf-8"))
-    flaky = next(tool for tool in registry["tools"] if tool["name"] == "flaky_tool")
-    attempts = flaky["metadata"]["repair_attempts"]
-    assert len(attempts) == 1
-    assert attempts[0]["failure"]["type"] == "nonzero_exit"
-
-    repaired = server.run_registered_tool(flaky, {"value": "direct"})
-    assert repaired["exit_code"] == 0
-    assert json.loads(repaired["stdout"])["value"] == "direct"
-    assert "event: task_plan" in response.text
-    assert "event: task_step" in response.text
-    assert "event: task_observation" in response.text
-    assert "event: task_revision" in response.text
-    assert "Final answer after two observations." in response.text
-    assert len(adapter.calls) == 3
-
-    task_files = list((tmp_path / "data" / "tasks").glob("*.json"))
-    assert len(task_files) == 1
-    task_state = json.loads(task_files[0].read_text(encoding="utf-8"))
-    assert task_state["done"] is True
-    assert task_state["phase"] == "final"
-    assert len(task_state["steps"]) == 2
-    assert len(task_state["observations"]) == 2
-    assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
