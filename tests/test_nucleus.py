@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -180,6 +181,7 @@ print(json.dumps({'echo': args.get('message', '')}))
 import json
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 completed = subprocess.run(
@@ -412,6 +414,60 @@ def test_summarize_and_store_archives_when_provider_fails(tmp_path, monkeypatch)
     memories = json.loads(memory_response.body)["memories"]
     assert memories[0]["session_id"] == session_id
     assert memories[0]["summary"] == f"Conversation session {session_id}"
+
+
+def test_enforce_memory_budget_compacts_old_sessions_and_keeps_summaries(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    settings = server.load_settings()
+    settings.update({
+        "memory_recent_days": 7,
+        "memory_max_raw_archive_mb": 0.001,
+        "memory_summary_target_tokens": 80,
+        "memory_cold_archive_compression": "zlib",
+    })
+    server.save_settings(settings)
+
+    old_timestamp = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+    for index in range(12):
+        session_id = f"old-session-{index}"
+        messages = [
+            {"role": "user", "content": f"Remember durable fact Project-{index}: the migration decision must preserve queryable summaries. " * 80},
+            {"role": "assistant", "content": f"Decision recorded for Project-{index}; summary lookup keyword budgetneedle{index}. " * 80},
+        ]
+        archive = server.write_session_archive(
+            session_id,
+            messages,
+            summary=f"Project-{index} budgetneedle{index} retained summary with durable migration decision.",
+        )
+        archive["created_at"] = old_timestamp
+        archive["updated_at"] = old_timestamp
+        server.session_archive_path(session_id).write_text(json.dumps(archive, indent=2), encoding="utf-8")
+
+    recent_messages = [{"role": "user", "content": "Recent session should remain raw." * 20}]
+    server.write_session_archive("recent-session", recent_messages, summary="Recent raw summary")
+
+    result = server.enforce_memory_budget()
+
+    assert result["compacted_count"] > 0
+    recent_payload = json.loads(server.session_archive_path("recent-session").read_text(encoding="utf-8"))
+    assert recent_payload["messages"] == recent_messages
+
+    compacted_payload = json.loads(server.session_archive_path("old-session-0").read_text(encoding="utf-8"))
+    assert compacted_payload["messages"] == []
+    assert compacted_payload["raw_messages_compression"] == "zlib"
+    assert "durable_facts" in compacted_payload
+
+    with server.connect_db() as conn:
+        metadata_rows = conn.execute("SELECT * FROM memory_compaction").fetchall()
+    assert len(metadata_rows) == result["compacted_count"]
+    assert metadata_rows[0]["original_size"] > metadata_rows[0]["compressed_size"]
+    assert metadata_rows[0]["summary_path"].startswith("episodic_memory:")
+    assert metadata_rows[0]["last_accessed_at"]
+
+    restored = server.normalize_session_archive(server.session_archive_path("old-session-0"))
+    assert restored["messages"][0]["content"].startswith("Remember durable fact Project-0")
+    matches = server.retrieve_relevant("budgetneedle0 migration", limit=5)
+    assert "Project-0 budgetneedle0 retained summary" in matches
 
 
 def test_upload_text(tmp_path, monkeypatch):
@@ -905,6 +961,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         description="Return the provided value as JSON.",
         parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         filepath="tools/flaky_tool.py",
+        test_plan="Intentional failure exercises repair loop.",
         test_plan="Exercise repair loop with an intentionally failing tool.",
     )
     assert registered["registered"] == "flaky_tool"
@@ -933,6 +990,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
             "provider": "pollinations",
             "context_files": [],
             "auto_approve": True,
+            "max_task_steps": 5,
             "max_task_steps": 6,
         },
     )
@@ -1044,7 +1102,9 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     client = make_client(tmp_path, monkeypatch)
     adapter = SequenceAdapter([
         "1. Run the first step\n2. Run the second step\n<tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('one')\"}}</tool_call>",
+        '{"decision":"retry","rationale":"Run the second step."}',
         "Use the first observation for another action. <tool_call>{\"name\":\"execute_python\",\"arguments\":{\"code\":\"print('two')\"}}</tool_call>",
+        '{"decision":"final","rationale":"Both steps are complete."}',
         "Final answer after two observations.",
     ])
     client.app.state.model_adapter = adapter
@@ -1069,9 +1129,8 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     assert "event: task_plan" in response.text
     assert "event: task_step" in response.text
     assert "event: task_observation" in response.text
-    assert "event: task_revision" in response.text
     assert "Final answer after two observations." in response.text
-    assert len(adapter.calls) == 3
+    assert len(adapter.calls) == 5
 
     task_files = list((tmp_path / "data" / "tasks").glob("*.json"))
     assert len(task_files) == 1
