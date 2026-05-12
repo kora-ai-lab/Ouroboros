@@ -42,8 +42,7 @@
     },
     {
       "name": "register_tool",
-      "description": "Permanently register a new skill package directory or legacy Python file. Skill packages live under nucleus/tools/ and contain tool.py, schema.json, README.md, tests.py, and metadata.json.",
-      "description": "Permanently register a tested Python file as a versioned tool. The file must live under nucleus/tools and include a test_command, test_plan, or sample_arguments.",
+      "description": "Permanently register a tested Python file or skill package as a versioned tool. Legacy Python files must live under nucleus/tools and include a test_command, test_plan, or sample_arguments. Skill packages must include tool.py, schema.json, README.md, tests.py, metadata.json with permissions, and evals.json.",
       "parameters": {
         "type": "object",
         "properties": {
