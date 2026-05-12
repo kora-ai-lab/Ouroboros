@@ -144,6 +144,7 @@ DEFAULT_REGISTRY = {
         },
         {
             "name": "register_tool",
+            "description": "Permanently register a new skill package directory or legacy Python file. Skill packages live under nucleus/tools/ and contain tool.py, schema.json, README.md, tests.py, and metadata.json.",
             "description": "Permanently register a tested Python file as a versioned tool.",
             "parameters": {
                 "type": "object",
@@ -160,7 +161,7 @@ DEFAULT_REGISTRY = {
                     "sample_arguments": {"type": "object"},
                     "supersedes": {"type": "string"},
                 },
-                "required": ["name", "description", "parameters_schema", "filepath"],
+                "required": ["name", "description", "filepath"],
             },
             "builtin": True,
             "requires_approval": False,
@@ -1384,16 +1385,116 @@ def validate_tool_name(name: str) -> None:
         raise ValueError("Tool name must be a valid Python-style identifier under 64 characters.")
 
 
-def resolve_tool_path(filepath: str) -> Path:
-    candidate = (BASE_DIR / filepath).resolve() if not Path(filepath).is_absolute() else Path(filepath).resolve()
+def resolve_tool_candidate(path_value: str) -> Path:
+    candidate = Path(path_value)
+    if not candidate.is_absolute():
+        candidate = BASE_DIR / candidate
+    candidate = candidate.resolve()
     tools_root = TOOLS_DIR.resolve()
     if tools_root != candidate and tools_root not in candidate.parents:
         raise ValueError("Registered tools must live under nucleus/tools.")
+    if not candidate.exists():
+        raise ValueError(f"Tool path does not exist: {path_value}")
+    return candidate
+
+
+def resolve_tool_path(filepath: str) -> Path:
+    candidate = resolve_tool_candidate(filepath)
+    if candidate.is_dir():
+        candidate = candidate / "tool.py"
     if candidate.suffix.lower() != ".py":
-        raise ValueError("Registered tools must be Python files.")
+        raise ValueError("Registered tools must be Python files or skill package directories.")
     if not candidate.exists():
         raise ValueError(f"Tool file does not exist: {filepath}")
     return candidate
+
+
+def load_tool_metadata(package_dir: Path) -> dict[str, Any]:
+    metadata_path = package_dir / "metadata.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"metadata.json is invalid JSON: {exc.msg}") from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("metadata.json must contain a JSON object.")
+    version = metadata.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("metadata.json must include a non-empty string version.")
+    deprecated = metadata.get("deprecated", False)
+    if not isinstance(deprecated, bool):
+        raise ValueError("metadata.json deprecated must be a boolean when present.")
+    deprecation_reason = metadata.get("deprecation_reason", "")
+    if deprecation_reason is not None and not isinstance(deprecation_reason, str):
+        raise ValueError("metadata.json deprecation_reason must be a string when present.")
+    return metadata
+
+
+def validate_json_schema(schema: dict[str, Any]) -> None:
+    if not isinstance(schema, dict):
+        raise ValueError("schema.json must contain a JSON object.")
+    try:
+        import jsonschema
+    except ImportError:
+        valid_types = {"null", "boolean", "object", "array", "number", "string", "integer"}
+
+        def walk(node: Any, location: str = "schema") -> None:
+            if isinstance(node, dict):
+                type_value = node.get("type")
+                if isinstance(type_value, str) and type_value not in valid_types:
+                    raise ValueError(f"Invalid JSON Schema type at {location}: {type_value}")
+                if isinstance(type_value, list):
+                    invalid = [item for item in type_value if item not in valid_types]
+                    if invalid:
+                        raise ValueError(f"Invalid JSON Schema type at {location}: {invalid[0]}")
+                required = node.get("required")
+                if required is not None and (not isinstance(required, list) or not all(isinstance(item, str) for item in required)):
+                    raise ValueError(f"Invalid JSON Schema required list at {location}.")
+                properties = node.get("properties")
+                if properties is not None and not isinstance(properties, dict):
+                    raise ValueError(f"Invalid JSON Schema properties at {location}.")
+                for key, value in node.items():
+                    walk(value, f"{location}.{key}")
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    walk(value, f"{location}[{index}]")
+
+        walk(schema)
+        return
+
+    try:
+        jsonschema.Draft202012Validator.check_schema(schema)
+    except jsonschema.SchemaError as exc:
+        raise ValueError(f"Invalid JSON Schema: {exc.message}") from exc
+
+
+def load_tool_package(package_dir: Path) -> dict[str, Any]:
+    required_files = ["tool.py", "schema.json", "README.md", "tests.py", "metadata.json"]
+    missing = [name for name in required_files if not (package_dir / name).is_file()]
+    if missing:
+        raise ValueError("Skill package is missing required files: " + ", ".join(missing))
+
+    try:
+        schema = json.loads((package_dir / "schema.json").read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"schema.json is invalid JSON: {exc.msg}") from exc
+    validate_json_schema(schema)
+    metadata = load_tool_metadata(package_dir)
+
+    completed = subprocess.run(
+        [sys.executable, str(package_dir / "tests.py")],
+        cwd=str(package_dir),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError(
+            "Skill package tests.py failed before registration. "
+            f"stdout={completed.stdout[-4000:]!r} stderr={completed.stderr[-4000:]!r}"
+        )
+    return {"schema": schema, "metadata": metadata, "test_stdout": completed.stdout, "test_stderr": completed.stderr}
 
 
 WRITE_CALLS = {"write_text", "write_bytes", "unlink", "mkdir", "makedirs", "rmdir", "remove", "rename", "replace", "touch"}
@@ -2032,8 +2133,8 @@ def validate_registered_tool(
 def register_tool(
     name: str,
     description: str,
-    parameters_schema: dict[str, Any],
-    filepath: str,
+    parameters_schema: dict[str, Any] | None = None,
+    filepath: str = "",
     requires_approval: bool = False,
     version: str = "1.0.0",
     source_task_id: str | None = None,
@@ -2044,6 +2145,24 @@ def register_tool(
 ) -> dict[str, Any]:
     validate_tool_name(name)
     try:
+        path = resolve_tool_candidate(filepath)
+        package_info: dict[str, Any] | None = None
+        metadata: dict[str, Any] = {"version": "0.0.0", "deprecated": False, "deprecation_reason": ""}
+        entry_filepath = str(Path(filepath))
+
+        if path.is_dir():
+            package_info = load_tool_package(path)
+            parameters = package_info["schema"]
+            metadata = package_info["metadata"]
+            entry_filepath = str(Path(filepath))
+        else:
+            if path.suffix.lower() != ".py":
+                raise ValueError("Legacy tool registrations must point to a Python file.")
+            parameters = parameters_schema or {"type": "object"}
+            validate_json_schema(parameters)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
         path = resolve_tool_path(filepath)
     except ValueError as exc:
         return {"error": str(exc)}
@@ -2077,6 +2196,26 @@ def register_tool(
     entry = {
         "name": name,
         "description": description,
+        "parameters": parameters,
+        "filepath": entry_filepath,
+        "builtin": False,
+        "requires_approval": bool(requires_approval),
+        "version": str(metadata.get("version", "0.0.0")),
+        "deprecated": bool(metadata.get("deprecated", False)),
+        "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
+    }
+    if path.is_dir():
+        entry["package"] = True
+        entry["package_dir"] = entry_filepath
+    registry["tools"] = [t for t in registry["tools"] if t.get("name") != name]
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "permanent": True}
+    if package_info is not None:
+        result["package"] = True
+        result["version"] = entry["version"]
+        result["tests"] = {"stdout": package_info["test_stdout"][-4000:], "stderr": package_info["test_stderr"][-4000:]}
+    return result
         "parameters": parameters_schema,
         "filepath": str(path.relative_to(BASE_DIR)),
         "builtin": False,
