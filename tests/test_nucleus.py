@@ -34,6 +34,7 @@ class SequenceFakeAdapter(server.ModelAdapter):
 def make_client(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "DATA_DIR", tmp_path / "data")
     monkeypatch.setattr(server, "ARCHIVE_DIR", tmp_path / "data" / "archive")
+    monkeypatch.setattr(server, "CHECKPOINTS_DIR", tmp_path / "data" / "checkpoints")
     monkeypatch.setattr(server, "TOOLS_DIR", tmp_path / "tools")
     monkeypatch.setattr(server, "KORA_DIR", tmp_path / "kora")
     monkeypatch.setattr(server, "REGISTRY_PATH", tmp_path / "registry.json")
@@ -62,6 +63,7 @@ def test_registry_loads_builtin_tools(tmp_path, monkeypatch):
     assert response.status_code == 200
     names = [tool["name"] for tool in response.json()["tools"]]
     assert "execute_python" in names
+    assert "rollback_latest_checkpoint" in names
     assert "register_tool" in names
 
 
@@ -348,6 +350,60 @@ def test_execute_python_policy_detects_path_open_write():
     policy = server.summarize_python_execution_policy("from pathlib import Path\nPath('out.txt').open('w').write('x')")
     assert policy["action"] == "require_approval"
     assert "filesystem write or mutation" in policy["reasons"]
+
+
+def test_execute_python_policy_includes_checkpoint_metadata(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    target = tmp_path / "policy.txt"
+    policy = server.summarize_python_execution_policy(f"from pathlib import Path\nPath({str(target)!r}).write_text('x')")
+    assert policy["action"] == "require_approval"
+    assert policy["checkpoint"]["strategy"] == "files"
+    assert policy["checkpoint"]["affected_paths"] == [str(target)]
+    assert policy["checkpoint"]["storage_dir"] == str(tmp_path / "data" / "checkpoints")
+
+
+def test_checkpoint_restores_temp_file_after_mutation(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    target = tmp_path / "mutable.txt"
+    target.write_text("original", encoding="utf-8")
+
+    result = asyncio.run(
+        server.execute_python(
+            f"from pathlib import Path\nPath({str(target)!r}).write_text('mutated', encoding='utf-8')",
+            policy_approved=True,
+        )
+    )
+
+    assert result["exit_code"] == 0
+    assert result["checkpoint"]["strategy"] == "files"
+    assert result["checkpoint"]["path_count"] == 1
+    assert target.read_text(encoding="utf-8") == "mutated"
+    metadata_path = tmp_path / "data" / "checkpoints" / f"{result['checkpoint']['id']}.json"
+    assert metadata_path.exists()
+
+    rollback = server.rollback_latest_checkpoint()
+
+    assert rollback["checkpoint"]["id"] == result["checkpoint"]["id"]
+    assert str(target) in rollback["restored"]
+    assert target.read_text(encoding="utf-8") == "original"
+
+
+def test_checkpoint_rollback_endpoint(tmp_path, monkeypatch):
+    client = make_client(tmp_path, monkeypatch)
+    target = tmp_path / "endpoint.txt"
+    target.write_text("before", encoding="utf-8")
+    asyncio.run(
+        server.execute_python(
+            f"open({str(target)!r}, 'w', encoding='utf-8').write('after')",
+            policy_approved=True,
+        )
+    )
+
+    response = client.post("/checkpoints/rollback")
+
+    assert response.status_code == 200
+    assert str(target) in response.json()["restored"]
+    assert target.read_text(encoding="utf-8") == "before"
 
 
 def test_execute_python_approved_execution(tmp_path):
