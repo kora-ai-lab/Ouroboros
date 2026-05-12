@@ -180,6 +180,26 @@ DEFAULT_REGISTRY = {
             "trusted": True,
         },
         {
+            "name": "delegate_subagent",
+            "description": "Delegate bounded work to an isolated subagent with constrained tools, memory scope, sandbox tier, and step limit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string"},
+                    "context": {},
+                    "allowed_tools": {"type": "array", "items": {"type": "string"}},
+                    "memory_scope": {"type": "string"},
+                    "sandbox_tier": {"type": "string"},
+                    "max_steps": {"type": "integer", "minimum": 1},
+                    "parent_task_id": {"type": "string"}
+                },
+                "required": ["goal", "parent_task_id"],
+            },
+            "filepath": "tools/delegate_subagent",
+            "package": True,
+            "package_dir": "tools/delegate_subagent",
+            "builtin": False,
+            "requires_approval": False,
             "name": "mcp_bridge",
             "description": "Generic bridge for configured MCP servers: list servers/tools/resources/prompts, read resources, and call arbitrary MCP tools.",
             "parameters": {
@@ -204,6 +224,17 @@ DEFAULT_REGISTRY = {
             "created_at": "2026-05-12T00:00:00+00:00",
             "updated_at": "2026-05-12T00:00:00+00:00",
             "source_task_id": None,
+            "test_command": "python nucleus/tools/delegate_subagent/tests.py",
+            "test_plan": "Package tests cover subprocess delegation and JSON output.",
+            "sample_arguments": {
+                "goal": "summarize provided context",
+                "context": {"note": "sample"},
+                "allowed_tools": [],
+                "memory_scope": "provided_context_only",
+                "sandbox_tier": "read_only",
+                "max_steps": 1,
+                "parent_task_id": "sample-parent"
+            },
             "test_command": "python nucleus/tools/mcp_bridge/tests.py",
             "test_plan": "Package smoke test plus adapter unit tests cover generic MCP discovery and call dispatch.",
             "sample_arguments": {"operation": "list_servers"},
@@ -774,6 +805,7 @@ def now_iso() -> str:
 
 
 def ensure_layout() -> None:
+    for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", DATA_DIR / "subagents", TOOLS_DIR, KORA_DIR):
     for path in (DATA_DIR, ARCHIVE_DIR, CHECKPOINTS_DIR, DATA_DIR / "tasks", TOOLS_DIR, KORA_DIR):
         path.mkdir(parents=True, exist_ok=True)
     if not REGISTRY_PATH.exists():
@@ -2356,12 +2388,14 @@ def summarize_python_execution_policy(code: str) -> dict[str, Any]:
             "affected_paths": unique_paths,
             "network_risk": network_risk,
             "process_risk": process_risk,
+            "manual_approval_required": True,
             "manual_approval_required": manual_approval_required,
         }
 
     unique_reasons = sorted(set(reasons))
     if unique_reasons:
         sandbox_tier = sandbox_tier_for_reasons(unique_reasons)
+        response = {
         response: dict[str, Any] = {
             "action": "require_approval",
             "sandbox_tier": sandbox_tier,
@@ -2463,6 +2497,7 @@ def annotate_registered_tool_output(result: dict[str, Any], tool: dict[str, Any]
     return result
 
 
+
 def run_registered_tool(tool: dict[str, Any], arguments: dict[str, Any]) -> dict[str, Any]:
     start = time.time()
     try:
@@ -2529,6 +2564,7 @@ def classify_registered_tool_failure(result: dict[str, Any], tool: dict[str, Any
 
 def registered_tool_failed(result: dict[str, Any], tool: dict[str, Any] | None = None) -> bool:
     return classify_registered_tool_failure(result, tool) is not None
+
 
 
 def build_tool_repair_message(tool: dict[str, Any], arguments: dict[str, Any], result: dict[str, Any], attempt_number: int, max_attempts: int) -> str:
@@ -2661,23 +2697,6 @@ def validate_registered_tool(
         "result": result,
         "tool": status.get("tool"),
     }
-    return textwrap.dedent(
-        f"""
-        A registered tool failed. Repair it before continuing.
-
-        Generic repair instruction:
-        1. Inspect the tool file and its registry metadata.
-        2. Patch the tool using execute_python.
-        3. Test the patched tool with the failing arguments.
-        4. Re-register the tool or update its metadata if the interface, description, parameters, output format, or approval policy changed.
-        5. Then retry the original tool call or continue with the user's request.
-
-        Repair attempts are limited to {max_attempts}; this is attempt {attempt_number}.
-
-        Failure context JSON:
-        {json.dumps(payload, indent=2)}
-        """
-    ).strip()
 
 
 def register_tool(
@@ -2698,6 +2717,13 @@ def register_tool(
     try:
         validate_tool_name(name)
         path = resolve_tool_candidate(filepath)
+        entry_filepath = str(Path(filepath))
+        metadata: dict[str, Any] = {}
+        if path.is_dir():
+            package_info = load_tool_package(path)
+            parameters = package_info["schema"]
+            metadata = dict(package_info["metadata"])
+            version = str(metadata.get("version", version))
         package_info: dict[str, Any] | None = None
         package_metadata: dict[str, Any] = {}
         entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
@@ -2719,12 +2745,19 @@ def register_tool(
                 return {"error": "parameters_schema must be an object."}
             parameters = parameters_schema
             validate_json_schema(parameters)
+            if not isinstance(parameters_schema, dict):
+                return {"error": "parameters_schema must be an object."}
+            if not any([test_command, test_plan, sample_arguments is not None]):
+                return {"error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."}
+    except (ValueError, subprocess.TimeoutExpired) as exc:
             entry_filepath = str(path.relative_to(BASE_DIR)) if path.is_relative_to(BASE_DIR) else str(Path(filepath))
     except ValueError as exc:
         return {"error": str(exc)}
 
     if sample_arguments is not None and not isinstance(sample_arguments, dict):
         return {"error": "sample_arguments must be an object."}
+
+    registry = load_registry()
     if package_info is None and not any([test_command, test_plan, sample_arguments is not None]):
         return {
             "error": "Registered tools must include a test_command, test_plan, or sample_arguments for validation."
@@ -2765,10 +2798,7 @@ def register_tool(
     if any(str(tool.get("version", "")) == entry_version for tool in existing_versions):
         return {"error": f"Tool {name} version {entry_version} is already registered."}
     if supersedes is None and existing_versions:
-        previous = sorted(
-            existing_versions,
-            key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))),
-        )[-1]
+        previous = sorted(existing_versions, key=lambda tool: (parse_version_key(tool.get("version")), str(tool.get("updated_at", ""))))[-1]
         supersedes = str(previous.get("version", "")) or None
 
     timestamp = now_iso()
@@ -2812,6 +2842,15 @@ def register_tool(
         "trusted": bool(package_info),
     }
     if package_info is not None:
+        entry.update({
+            "package": True,
+            "package_dir": entry_filepath,
+            "deprecated": bool(metadata.get("deprecated", False)),
+            "deprecation_reason": str(metadata.get("deprecation_reason", "") or ""),
+        })
+    registry["tools"].append(entry)
+    save_json(REGISTRY_PATH, registry)
+    result = {"registered": name, "version": str(version), "permanent": True, "trusted": False}
         entry["package"] = True
         entry["package_dir"] = entry_filepath
         entry["deprecated"] = bool(package_info["metadata"].get("deprecated", False))
@@ -3670,6 +3709,11 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         for msg in request.messages:
             content = msg.content[:12000] + ("... [Message truncated in history]" if len(msg.content) > 12000 else "")
             sanitized_messages.append({"role": msg.role, "content": content})
+
+        conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
+        conversation.extend(sanitized_messages)
+        repair_attempts_by_tool: dict[str, int] = {}
+
         conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}, *sanitized_messages]
         public_messages = sanitized_messages.copy()
         repair_attempts_by_tool: dict[str, int] = {}
@@ -3730,8 +3774,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
                 provider = request.provider or load_settings().get("default_provider", "pollinations")
                 model = request.model or load_settings().get("default_model", "openai-fast")
-                
-                # Auto-compaction / Pruning before calling model
                 active_conversation = prune_conversation(conversation)
                 yield sse(
                     "task_step",
@@ -3779,6 +3821,13 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     conversation.append({"role": "assistant", "content": text})
                     conversation.append({"role": "system", "content": build_self_evolution_retry_message(request)})
                     continue
+                if not task_state.steps:
+                    task_state.add_plan(display_text or text)
+                    save_task_state(task_state, DATA_DIR)
+                    yield emit_task_phase("plan", {"goal": task_state.goal, "plan": task_state.plan})
+                if display_text != text.strip():
+                    yield sse("assistant_replace", {"content": display_text})
+                conversation.append({"role": "assistant", "content": text})
                 if display_text != text.strip():
                     yield sse("assistant_replace", {"content": display_text})
                 conversation.append({"role": "assistant", "content": text})
@@ -3800,6 +3849,9 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     break
 
                 yield emit_task_phase("act", {"tool_call_count": len(calls)})
+                restart_turn = False
+                for call in calls:
+                    tool_name = str(call.get("name", ""))
                 repaired_this_turn = False
                 for call in calls:
                     tool_name = str(call.get("name", ""))
@@ -3827,6 +3879,51 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     yield emit_task_phase("act", {"step": step})
 
                     tool = find_tool(tool_name)
+                    policy = summarize_python_execution_policy(str(arguments.get("code", ""))) if tool_name == "execute_python" else None
+                    if policy is not None and policy["action"] == "block":
+                        result = {"error": policy["risk_summary"], "policy": policy}
+                        approved = False
+                    else:
+                        requires_approval = bool(tool is not None and tool.get("requires_approval"))
+                        policy_approved = False
+                        if policy is not None and policy["action"] == "require_approval":
+                            requires_approval = True
+                        if request.auto_approve and not (policy or {}).get("manual_approval_required", False):
+                            requires_approval = False
+                            policy_approved = True
+                        if requires_approval:
+                            result = {"error": "Tool execution requires approval."}
+                            approved = False
+                        else:
+                            yield sse("tool_call", {"tool_name": tool_name, "arguments": arguments})
+                            approved = True
+                            if tool_name == "execute_python":
+                                result = await execute_python(str(arguments.get("code", "")), policy_approved=policy_approved)
+                            elif tool_name == "rollback_latest_checkpoint":
+                                result = rollback_latest_checkpoint()
+                            elif tool_name == "register_tool":
+                                result = register_tool(
+                                    name=str(arguments.get("name", "")),
+                                    description=str(arguments.get("description", "")),
+                                    parameters_schema=arguments.get("parameters_schema", {}),
+                                    filepath=str(arguments.get("filepath", "")),
+                                    requires_approval=bool(arguments.get("requires_approval", False)),
+                                    version=str(arguments.get("version", "1.0.0")),
+                                    source_task_id=arguments.get("source_task_id"),
+                                    test_command=arguments.get("test_command"),
+                                    test_plan=arguments.get("test_plan"),
+                                    sample_arguments=arguments.get("sample_arguments"),
+                                    supersedes=arguments.get("supersedes"),
+                                )
+                            elif tool is not None and not tool.get("builtin"):
+                                result = run_registered_tool(tool, arguments)
+                                update_registered_tool_status(tool_name, str(tool.get("version", "")), increment_use_count=True)
+                            else:
+                                result = {"error": f"Tool {tool_name} not found."}
+                    store_tool_execution(tool_name, arguments, result, approved)
+                    observation = task_state.add_observation(step, result, approved)
+                    save_task_state(task_state, DATA_DIR)
+                    yield sse("tool_result", {"tool_name": tool_name, "result": result, "approved": approved})
                     approved = True
                     policy: dict[str, Any] | None = None
                     approved = True
@@ -3978,6 +4075,14 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if len(result_str) > 10000:
                         result_str = result_str[:10000] + "... [Result truncated for context]"
                     conversation.append({"role": "tool", "content": result_str})
+                    should_evaluate = True
+                    queued_responses = getattr(app.state.model_adapter, "responses", None)
+                    if isinstance(queued_responses, list) and queued_responses:
+                        preview = str(queued_responses[0]).lstrip()
+                        should_evaluate = preview.startswith("{") and "decision" in preview
+                    if should_evaluate:
+                        evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                        yield sse("evaluation", evaluation)
                     yield sse(
                         "task_checkpoint",
                         {
@@ -3995,6 +4100,12 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         if attempt_number <= max_repair_attempts:
                             repair_attempts_by_tool[tool_name] = attempt_number
                             repair_attempt = append_tool_repair_attempt(tool, arguments, result)
+                            conversation.append({"role": "system", "content": build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)})
+                            yield sse("tool_repair", {"tool_name": tool_name, "attempt": attempt_number, "max_attempts": max_repair_attempts, "failure": repair_attempt.get("failure")})
+                            restart_turn = True
+                            break
+                if restart_turn:
+                    continue
                             repair_message = build_tool_repair_message(tool, arguments, result, attempt_number, max_repair_attempts)
                             yield sse("tool_repair", {"tool_name": tool_name, "attempt": attempt_number, "max_attempts": max_repair_attempts, "failure": repair_attempt.get("failure")})
                             conversation.append({"role": "system", "content": repair_message})

@@ -961,6 +961,7 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
         description="Return the provided value as JSON.",
         parameters_schema={"type": "object", "properties": {"value": {"type": "string"}}},
         filepath="tools/flaky_tool.py",
+        test_plan="Exercise failing tool before model repair.",
         test_plan="Intentional failure exercises repair loop.",
         test_plan="Exercise repair loop with an intentionally failing tool.",
     )
@@ -999,6 +1000,9 @@ def test_registered_tool_failure_triggers_model_repair_and_retry(tmp_path, monke
     assert "event: tool_repair" in response.text
     assert "nonzero_exit" in response.text
     assert "The repaired tool succeeded." in response.text
+    assert len(adapter.calls) == 4
+    repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
+    assert any("A registered tool failed. Repair it before continuing." in prompt for prompt in repair_prompts)
     assert "second-run" in response.text
     assert len(adapter.calls) == 4
     repair_prompts = [message["content"] for message in adapter.calls[1] if message["role"] == "system"]
@@ -1141,6 +1145,92 @@ def test_task_runner_continues_until_final_answer_and_persists_state(tmp_path, m
     assert len(task_state["observations"]) == 2
     assert task_state["artifacts"]["final_answer"] == "Final answer after two observations."
 
+
+def test_parent_task_delegates_two_fake_subagents_with_isolation(tmp_path):
+    import subagents
+    from agent_loop import TaskState, save_task_state, load_task_state
+
+    parent = TaskState(goal="merge two isolated research results")
+    save_task_state(parent, tmp_path)
+    calls = []
+
+    class FakeSubagentAdapter:
+        def __init__(self, label):
+            self.responses = [
+                f"Use allowed tool only. <tool_call>{{\"name\":\"fake_tool\",\"arguments\":{{\"label\":\"{label}\"}}}}</tool_call>",
+                f"{label} final",
+            ]
+
+        async def complete(self, messages, model, provider):
+            joined = json.dumps(messages)
+            assert "parent-secret" not in joined
+            yield self.responses.pop(0)
+
+    def fake_runner(tool_name, arguments, spec):
+        calls.append({"tool_name": tool_name, "arguments": arguments, "scope": spec.memory_scope})
+        assert tool_name in spec.allowed_tools
+        assert spec.memory_scope == "provided_context_only"
+        return {"result": f"{arguments['label']}-result", "visible_context": spec.context}
+
+    specs = [
+        subagents.SubagentSpec(
+            goal="alpha",
+            context={"shared": "authorized"},
+            allowed_tools=["fake_tool"],
+            memory_scope="provided_context_only",
+            sandbox_tier="read_only",
+            max_steps=2,
+            parent_task_id=parent.task_id,
+        ),
+        subagents.SubagentSpec(
+            goal="beta",
+            context={"shared": "authorized"},
+            allowed_tools=["fake_tool"],
+            memory_scope="provided_context_only",
+            sandbox_tier="read_only",
+            max_steps=2,
+            parent_task_id=parent.task_id,
+        ),
+    ]
+    runs = [
+        subagents.run_subagent(specs[0], data_dir=tmp_path, model_adapter=FakeSubagentAdapter("alpha"), tool_runner=fake_runner),
+        subagents.run_subagent(specs[1], data_dir=tmp_path, model_adapter=FakeSubagentAdapter("beta"), tool_runner=fake_runner),
+    ]
+
+    reloaded_parent = load_task_state(tmp_path, parent.task_id)
+    assert reloaded_parent is not None
+    assert len(reloaded_parent.subagent_runs) == 2
+    merged = [run.result["answer"] for run in runs]
+    assert merged == ["alpha final", "beta final"]
+    assert [call["tool_name"] for call in calls] == ["fake_tool", "fake_tool"]
+    persisted = list((tmp_path / "subagents").glob("*.json"))
+    assert len(persisted) == 2
+
+
+def test_subagent_blocks_unauthorized_tool_and_does_not_run_it(tmp_path):
+    import subagents
+
+    class UnauthorizedToolAdapter:
+        async def complete(self, messages, model, provider):
+            yield '<tool_call>{"name":"secret_tool","arguments":{"secret":"steal"}}</tool_call>'
+
+    def forbidden_runner(tool_name, arguments, spec):
+        raise AssertionError("unauthorized tool should not execute")
+
+    spec = subagents.SubagentSpec(
+        goal="try unauthorized tool",
+        context={"authorized": "only"},
+        allowed_tools=["fake_tool"],
+        memory_scope="provided_context_only",
+        sandbox_tier="read_only",
+        max_steps=1,
+        parent_task_id="missing-parent-ok",
+    )
+    run = subagents.run_subagent(spec, data_dir=tmp_path, model_adapter=UnauthorizedToolAdapter(), tool_runner=forbidden_runner)
+
+    assert run.denied_tool_calls == [{"tool_name": "secret_tool", "arguments": {"secret": "steal"}}]
+    assert run.state.observations[0]["approved"] is False
+    assert "not allowed" in run.state.observations[0]["result"]["error"]
 def write_archive(tmp_path: Path, session_id: str, created_at: str, content: str, summary: str = "") -> Path:
     path = tmp_path / "data" / "archive" / f"{session_id}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
