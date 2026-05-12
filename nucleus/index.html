@@ -308,6 +308,8 @@
     .message.assistant-msg { border-left-color: var(--white); }
     .message.system-msg { border-left-color: var(--gray-5); }
     .message.tool-msg { border-left-color: var(--gray-3); background: var(--surface); }
+    .message.task-msg { border-left-color: var(--gray-4); background: var(--surface); font-size: 13px; }
+    .message.task-msg .content { color: var(--gray-4); }
     .message.approval-msg { border-left-color: var(--white); border: 1px solid var(--gray-3); background: var(--surface); }
 
     .role {
@@ -796,6 +798,7 @@
       if (r === 'user') return 'user-msg';
       if (r === 'ouroboros' || r === 'assistant') return 'assistant-msg';
       if (r === 'system') return 'system-msg';
+      if (r.includes('task')) return 'task-msg';
       if (r.includes('tool')) return 'tool-msg';
       return '';
     }
@@ -835,6 +838,71 @@
         '</div><pre id="' + id + '" class="json-pre" style="display:none">' +
         escaped + '</pre>';
       addMessage(role, html);
+    }
+
+    const TASK_EVENT_LABELS = {
+      task_started: 'Task started',
+      task_plan: 'Task plan',
+      task_step: 'Task step',
+      task_observation: 'Task observation',
+      task_evaluation: 'Task evaluation',
+      task_retry: 'Task retry',
+      task_checkpoint: 'Task checkpoint',
+      task_done: 'Task done'
+    };
+
+    function describeTaskEvent(eventName, data) {
+      if (eventName === 'task_started') {
+        const parts = ['stream opened'];
+        if (data.provider) parts.push(`provider: ${data.provider}`);
+        if (data.model) parts.push(`model: ${data.model}`);
+        return parts.join(' · ');
+      }
+      if (eventName === 'task_plan') {
+        const steps = Array.isArray(data.steps) ? data.steps.join(' → ') : 'No plan details provided';
+        return `${steps}${data.max_attempts ? ` (max attempts: ${data.max_attempts})` : ''}`;
+      }
+      if (eventName === 'task_step') {
+        const parts = [data.step || 'step'];
+        if (data.tool_name) parts.push(`tool: ${data.tool_name}`);
+        if (data.model) parts.push(`model: ${data.model}`);
+        if (data.attempt) parts.push(`attempt: ${data.attempt}`);
+        return parts.join(' · ');
+      }
+      if (eventName === 'task_observation') {
+        const parts = [data.observation || 'observation'];
+        if (Number.isFinite(data.tool_call_count)) parts.push(`tool calls: ${data.tool_call_count}`);
+        if (data.tool_name) parts.push(`tool: ${data.tool_name}`);
+        if (data.content_length) parts.push(`${data.content_length} chars`);
+        return parts.join(' · ');
+      }
+      if (eventName === 'task_evaluation') {
+        return `${data.status || 'evaluated'} · tool calls: ${data.tool_call_count || 0}`;
+      }
+      if (eventName === 'task_retry') {
+        return `${data.reason || 'retry requested'}${data.next_step ? ` → ${data.next_step}` : ''}`;
+      }
+      if (eventName === 'task_checkpoint') {
+        return `${data.checkpoint || 'checkpoint'}${data.tool_name ? ` · tool: ${data.tool_name}` : ''}`;
+      }
+      if (eventName === 'task_done') {
+        return data.status || 'complete';
+      }
+      return data.message || data.status || JSON.stringify(data);
+    }
+
+    function renderTaskEvent(eventName, data) {
+      const node = document.createElement('div');
+      node.className = 'message task-msg';
+      const role = document.createElement('div');
+      role.className = 'role';
+      role.textContent = TASK_EVENT_LABELS[eventName] || eventName;
+      const content = document.createElement('div');
+      content.className = 'content';
+      content.textContent = describeTaskEvent(eventName, data || {});
+      node.append(role, content);
+      output.appendChild(node);
+      output.scrollTop = output.scrollHeight;
     }
 
     function addChip(item) {
@@ -1246,6 +1314,8 @@
         assistantNode.appendChild(document.createTextNode(data.content));
       } else if (eventName === 'assistant_replace') {
         assistantNode.textContent = data.content;
+      } else if (TASK_EVENT_LABELS[eventName]) {
+        renderTaskEvent(eventName, data);
       } else if (eventName === 'tool_call') {
         renderJsonBlock('Tool call', data);
       } else if (eventName === 'tool_result') {
