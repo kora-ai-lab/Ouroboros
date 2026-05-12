@@ -273,6 +273,49 @@ def test_execute_python_policy_detects_path_open_write():
     assert "filesystem write or mutation" in policy["reasons"]
 
 
+
+
+def test_execute_python_policy_assigns_sandbox_tiers():
+    write_policy = server.summarize_python_execution_policy("open('out.txt', 'w').write('x')")
+    assert write_policy["action"] == "require_approval"
+    assert write_policy["sandbox_tier"] == "workspace_write"
+    assert write_policy["network_risk"] is False
+    assert write_policy["process_risk"] is False
+
+    network_policy = server.summarize_python_execution_policy("import requests\nprint(requests.__name__)")
+    assert network_policy["action"] == "require_approval"
+    assert network_policy["sandbox_tier"] == "network_enabled"
+    assert network_policy["network_risk"] is True
+    assert network_policy["process_risk"] is False
+
+    process_policy = server.summarize_python_execution_policy("import subprocess\nsubprocess.run(['echo', 'x'])")
+    assert process_policy["action"] == "require_approval"
+    assert process_policy["sandbox_tier"] == "host_full"
+    assert process_policy["process_risk"] is True
+
+
+def test_execute_python_workspace_write_blocks_dynamic_outside_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    target = tmp_path / "blocked.txt"
+    code = "import os\npath = os.path.join(os.environ['TMPDIR'], 'blocked.txt')\nopen(path, 'w').write('blocked')"
+    policy = server.summarize_python_execution_policy(code)
+    assert policy["sandbox_tier"] == "workspace_write"
+
+    result = asyncio.run(server.execute_python(code, policy_approved=True))
+
+    assert result["exit_code"] != 0
+    assert "workspace_write sandbox blocks writes outside workspace" in result["stderr"]
+    assert not target.exists()
+
+
+def test_execute_python_read_only_allows_reads():
+    result = asyncio.run(server.execute_python("print(open('README.md', encoding='utf-8').read(1))"))
+
+    assert result["exit_code"] == 0
+    assert result["stdout"].strip()
+    assert result["timed_out"] is False
+
+
 def test_execute_python_approved_execution(tmp_path):
     target = tmp_path / "approved.txt"
     code = f"open({str(target)!r}, 'w').write('approved')"
