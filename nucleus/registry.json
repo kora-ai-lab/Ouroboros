@@ -28,7 +28,12 @@
       "last_error": null,
       "use_count": 0,
       "supersedes": null,
-      "trusted": true
+      "trusted": true,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecated": false,
+      "deprecation_reason": ""
     },
     {
       "name": "rollback_latest_checkpoint",
@@ -38,11 +43,29 @@
         "properties": {}
       },
       "builtin": true,
-      "requires_approval": true
+      "requires_approval": true,
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecated": false,
+      "deprecation_reason": "",
+      "trusted": true,
+      "created_at": "2026-05-12T00:00:00+00:00",
+      "updated_at": "2026-05-12T00:00:00+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Built-in tool covered by application tests.",
+      "sample_arguments": {},
+      "last_test_status": "built_in",
+      "last_error": null,
+      "use_count": 0
     },
     {
       "name": "register_tool",
       "description": "Permanently register a tested Python file or skill package as a versioned tool. Legacy Python files must live under nucleus/tools and include a test_command, test_plan, or sample_arguments. Skill packages must include tool.py, schema.json, README.md, tests.py, metadata.json with permissions, and evals.json.",
+      "description": "Permanently register a tested Python file as a versioned tool. The file must live under nucleus/tools and include a test_command, test_plan, or sample_arguments.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -102,7 +125,74 @@
       "last_error": null,
       "use_count": 0,
       "supersedes": null,
+      "trusted": true,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecated": false,
+      "deprecation_reason": ""
       "trusted": true
+    },
+    {
+      "name": "mcp_bridge",
+      "description": "Generic bridge for configured MCP servers: list servers/tools/resources/prompts, read resources, and call arbitrary MCP tools.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "operation": {
+            "type": "string",
+            "enum": [
+              "list_servers",
+              "list_tools",
+              "call_tool",
+              "list_resources",
+              "read_resource",
+              "list_prompts"
+            ]
+          },
+          "server": {
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "object"
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation"
+        ],
+        "additionalProperties": false
+      },
+      "filepath": "tools/mcp_bridge",
+      "builtin": false,
+      "requires_approval": false,
+      "package": true,
+      "package_dir": "tools/mcp_bridge",
+      "metadata": {
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json"
+      },
+      "version": "1.0.0",
+      "created_at": "2026-05-12T00:00:00+00:00",
+      "updated_at": "2026-05-12T00:00:00+00:00",
+      "source_task_id": null,
+      "test_command": "python nucleus/tools/mcp_bridge/tests.py",
+      "test_plan": "Package smoke test plus adapter unit tests cover generic MCP discovery and call dispatch.",
+      "sample_arguments": {
+        "operation": "list_servers"
+      },
+      "last_test_status": "pending",
+      "last_error": null,
+      "use_count": 0,
+      "supersedes": null,
+      "trusted": false
     }
   ]
 }

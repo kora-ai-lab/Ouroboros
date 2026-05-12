@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string"},
+    "context": {},
+    "allowed_tools": {"type": "array", "items": {"type": "string"}},
+    "memory_scope": {"type": "string"},
+    "sandbox_tier": {"type": "string"},
+    "max_steps": {"type": "integer", "minimum": 1},
+    "parent_task_id": {"type": "string"}
+  },
+  "required": ["goal", "parent_task_id"],
+  "additionalProperties": false
+}
