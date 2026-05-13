@@ -4390,16 +4390,14 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 tool_calls = extract_tool_calls(text)
 
                 if not tool_calls:
-                    if is_capability_refusal(text):
-                        retry_message = build_self_evolution_retry_message(request)
-                        conversation.append({"role": "system", "content": retry_message})
-                        continue
-                    if "?" in text and any(kw in text.lower() for kw in ["what", "which", "how", "do you", "is there", "can you", "should i", "prefer", "want", "veux", "peux", "dois", "quel", "quelle", "quels", "quelles", "quoi", "comment", "pourquoi", "est-ce"]):
-                        conversation.append({"role": "system", "content": "You just asked a question instead of acting. Answer it yourself using execute_python — you have all the tools and context needed."})
-                        continue
                     user_msg = last_user_message(request.messages)
-                    if len(user_msg) > 30 or any(kw in user_msg.lower() for kw in ["find", "create", "read", "write", "setup", "install", "make", "build", "run", "start", "configur", "automat", "lance", "cherche", "crée", "cree", "ouvre", "ecrit", "écrit"]):
-                        conversation.append({"role": "system", "content": "This request requires action, not just conversation. Use execute_python to inspect, prototype, or build what the user asked for."})
+                    if len(user_msg) > 25:
+                        disc_code = "import os, platform, sys; print('OS:', platform.system(), platform.release()); print('Python:', sys.version); print('CWD:', os.getcwd()); print('Files:', [x for x in os.listdir('.') if not x.startswith('.')][:15])"
+                        result, _ = await dispatch_task_tool("execute_python", {"code": disc_code}, policy_approved=True)
+                        result_str = json.dumps(result)
+                        if len(result_str) > 3000:
+                            result_str = result_str[:3000] + "... [truncated]"
+                        conversation.append({"role": "tool", "content": "[auto-executed environment inspection]\n" + result_str})
                         continue
                     break
 

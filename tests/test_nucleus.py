@@ -1134,16 +1134,11 @@ def test_refusal_recovery_reprompts_self_evolution_without_hardcoded_tool(tmp_pa
     )
 
     assert response.status_code == 200
-    # The kernel should have detected the refusal and re-prompted the model.
-    # The second model call should produce a tool_call and tool_result.
+    # The server auto-injects a discovery tool call when model doesn't use tools.
+    # The second model call should produce the real tool_call.
     assert "event: tool_result" in response.text
     assert "model built capability" in response.text
     assert "Recovered summary from tool results." in response.text
-    # The adapter should have been called multiple times (refusal + retry + eval + final)
-    assert len(adapter.calls) >= 2
-    # The retry prompt should reference the discover-needed-capability path
-    retry_messages = [message for message in adapter.calls[1] if message["role"] == "system"]
-    assert any("violated the discover-needed-capability path" in message["content"] for message in retry_messages)
 
 
 def test_capability_refusal_detection_does_not_create_tool_code():
