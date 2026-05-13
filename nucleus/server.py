@@ -3583,12 +3583,10 @@ async def evaluate_tool_result(
 ) -> dict[str, str]:
     conversation.append({"role": "system", "content": build_evaluation_prompt()})
     try:
-        raw_response = await asyncio.wait_for(
-            complete_model_text(prune_conversation(conversation), model, provider),
-            timeout=10.0,
-        )
-    except asyncio.TimeoutError:
-        raw_response = '{"decision":"continue","rationale":"Evaluation timed out."}'
+        raw_response = await complete_model_text(prune_conversation(conversation), model, provider)
+    except Exception as exc:
+        conversation.pop()
+        return {"decision": "continue", "rationale": f"Evaluation unavailable", "error": str(exc)}
     conversation.append({"role": "assistant", "content": raw_response})
     parsed = parse_evaluation_decision(raw_response)
     store_evaluation_decision(session_id, parsed["decision"], parsed["rationale"], raw_response)
@@ -4435,6 +4433,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     continue
 
                 evaluation = await evaluate_tool_result(conversation, session_id, model, provider)
+                if evaluation.get("error"):
+                    yield sse("error", {"message": f"Evaluation: {evaluation['error']}"})
                 yield sse("evaluation", evaluation)
                 if evaluation["decision"] == "rollback":
                     rollback = KERNEL.rollback_latest_checkpoint(caller="eval")
