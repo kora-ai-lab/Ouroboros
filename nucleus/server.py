@@ -584,12 +584,12 @@ KERNEL = KernelBoundary()
 
 
 class ModelAdapter:
-    async def complete(self, messages: list[dict[str, str]], model: str, provider: str) -> AsyncIterator[str]:
+    async def complete(self, messages: list[dict[str, str]], model: str, provider: str, tool_choice: str | None = None) -> AsyncIterator[str]:
         raise NotImplementedError
 
 
 class ProviderAdapter(ModelAdapter):
-    async def complete(self, messages: list[dict[str, str]], model: str, provider: str) -> AsyncIterator[str]:
+    async def complete(self, messages: list[dict[str, str]], model: str, provider: str, tool_choice: str | None = None) -> AsyncIterator[str]:
         provider_config = get_provider(provider)
         provider_type = provider_config.get("type", "openai_compatible")
         if provider_type == "ollama":
@@ -600,7 +600,7 @@ class ProviderAdapter(ModelAdapter):
             async for token in stream_gguf(provider_config, messages, model):
                 yield token
             return
-        async for token in stream_openai_compatible(provider_config, messages, model):
+        async for token in stream_openai_compatible(provider_config, messages, model, tool_choice=tool_choice):
             yield token
 
 
@@ -608,6 +608,7 @@ async def stream_openai_compatible(
     provider_config: dict[str, Any],
     messages: list[dict[str, str]],
     model: str,
+    tool_choice: str | None = None,
 ) -> AsyncIterator[str]:
     base_url = provider_config.get("base_url") or POLLINATIONS_BASE_URL
     api_key = get_provider_api_key_from_config(provider_config)
@@ -615,7 +616,6 @@ async def stream_openai_compatible(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     
-    # Map "tool" role to "user"; skip messages with empty content
     mapped_messages = []
     for i, m in enumerate(messages):
         c = m.get("content", "")
@@ -629,7 +629,24 @@ async def stream_openai_compatible(
     if not mapped_messages:
         raise RuntimeError("All messages had empty content — nothing to send to provider.")
 
-    payload = {"model": model, "messages": mapped_messages, "stream": True}
+    payload: dict[str, Any] = {"model": model, "messages": mapped_messages, "stream": True}
+    if tool_choice:
+        payload["tools"] = [{
+            "type": "function",
+            "function": {
+                "name": "execute_python",
+                "description": "Execute Python code in the Ouroboros project directory. Use this for any task requiring code (HTTP, files, shell, packages, scraping).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "The Python code to execute"}
+                    },
+                    "required": ["code"]
+                },
+            },
+        }]
+        payload["tool_choice"] = tool_choice
+
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream(
             "POST",
@@ -650,6 +667,9 @@ async def stream_openai_compatible(
                     if error_text:
                         detail = f"{error_text[:500]} (HTTP {response.status_code})"
                 raise RuntimeError(detail)
+
+            tc_buffers: dict[int, dict[str, Any]] = {}
+            text_buffer: list[str] = []
             async for line in response.aiter_lines():
                 if not line.startswith("data: "):
                     continue
@@ -664,9 +684,29 @@ async def stream_openai_compatible(
                 if not choices:
                     continue
                 delta = choices[0].get("delta") or {}
-                content = delta.get("content")
-                if content:
-                    yield content
+                if delta.get("content"):
+                    text_buffer.append(delta["content"])
+                    yield delta["content"]
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    if idx not in tc_buffers:
+                        tc_buffers[idx] = {"id": "", "name": "", "arguments": ""}
+                    buf = tc_buffers[idx]
+                    if tc.get("id"):
+                        buf["id"] = tc["id"]
+                    if tc.get("function", {}).get("name"):
+                        buf["name"] = tc["function"]["name"]
+                    if tc.get("function", {}).get("arguments"):
+                        buf["arguments"] += tc["function"]["arguments"]
+
+            if tc_buffers and not text_buffer:
+                for buf in tc_buffers.values():
+                    if buf["name"] == "execute_python":
+                        try:
+                            args = json.loads(buf["arguments"]) if buf["arguments"] else {}
+                        except json.JSONDecodeError:
+                            args = {"code": buf["arguments"]}
+                        yield f"<tool_call>{json.dumps({'name': 'execute_python', 'arguments': args})}</tool_call>"
 
 
 def normalize_runtime_settings(raw_settings: dict[str, Any] | None) -> dict[str, Any]:
@@ -4378,11 +4418,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             except Exception:
                 pass
 
+            force_tool = last_user_message(request.messages)
+            force_tc = "required" if len(force_tool) > 25 else None
+
             for _ in range(max_turns):
                 text = ""
-                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
+                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider, tool_choice=force_tc):
                     text += token
                     yield sse("delta", {"content": token})
+                force_tc = None
 
                 conversation.append({"role": "assistant", "content": text})
                 display_text = strip_tool_calls(text).strip()
@@ -4390,15 +4434,6 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 tool_calls = extract_tool_calls(text)
 
                 if not tool_calls:
-                    user_msg = last_user_message(request.messages)
-                    if len(user_msg) > 25:
-                        disc_code = "import os, platform, sys; print('OS:', platform.system(), platform.release()); print('Python:', sys.version); print('CWD:', os.getcwd()); print('Files:', [x for x in os.listdir('.') if not x.startswith('.')][:15])"
-                        result, _ = await dispatch_task_tool("execute_python", {"code": disc_code}, policy_approved=True)
-                        result_str = json.dumps(result)
-                        if len(result_str) > 3000:
-                            result_str = result_str[:3000] + "... [truncated]"
-                        conversation.append({"role": "tool", "content": "[auto-executed environment inspection]\n" + result_str})
-                        continue
                     break
 
                 restart_turn = False

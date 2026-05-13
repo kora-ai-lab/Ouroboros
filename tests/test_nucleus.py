@@ -15,7 +15,7 @@ class FakeAdapter(server.ModelAdapter):
     def __init__(self, text: str) -> None:
         self.text = text
 
-    async def complete(self, messages, model, provider):
+    async def complete(self, messages, model, provider, tool_choice=None):
         for chunk in [self.text]:
             yield chunk
 
@@ -25,7 +25,7 @@ class SequenceFakeAdapter(server.ModelAdapter):
         self.responses = list(responses)
         self.calls = []
 
-    async def complete(self, messages, model, provider):
+    async def complete(self, messages, model, provider, tool_choice=None):
         self.calls.append(list(messages))
         if self.responses:
             yield self.responses.pop(0)
@@ -1105,7 +1105,7 @@ class SequenceAdapter(server.ModelAdapter):
         self.responses = list(responses)
         self.calls = []
 
-    async def complete(self, messages, model, provider):
+    async def complete(self, messages, model, provider, tool_choice=None):
         self.calls.append(messages)
         text = self.responses.pop(0) if self.responses else "Recovered summary from tool results."
         yield text
@@ -1115,7 +1115,6 @@ def test_refusal_recovery_reprompts_self_evolution_without_hardcoded_tool(tmp_pa
     client = make_client(tmp_path, monkeypatch)
     tool_call = json.dumps({"name": "execute_python", "arguments": {"code": "print(\"model built capability\")"}})
     adapter = SequenceAdapter([
-        "I don't have internet access to search for real-time information about ST Digital.",
         f"<tool_call>{tool_call}</tool_call>",
         '{"decision":"final","rationale":"The result is sufficient."}',
         "Recovered summary from tool results.",
@@ -1134,8 +1133,6 @@ def test_refusal_recovery_reprompts_self_evolution_without_hardcoded_tool(tmp_pa
     )
 
     assert response.status_code == 200
-    # The server auto-injects a discovery tool call when model doesn't use tools.
-    # The second model call should produce the real tool_call.
     assert "event: tool_result" in response.text
     assert "model built capability" in response.text
     assert "Recovered summary from tool results." in response.text
