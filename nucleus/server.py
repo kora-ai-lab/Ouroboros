@@ -4389,13 +4389,14 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     policy = summarize_python_execution_policy(str(arguments.get("code", ""))) if tool_name == "execute_python" else None
                     policy_approved = request.auto_approve
 
-                    if tool_name == "execute_python" and policy and policy.get("action") == "require_approval" and not request.auto_approve:
+                    if not request.auto_approve:
+                        risk = policy.get("risk_summary", f"Tool: {tool_name}") if policy else f"Tool: {tool_name}"
                         pending = PendingApproval(
                             tool_name=tool_name,
                             arguments=arguments,
-                            risk_summary=policy.get("summary", ""),
-                            policy_reasons=policy.get("reasons", []),
-                            sandbox_tier=policy.get("sandbox_tier", "read_only"),
+                            risk_summary=risk,
+                            policy_reasons=policy.get("reasons", []) if policy else [],
+                            sandbox_tier=policy.get("sandbox_tier", "read_only") if policy else "read_only",
                         )
                         app.state.pending_approvals[pending.approval_id] = pending
                         yield sse("approval_request", pending.model_dump())
