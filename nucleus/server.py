@@ -351,6 +351,9 @@ WORKSPACE INDEX CONTEXT:
 
 KORA KNOWLEDGE BASE:
 {kora_context}
+
+CURRENT ENVIRONMENT (discovered, you do not need to ask):
+{environment_dump}
 """
 
 
@@ -1960,6 +1963,26 @@ def retrieve_workspace_index_context(query: str, limit: int = 8, max_chars: int 
     return context
 
 
+def discover_environment() -> str:
+    import platform, shutil
+    lines = []
+    lines.append(f"OS: {platform.system()} {platform.release()}")
+    lines.append(f"Python: {platform.python_version()}")
+    lines.append(f"Host: {platform.node()}")
+    lines.append(f"CWD: {os.getcwd()}")
+    lines.append(f"Project root: {ROOT_DIR}")
+    lines.append(f"Nucleus dir: {BASE_DIR}")
+    env_keys = {k for k in os.environ if k.startswith(("OUROBOROS_", "POLLINATIONS_", "OPENAI_"))}
+    if env_keys:
+        for k in sorted(env_keys):
+            lines.append(f"ENV {k}={'SET' if os.environ.get(k) else 'UNSET'}")
+    docker_path = shutil.which("docker")
+    lines.append(f"Docker: {'available at ' + docker_path if docker_path else 'not found'}")
+    git_path = shutil.which("git")
+    lines.append(f"Git: {'available at ' + git_path if git_path else 'not found'}")
+    return "\n".join(lines)
+
+
 def build_system_prompt(request: ChatRequest) -> str:
     facts = json.dumps(load_json(FACTS_PATH, DEFAULT_FACTS), indent=2)
     registry = json.dumps(load_registry(), indent=2)
@@ -1968,36 +1991,35 @@ def build_system_prompt(request: ChatRequest) -> str:
     if not recalled_text:
         recalled_text = "No relevant memories found."
     else:
-        # Cap recalled memories
         if len(recalled_text) > 4000:
             recalled_text = recalled_text[:4000] + "... [truncated]"
     
-    # Cap context files
     context_parts = []
     total_chars = 0
     for item in request.context_files:
         content = item.content
         if len(content) > 8000:
             content = content[:8000] + "... [file truncated]"
-        
         part = f"### {item.name}\n{content}"
         if total_chars + len(part) > 24000:
             context_parts.append(f"### {item.name}\n[OMITTED: Context too large]")
             break
         context_parts.append(part)
         total_chars += len(part)
-        
     context_file_text = "\n\n".join(context_parts)
     kora_context = load_kora_context()
     if context_file_text:
         kora_context = f"{kora_context}\n\nUploaded context files:\n{context_file_text}"
         
+    env_dump = discover_environment()
+
     return SYSTEM_TEMPLATE.format(
         tool_registry=registry,
         facts=facts,
         recalled_memories=recalled_text,
         workspace_index_context=retrieve_workspace_index_context(first_query),
         kora_context=kora_context,
+        environment_dump=env_dump,
     )
 
 
