@@ -4434,6 +4434,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 tool_calls = extract_tool_calls(text)
 
                 if not tool_calls:
+                    if force_tc == "required":
+                        disc_code = "import os, platform, sys; print('OS:', platform.system(), platform.release()); print('Python:', sys.version); print('CWD:', os.getcwd()); print('Files:', [x for x in os.listdir('.') if not x.startswith('.')][:15])"
+                        result, _ = await dispatch_task_tool("execute_python", {"code": disc_code}, policy_approved=True)
+                        yield sse("tool_result", {"tool": "execute_python", "result": result})
+                        result_str = json.dumps(result)
+                        if len(result_str) > 3000:
+                            result_str = result_str[:3000] + "... [truncated]"
+                        conversation.append({"role": "tool", "content": "[auto-executed environment inspection]\n" + result_str})
+                        continue
                     break
 
                 restart_turn = False
