@@ -3582,7 +3582,13 @@ async def evaluate_tool_result(
     provider: str,
 ) -> dict[str, str]:
     conversation.append({"role": "system", "content": build_evaluation_prompt()})
-    raw_response = await complete_model_text(prune_conversation(conversation), model, provider)
+    try:
+        raw_response = await asyncio.wait_for(
+            complete_model_text(prune_conversation(conversation), model, provider),
+            timeout=10.0,
+        )
+    except asyncio.TimeoutError:
+        raw_response = '{"decision":"continue","rationale":"Evaluation timed out."}'
     conversation.append({"role": "assistant", "content": raw_response})
     parsed = parse_evaluation_decision(raw_response)
     store_evaluation_decision(session_id, parsed["decision"], parsed["rationale"], raw_response)
