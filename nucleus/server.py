@@ -4313,10 +4313,8 @@ def parse_iso_datetime(value: str | None, fallback: datetime | None = None) -> d
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
         session_id = str(uuid.uuid4())
-        env_discovery = discover_environment()
         conversation: list[dict[str, str]] = [
             {"role": "system", "content": build_system_prompt(request)},
-            {"role": "tool", "content": f"[auto-discovered environment]\n{env_discovery}"},
         ]
         sanitized_messages: list[dict[str, str]] = []
         for msg in request.messages:
@@ -4343,6 +4341,24 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         max_repair_attempts = tool_repair_max_attempts()
 
         try:
+            # Auto-discover project structure on first turn
+            try:
+                disc_lines = ["[auto-discovered project structure]"]
+                for item in sorted(ROOT_DIR.iterdir()):
+                    if item.is_dir() and not item.name.startswith("."):
+                        disc_lines.append(f"  {item.name}/")
+                    elif item.is_file() and item.suffix in {".py", ".json", ".md", ".txt", ".toml", ".yaml", ".yml"}:
+                        disc_lines.append(f"  {item.name}")
+                if BASE_DIR.exists() and BASE_DIR != ROOT_DIR:
+                    disc_lines.append("")
+                    disc_lines.append("NUCLEUS/:")
+                    for x in sorted(BASE_DIR.iterdir()):
+                        if not x.name.startswith("."):
+                            disc_lines.append(f"  {x.name}")
+                conversation.append({"role": "tool", "content": "\n".join(disc_lines)})
+            except Exception:
+                pass
+
             for _ in range(max_turns):
                 text = ""
                 async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
@@ -4358,6 +4374,9 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     if is_capability_refusal(text):
                         retry_message = build_self_evolution_retry_message(request)
                         conversation.append({"role": "system", "content": retry_message})
+                        continue
+                    if "?" in text and any(kw in text.lower() for kw in ["what", "which", "how", "do you", "is there", "can you", "should i", "prefer", "want"]):
+                        conversation.append({"role": "system", "content": "You just asked a question instead of acting. Answer it yourself using execute_python — you have all the tools and context needed."})
                         continue
                     break
 
