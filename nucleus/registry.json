@@ -36,36 +36,8 @@
       "deprecation_reason": ""
     },
     {
-      "name": "rollback_latest_checkpoint",
-      "description": "Restore the latest file mutation checkpoint created before an approved risky Python execution.",
-      "parameters": {
-        "type": "object",
-        "properties": {}
-      },
-      "builtin": true,
-      "requires_approval": true,
-      "version": "1.0.0",
-      "supersedes": null,
-      "created_by_task_id": null,
-      "eval_score": null,
-      "rollback_to": null,
-      "deprecated": false,
-      "deprecation_reason": "",
-      "trusted": true,
-      "created_at": "2026-05-12T00:00:00+00:00",
-      "updated_at": "2026-05-12T00:00:00+00:00",
-      "source_task_id": null,
-      "test_command": null,
-      "test_plan": "Built-in tool covered by application tests.",
-      "sample_arguments": {},
-      "last_test_status": "built_in",
-      "last_error": null,
-      "use_count": 0
-    },
-    {
       "name": "register_tool",
-      "description": "Permanently register a tested Python file or skill package as a versioned tool. Legacy Python files must live under nucleus/tools and include a test_command, test_plan, or sample_arguments. Skill packages must include tool.py, schema.json, README.md, tests.py, metadata.json with permissions, and evals.json.",
-      "description": "Permanently register a tested Python file as a versioned tool. The file must live under nucleus/tools and include a test_command, test_plan, or sample_arguments.",
+      "description": "Permanently register a tested Python file or skill package as a versioned tool. Skill packages live under nucleus/tools/ and contain tool.py, schema.json, README.md, tests.py, metadata.json with permissions, and evals.json.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -131,7 +103,49 @@
       "rollback_to": null,
       "deprecated": false,
       "deprecation_reason": ""
-      "trusted": true
+    },
+    {
+      "name": "delegate_subagent",
+      "description": "Delegate bounded work to an isolated subagent with constrained tools, memory scope, sandbox tier, and step limit.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "goal": {"type": "string"},
+          "context": {},
+          "allowed_tools": {"type": "array", "items": {"type": "string"}},
+          "memory_scope": {"type": "string"},
+          "sandbox_tier": {"type": "string"},
+          "max_steps": {"type": "integer", "minimum": 1},
+          "parent_task_id": {"type": "string"}
+        },
+        "required": ["goal", "parent_task_id"]
+      },
+      "filepath": "tools/delegate_subagent",
+      "builtin": false,
+      "requires_approval": false,
+      "package": true,
+      "package_dir": "tools/delegate_subagent",
+      "metadata": {"version": "1.0.0", "deprecated": false, "deprecation_reason": "", "output_format": "json"},
+      "version": "1.0.0",
+      "created_at": "2026-05-12T00:00:00+00:00",
+      "updated_at": "2026-05-12T00:00:00+00:00",
+      "source_task_id": null,
+      "test_command": "python nucleus/tools/delegate_subagent/tests.py",
+      "test_plan": "Package tests cover subprocess delegation and JSON output.",
+      "sample_arguments": {
+        "goal": "summarize provided context",
+        "context": {"note": "sample"},
+        "allowed_tools": [],
+        "memory_scope": "provided_context_only",
+        "sandbox_tier": "read_only",
+        "max_steps": 1,
+        "parent_task_id": "sample-parent"
+      },
+      "last_test_status": "pending",
+      "last_error": null,
+      "use_count": 0,
+      "supersedes": null,
+      "trusted": false
     },
     {
       "name": "mcp_bridge",
@@ -150,22 +164,12 @@
               "list_prompts"
             ]
           },
-          "server": {
-            "type": "string"
-          },
-          "tool_name": {
-            "type": "string"
-          },
-          "arguments": {
-            "type": "object"
-          },
-          "uri": {
-            "type": "string"
-          }
+          "server": {"type": "string"},
+          "tool_name": {"type": "string"},
+          "arguments": {"type": "object"},
+          "uri": {"type": "string"}
         },
-        "required": [
-          "operation"
-        ],
+        "required": ["operation"],
         "additionalProperties": false
       },
       "filepath": "tools/mcp_bridge",
@@ -173,21 +177,14 @@
       "requires_approval": false,
       "package": true,
       "package_dir": "tools/mcp_bridge",
-      "metadata": {
-        "version": "1.0.0",
-        "deprecated": false,
-        "deprecation_reason": "",
-        "output_format": "json"
-      },
+      "metadata": {"version": "1.0.0", "deprecated": false, "deprecation_reason": "", "output_format": "json"},
       "version": "1.0.0",
       "created_at": "2026-05-12T00:00:00+00:00",
       "updated_at": "2026-05-12T00:00:00+00:00",
       "source_task_id": null,
       "test_command": "python nucleus/tools/mcp_bridge/tests.py",
       "test_plan": "Package smoke test plus adapter unit tests cover generic MCP discovery and call dispatch.",
-      "sample_arguments": {
-        "operation": "list_servers"
-      },
+      "sample_arguments": {"operation": "list_servers"},
       "last_test_status": "pending",
       "last_error": null,
       "use_count": 0,

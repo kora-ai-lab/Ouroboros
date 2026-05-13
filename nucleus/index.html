@@ -781,6 +781,7 @@
     let settingsState = null;
     let activeSessionId = null;
     let sessionRecords = [];
+    let currentChatAbort = null;
 
     const LOCAL_RUNTIME_PRESETS = {
       safe: { n_threads: 4, n_gpu_layers: 0, n_ctx: 2048, n_batch: 256, n_ubatch: 256, use_mmap: true, use_mlock: false, flash_attn: false },
@@ -971,6 +972,10 @@
     }
 
     async function loadSession(sessionId, confirmReplace = true) {
+      if (currentChatAbort) {
+        currentChatAbort.abort();
+        currentChatAbort = null;
+      }
       if (confirmReplace && messages.length && !confirm('Replace current chat with this session?')) return;
       const res = await fetch(`/sessions/${sessionId}`);
       if (!res.ok) throw new Error(await res.text());
@@ -1419,6 +1424,12 @@
     }
 
     async function sendMessage(text) {
+      if (currentChatAbort) {
+        currentChatAbort.abort();
+      }
+      const abort = new AbortController();
+      currentChatAbort = abort;
+
       messages.push({ role: 'user', content: text });
       addTextMessage('User', text);
       const assistantNode = addTextMessage('Ouroboros', '');
@@ -1434,7 +1445,8 @@
           provider: providerSelect.value || 'pollinations',
           context_files: contextFiles,
           auto_approve: autoApproveToggle.checked
-        })
+        }),
+        signal: abort.signal,
       });
 
       const reader = response.body.getReader();
@@ -1463,6 +1475,10 @@
         }
       }
 
+      if (abort.signal.aborted) {
+        sendButton.disabled = false;
+        return;
+      }
       messages.push({ role: 'assistant', content: assistantText });
       try {
         await persistSessionArchive();
