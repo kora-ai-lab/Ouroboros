@@ -4375,7 +4375,7 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                         retry_message = build_self_evolution_retry_message(request)
                         conversation.append({"role": "system", "content": retry_message})
                         continue
-                    if "?" in text and any(kw in text.lower() for kw in ["what", "which", "how", "do you", "is there", "can you", "should i", "prefer", "want"]):
+                    if "?" in text and any(kw in text.lower() for kw in ["what", "which", "how", "do you", "is there", "can you", "should i", "prefer", "want", "veux", "peux", "dois", "quel", "quelle", "quels", "quelles", "quoi", "comment", "pourquoi", "est-ce"]):
                         conversation.append({"role": "system", "content": "You just asked a question instead of acting. Answer it yourself using execute_python — you have all the tools and context needed."})
                         continue
                     break
