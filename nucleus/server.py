@@ -4421,20 +4421,23 @@ async def chat(request: ChatRequest) -> StreamingResponse:
             force_tool = last_user_message(request.messages)
             force_tc = "required" if len(force_tool) > 25 else None
 
+            tool_forced = force_tc == "required"
+
             for _ in range(max_turns):
                 text = ""
                 async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider, tool_choice=force_tc):
                     text += token
                     yield sse("delta", {"content": token})
-                force_tc = None
 
+                force_tc = None
                 conversation.append({"role": "assistant", "content": text})
                 display_text = strip_tool_calls(text).strip()
                 public_messages.append({"role": "assistant", "content": display_text})
                 tool_calls = extract_tool_calls(text)
 
                 if not tool_calls:
-                    if force_tc == "required":
+                    if tool_forced:
+                        tool_forced = False
                         disc_code = "import os, platform, sys; print('OS:', platform.system(), platform.release()); print('Python:', sys.version); print('CWD:', os.getcwd()); print('Files:', [x for x in os.listdir('.') if not x.startswith('.')][:15])"
                         result, _ = await dispatch_task_tool("execute_python", {"code": disc_code}, policy_approved=True)
                         yield sse("tool_result", {"tool": "execute_python", "result": result})
