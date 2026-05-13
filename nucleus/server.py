@@ -306,10 +306,6 @@ You have exactly two built-in tools: execute_python and register_tool. You can e
 
 YOU MUST NEVER SAY "I don't have internet access" OR "I can't do that" OR "I don't have that capability" as the final answer. Do not refuse due to missing tools; build the needed capability with execute_python and register_tool, or request the policy approval, sandbox access, or missing details needed to proceed.
 
-=== ENVIRONMENT (AUTO-DISCOVERED) — USE THIS, DO NOT ASK THE USER ===
-{environment_dump}
-This environment is auto-discovered and available to you. The user should NEVER be asked for this information. All of the above is known.
-
 SELF-EVOLUTION PROTOCOL:
 When you need a capability that is not in your current tool registry:
 1. Write the Python code directly using execute_python to accomplish the task immediately.
@@ -337,9 +333,8 @@ BEHAVIORAL RULES:
 5. You can modify your own nucleus code (read/write files in the nucleus directory) when approved by policy.
 6. For self-modifying repository work, inspect `git status` before edits and again after edits so the user can see the checkpoint state. Use the reusable `nucleus/git_harness.py` helpers through execute_python when useful, or register thin wrappers only when needed.
 7. You do not ask for confirmation more than once per action. If the user asked for something, do it.
-8. DISCOVER ENVIRONMENT, DO NOT ASK: Never ask the user for their OS, file paths, installed software, network config, or any environmental detail. Use execute_python to discover these (e.g. import platform; platform.system(), Path.cwd(), os.listdir(), subprocess.run). The user should never have to tell you information you can discover.
-9. After a tool result is returned, you MUST respond to it: summarize findings or confirm execution.
-10. For PDFs, the pymupdf library is pre-installed.
+8. After a tool result is returned, you MUST respond to it: summarize findings or confirm execution.
+9. For PDFs, the pymupdf library is pre-installed.
 
 CURRENT REGISTERED TOOLS:
 {tool_registry}
@@ -2013,15 +2008,12 @@ def build_system_prompt(request: ChatRequest) -> str:
     if context_file_text:
         kora_context = f"{kora_context}\n\nUploaded context files:\n{context_file_text}"
         
-    env_dump = discover_environment()
-
     return SYSTEM_TEMPLATE.format(
         tool_registry=registry,
         facts=facts,
         recalled_memories=recalled_text,
         workspace_index_context=retrieve_workspace_index_context(first_query),
         kora_context=kora_context,
-        environment_dump=env_dump,
     )
 
 
@@ -4321,7 +4313,11 @@ def parse_iso_datetime(value: str | None, fallback: datetime | None = None) -> d
 async def chat(request: ChatRequest) -> StreamingResponse:
     async def stream() -> AsyncIterator[str]:
         session_id = str(uuid.uuid4())
-        conversation: list[dict[str, str]] = [{"role": "system", "content": build_system_prompt(request)}]
+        env_discovery = discover_environment()
+        conversation: list[dict[str, str]] = [
+            {"role": "system", "content": build_system_prompt(request)},
+            {"role": "tool", "content": f"[auto-discovered environment]\n{env_discovery}"},
+        ]
         sanitized_messages: list[dict[str, str]] = []
         for msg in request.messages:
             content = msg.content[:12000] + ("... [Message truncated in history]" if len(msg.content) > 12000 else "")
