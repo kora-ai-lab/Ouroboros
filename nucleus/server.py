@@ -2034,6 +2034,21 @@ CAPABILITY_REFUSAL_PATTERNS = (
     "cannot browse the web",
     "i don't have that capability",
     "i do not have that capability",
+    "i cannot",
+    "i can't",
+    # French refusals
+    "je n'ai pas la capacité",
+    "je n'ai pas accès",
+    "je ne peux pas",
+    "je suis un modèle de langage",
+    "en tant que modèle de langage",
+    "je ne peux pas accéder",
+    "je n'ai pas les capacités",
+    "désolé, je ne peux pas",
+    "désolé je ne peux pas",
+    "je ne suis pas capable",
+    "je ne peux pas exécuter",
+    "je ne peux pas modifier",
 )
 
 
