@@ -618,6 +618,10 @@ class ProviderAdapter(ModelAdapter):
             async for token in stream_gguf(provider_config, messages, model):
                 yield token
             return
+        if provider_type == "google":
+            async for token in stream_google(provider_config, messages, model):
+                yield token
+            return
         async for token in stream_openai_compatible(provider_config, messages, model, tool_choice=tool_choice):
             yield token
 
@@ -903,6 +907,59 @@ async def stream_gguf(
         await asyncio.sleep(0)
 
 
+async def stream_google(
+    provider_config: dict[str, Any],
+    messages: list[dict[str, str]],
+    model: str,
+) -> AsyncIterator[str]:
+    base_url = provider_config.get("base_url", "").rstrip("/") or "https://generativelanguage.googleapis.com/v1beta"
+    api_key = provider_config.get("_override_key") or get_provider_api_key_from_config(provider_config)
+    if not api_key:
+        raise RuntimeError("Google API key required.")
+    headers = {"Content-Type": "application/json", "X-goog-api-key": api_key}
+    mapped = []
+    for m in messages:
+        role = "user" if m["role"] in ("tool", "system") else m["role"]
+        mapped.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+    payload = {"contents": mapped, "safety_settings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}]}
+    async with httpx.AsyncClient(timeout=60) as client:
+        async with client.stream("POST", f"{base_url}/models/{model}:generateContent?alt=sse", headers=headers, json=payload) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                raise RuntimeError(f"Google API returned HTTP {resp.status_code}: {resp.text[:500]}")
+            async for line in resp.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    candidates = chunk.get("candidates") or []
+                    if not candidates:
+                        continue
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    for part in parts:
+                        if part.get("text"):
+                            yield part["text"]
+
+
+async def discover_google_models(provider_config: dict[str, Any]) -> list[str]:
+    base_url = provider_config.get("base_url", "").rstrip("/") or "https://generativelanguage.googleapis.com/v1beta"
+    api_key = provider_config.get("_override_key") or get_provider_api_key_from_config(provider_config)
+    if not api_key:
+        return []
+    headers = {"X-goog-api-key": api_key}
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(f"{base_url}/models", headers=headers)
+        if response.status_code != 200:
+            return []
+        data = response.json()
+        models = data.get("models", [])
+        return sorted(set(str(m["name"]).split("/")[-1] for m in models if "name" in m))
+
+
 async def discover_openai_compatible_models(provider_config: dict[str, Any]) -> list[str]:
     base_url = provider_config.get("base_url", "").rstrip("/")
     if not base_url:
@@ -1007,6 +1064,8 @@ async def discover_models_for_provider(provider_id: str) -> list[str]:
         return await discover_ollama_models(provider_config)
     if provider_type == "gguf":
         return discover_gguf_models(provider_config)
+    if provider_type == "google":
+        return await discover_google_models(provider_config)
     return await discover_openai_compatible_models(provider_config)
 
 
@@ -1428,8 +1487,8 @@ def normalize_provider_id(provider_id: str) -> str:
 
 def upsert_provider(update: ProviderUpdate) -> dict[str, Any]:
     provider_id = normalize_provider_id(update.id)
-    if update.type not in {"openai_compatible", "ollama", "gguf"}:
-        raise ValueError("Provider type must be openai_compatible, ollama, or gguf.")
+    if update.type not in {"openai_compatible", "ollama", "gguf", "google"}:
+        raise ValueError("Provider type must be openai_compatible, ollama, gguf, or google.")
     settings = load_settings()
     api_key_env = f"{provider_id.upper()}_API_KEY"
     existing = settings["providers"].get(provider_id, {})
