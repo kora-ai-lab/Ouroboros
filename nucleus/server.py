@@ -4869,8 +4869,10 @@ async def get_multiverse() -> JSONResponse:
         return [node]
 
     from glob import glob as _glob
+    from collections import defaultdict
+    session_groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
     ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
-    for apath in sorted(ARCHIVE_DIR.glob("*.json"), reverse=True)[:30]:
+    for apath in sorted(ARCHIVE_DIR.glob("*.json"), reverse=True)[:50]:
         try:
             arch = json.loads(apath.read_text(encoding="utf-8"))
         except Exception:
@@ -4882,8 +4884,9 @@ async def get_multiverse() -> JSONResponse:
         msgs = arch.get("messages", [])
         if msgs:
             first_msg = str(msgs[0].get("content", ""))[:80] if isinstance(msgs[0], dict) else str(msgs[0])[:80]
-        session_node: dict[str, Any] = {
-            "title": summary or first_msg or title, "level": "system_god", "status": "archived",
+        session_title = summary or first_msg or title
+        sys_node: dict[str, Any] = {
+            "title": session_title, "level": "system_god", "status": "archived",
             "children": [], "source": "session", "task_id": sid,
         }
         for m in msgs[-5:]:
@@ -4894,11 +4897,16 @@ async def get_multiverse() -> JSONResponse:
                 for line in content.split("\n")[:3]:
                     if line.strip():
                         wm["children"].append({"title": line.strip()[:100], "level": "continent_emperor", "status": "info", "children": [], "source": "line"})
-            session_node["children"].append(wm)
-        universe_name = "General"
-        u = get_univ(universe_name)
-        g = get_galaxy(u, title[:40] if title else "Session")
-        g["children"].append(session_node)
+            sys_node["children"].append(wm)
+        words = session_title.split()[:3]
+        group_key = " ".join(words) if words else "Other"
+        session_groups[group_key].append(sys_node)
+
+    for group_key, sessions in session_groups.items():
+        u = get_univ("General")
+        g = get_galaxy(u, group_key[:40])
+        for s in sessions:
+            g["children"].append(s)
 
     tasks_dir = DATA_DIR / "tasks"
     if tasks_dir.exists():

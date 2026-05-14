@@ -1010,12 +1010,15 @@
       contentNode.appendChild(node);
     }
 
-    const LEVELS = [
-      'the_one', 'universe_god', 'galaxy_demigod', 'system_god',
-      'world_monarch', 'continent_emperor', 'country_president', 'region_governor',
-      'city_minister', 'district_chief', 'section_chief', 'family_head',
-      'house_chief', 'individual'
-    ];
+    const LEVEL_LABELS = {
+      'the_one': 'THE ONE', 'universe_god': 'UNIVERSE', 'galaxy_demigod': 'GALAXY',
+      'system_god': 'SYSTEM', 'world_monarch': 'WORLD', 'continent_emperor': 'CONTINENT',
+      'country_president': 'COUNTRY', 'region_governor': 'REGION',
+      'city_minister': 'CITY', 'district_chief': 'DISTRICT',
+      'section_chief': 'SECTION', 'family_head': 'FAMILY',
+      'house_chief': 'HOUSE', 'individual': 'INDIVIDUAL',
+      'info': '', 'done': '', 'running': '', 'failed': '', 'active': '', 'error': ''
+    };
     const LEVEL_ICONS = {
       'the_one': '◆', 'universe_god': '◆', 'galaxy_demigod': '✦', 'system_god': '●',
       'world_monarch': '◉', 'continent_emperor': '▸', 'country_president': '▹',
@@ -1076,6 +1079,18 @@
       iconSpan.className = 'mv-icon';
       iconSpan.textContent = hasKids ? '▾' : '·';
       div.appendChild(iconSpan);
+      const levelLabel = LEVEL_LABELS[node.level];
+      if (levelLabel && node.level !== 'the_one') {
+        const tag = document.createElement('span');
+        tag.className = 'mv-label';
+        tag.style.fontSize = '9px';
+        tag.style.background = 'var(--gray-2)';
+        tag.style.padding = '1px 5px';
+        tag.style.borderRadius = '0';
+        tag.style.marginRight = '4px';
+        tag.textContent = levelLabel;
+        div.appendChild(tag);
+      }
       div.appendChild(document.createTextNode(' ' + label));
       if (node.level === 'the_one') {
         const total = countDescendants(node);
