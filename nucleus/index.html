@@ -312,6 +312,14 @@
     .message.task-msg .content { color: var(--gray-4); }
     .message.approval-msg { border-left-color: var(--white); border: 1px solid var(--gray-3); background: var(--surface); }
 
+    .mv-node { padding: 3px 0 3px 16px; font-size: 12px; cursor: pointer; color: var(--gray-4); }
+    .mv-node:hover { color: var(--white); }
+    .mv-node .mv-icon { display:inline-block; width:16px; text-align:center; margin-right:4px; }
+    .mv-node .mv-label { color: var(--gray-3); font-size:10px; margin-left:4px; }
+    .mv-node.mv-ok { color: var(--gray-4); }
+    .mv-node.mv-run { color: var(--white); }
+    .mv-node.mv-pend { color: var(--gray-5); }
+
     .role {
       color: var(--gray-3);
       font-size: 10px;
@@ -605,6 +613,8 @@
         <div id="sessionList"></div>
         <div class="section-title">Episodic Memory</div>
         <div id="memoryList"></div>
+        <div class="section-title" style="cursor:pointer;user-select:none" id="multiverseToggle">Multivers ▸</div>
+        <div id="multiversePanel" style="display:none"></div>
       </div>
     </aside>
 
@@ -1096,6 +1106,49 @@
         memoryList.innerHTML = `<div class="memory-item">Failed to load memories: ${e.message}</div>`;
       }
     }
+
+    async function refreshMultiverse() {
+      const panel = document.getElementById('multiversePanel');
+      if (panel.style.display === 'none') return;
+      try {
+        const sessRes = await fetch('/sessions');
+        const sessData = await sessRes.json();
+        const memRes = await fetch('/memory');
+        const memData = await memRes.json();
+        const groups = {};
+        for (const s of sessData.sessions || []) {
+          const project = 'General';
+          if (!groups[project]) groups[project] = { sessions: [], memories: [] };
+          groups[project].sessions.push(s);
+        }
+        for (const m of memData.memories || []) {
+          const project = 'General';
+          if (!groups[project]) groups[project] = { sessions: [], memories: [] };
+          groups[project].memories.push(m);
+        }
+        let html = '';
+        for (const [universe, data] of Object.entries(groups)) {
+          const total = data.sessions.length + data.memories.length;
+          html += `<div class="mv-node" style="font-weight:600;padding-left:0">◆ ${universe} <span class="mv-label">${total}</span></div>`;
+          for (const s of data.sessions.slice(-5).reverse()) {
+            const label = (s.summary || s.session_id).substring(0, 60);
+            html += `<div class="mv-node">▸ ${label} <span class="mv-label">session</span></div>`;
+          }
+        }
+        panel.innerHTML = html || '<div style="padding:8px;font-size:12px;color:var(--gray-5)">No data yet.</div>';
+      } catch (e) {
+        panel.innerHTML = `<div style="padding:8px;font-size:12px;color:var(--gray-5)">${e.message}</div>`;
+      }
+    }
+
+    document.getElementById('multiverseToggle').addEventListener('click', () => {
+      const panel = document.getElementById('multiversePanel');
+      const toggle = document.getElementById('multiverseToggle');
+      const shown = panel.style.display !== 'none';
+      panel.style.display = shown ? 'none' : 'block';
+      toggle.textContent = shown ? 'Multivers ▸' : 'Multivers ▾';
+      if (!shown) refreshMultiverse();
+    });
 
     function setSettingsStatus(text) {
       settingsStatus.textContent = text;
