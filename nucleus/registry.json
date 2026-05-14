@@ -1,6 +1,13 @@
 {
   "tools": [
     {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
       "name": "execute_python",
       "description": "Execute Python code in the Ouroboros project directory. Use this to test code before registering it as a permanent tool, to read or modify files in the project, and to gain any capability you need. Returns stdout, stderr, exit_code.",
       "parameters": {
@@ -17,7 +24,6 @@
       },
       "builtin": true,
       "requires_approval": true,
-      "version": "1.0.0",
       "created_at": "2026-05-12T00:00:00+00:00",
       "updated_at": "2026-05-12T00:00:00+00:00",
       "source_task_id": null,
@@ -27,15 +33,16 @@
       "last_test_status": "built_in",
       "last_error": null,
       "use_count": 0,
+      "trusted": true
+    },
+    {
+      "version": "1.0.0",
       "supersedes": null,
-      "trusted": true,
       "created_by_task_id": null,
       "eval_score": null,
       "rollback_to": null,
+      "deprecation_reason": "",
       "deprecated": false,
-      "deprecation_reason": ""
-    },
-    {
       "name": "register_tool",
       "description": "Permanently register a tested Python file or skill package as a versioned tool. Skill packages live under nucleus/tools/ and contain tool.py, schema.json, README.md, tests.py, metadata.json with permissions, and evals.json.",
       "parameters": {
@@ -86,7 +93,6 @@
       },
       "builtin": true,
       "requires_approval": true,
-      "version": "1.0.0",
       "created_at": "2026-05-12T00:00:00+00:00",
       "updated_at": "2026-05-12T00:00:00+00:00",
       "source_task_id": null,
@@ -96,15 +102,16 @@
       "last_test_status": "built_in",
       "last_error": null,
       "use_count": 0,
+      "trusted": true
+    },
+    {
+      "version": "1.0.0",
       "supersedes": null,
-      "trusted": true,
       "created_by_task_id": null,
       "eval_score": null,
       "rollback_to": null,
+      "deprecation_reason": "",
       "deprecated": false,
-      "deprecation_reason": ""
-    },
-    {
       "name": "delegate_subagent",
       "description": "Delegate bounded work to an isolated subagent with constrained tools, memory scope, sandbox tier, step limit, title, and scope. Title defines the hierarchy level (individual \u2192 universe_god). Scope defines the context boundaries for isolation.",
       "parameters": {
@@ -158,7 +165,6 @@
         "deprecation_reason": "",
         "output_format": "json"
       },
-      "version": "1.0.0",
       "created_at": "2026-05-12T00:00:00+00:00",
       "updated_at": "2026-05-12T00:00:00+00:00",
       "source_task_id": null,
@@ -178,10 +184,16 @@
       "last_test_status": "pending",
       "last_error": null,
       "use_count": 0,
-      "supersedes": null,
       "trusted": false
     },
     {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
       "name": "mcp_bridge",
       "description": "Generic bridge for configured MCP servers: list servers/tools/resources/prompts, read resources, and call arbitrary MCP tools.",
       "parameters": {
@@ -227,7 +239,6 @@
         "deprecation_reason": "",
         "output_format": "json"
       },
-      "version": "1.0.0",
       "created_at": "2026-05-12T00:00:00+00:00",
       "updated_at": "2026-05-12T00:00:00+00:00",
       "source_task_id": null,
@@ -239,7 +250,6 @@
       "last_test_status": "pending",
       "last_error": null,
       "use_count": 0,
-      "supersedes": null,
       "trusted": false
     },
     {
@@ -434,7 +444,103 @@
       "builtin": false,
       "requires_approval": false,
       "metadata": {
-        "repair_attempts": [],
+        "repair_attempts": [
+          {
+            "timestamp": "2026-05-14T16:53:23.514674+00:00",
+            "arguments": {
+              "title": "Kora Lab: African AI Sovereignty Positioning Strategy",
+              "sections": [
+                {
+                  "heading": "Executive Summary",
+                  "content": "Kora Lab is positioned at the convergence of three high-conviction trends: (1) sovereign AI development in Africa, (2) accessibility-first AI design, and (3) neurodivergent founder networks as underexploited talent pools. With zero budget, Kora must move through a capital-efficient path: build credibility through open-source, land early customer pilots, secure seed funding within 12 months.\n\nRecommended positioning: 'Sovereign Multilingual AI for African Accessibility' \u2014 not just a model lab, but a full-stack play that bundles language sovereignty + accessibility + neurodiversity.\n\n**Target Series A**: $1.5-2.5M (18 months out)\n**MVP Launch**: 3 months\n**Seed Funding**: $150-300K (via grants, angels, micro-VCs)"
+                },
+                {
+                  "heading": "African AI Sovereignty Landscape",
+                  "content": "**Tier 1 Competitors** (well-funded, credible):\n- Lelapa AI (South Africa): $500K seed, Zulu/Xhosa/Sotho LLMs\n- Sama (Kenya): $60M+, data supply chain (not pure AI)\n- Masakhane: Open-source NLP research collective\n\n**Kora's Differentiation**:\n- Lelapa owns South Africa; Kora can own West Africa (Francophone + Anglophone)\n- Sama does labor arbitrage; Kora does accessible AI (different TAM)\n- Masakhane is research; Kora is commercialized product + accessibility layer\n\n**Key Insight**: Funding for African AI is flowing, but mostly to either (a) data companies (Sama) or (b) model labs run by established figures (Lelapa founders have prior success). Kora's advantage: neurodiversity narrative + accessibility = ESG appeal + founder differentiation."
+                },
+                {
+                  "heading": "Funding Landscape Pre-Series A",
+                  "content": "**Current Opportunity Window**: 2024-2025\n- Seed funding available: $100K-$500K\n- Sources: OpenAI Fund, Google Startup School, Africa-focused VCs (Founders Factory, Plug & Play)\n- Government grants: Nigeria NITDA, Ghana Innovation Fund, Togo digital transformation budgets\n\n**Gaps in Market**:\n- Limited appetite for pure model-only plays (need application or revenue story)\n- African founders still face 'Africa problem' bias from US investors\n- Geographic arbitrage: Need US co-founder or advisor to unlock US/Europe VC\n\n**Kora's Path**:\n1. **Months 0-3**: Build MVP (Pollinations + accessibility wrapper) + land 2-3 pilot customers\n2. **Months 3-6**: Apply for grants (OpenAI Fund, Google, Africa-focused) + approach micro-VCs\n3. **Months 6-12**: Raise $200-300K seed, hire first team member (engineer or co-founder)\n4. **Months 12-18**: Series A readiness (revenue, active users, strong founding team)"
+                },
+                {
+                  "heading": "Sovereign AI Market Context",
+                  "content": "**Why African Sovereignty Matters**:\n- Data colonialism: African data trains Western AI; value extracted outside Africa\n- Linguistic erasure: Yoruba, Twi, Hausa, French creole severely underrepresented in LLMs\n- Geopolitical: Reliance on US/China AI = infrastructure vulnerability\n- Economic: AI models = tech stack; Africa needs its own\n\n**Market Tailwinds**:\n- African governments (Nigeria, Ghana, Kenya) now mandate local AI deployment\n- Fintech boom in Africa = AI-native businesses required\n- Global ESG + 'reverse colonialism' sentiment supports African AI labs\n- Talent arbitrage: Top African AI engineers cost 1/3 of Bay Area\n\n**Kora's Narrative**:\nNot just 'African AI' (now clich\u00e9d) but **'Accessible Sovereign AI for Neurodivergent Creators in Africa.'** This layers three mission-driven narratives: sovereignty + accessibility + neurodiversity. Rare, defensible, resonant with impact investors."
+                },
+                {
+                  "heading": "Kora's SWOT Analysis",
+                  "content": "**Strengths**:\n- Founder: Kheir Lissi, visionary on African sovereignty + deep neurodiversity network\n- Location: Togo (strategic, West Africa largely underserved)\n- Dual mission: accessibility + sovereignty (resonates with mission-driven funders)\n- EdenVallie incubator: founder network + market insight\n\n**Weaknesses**:\n- Zero budget (requires capital-efficient MVP)\n- Solo founder (single point of failure; need co-founder before Series A)\n- No major prior exits or credentials (must be earned via traction)\n- Dependent on Pollinations (not training own model yet)\n\n**Opportunities**:\n- West Africa underserved: Nigeria has clusters, but Togo/Benin/Ghana fragmented\n- Multilingual focus: Yoruba, Twi, Hausa, French creole = massive TAM\n- Accessibility rare in AI; neurodivergent founders = ESG narrative\n- Government partnerships: Togo digital transformation, WAEMU initiatives\n- Series A in 18 months is realistic with right execution\n\n**Threats**:\n- Better-funded competitors (Lelapa $500K+, Sama at scale)\n- Brain drain: Top African talent recruited to US\n- Pollinations pricing change = moat risk\n- Macro: African VC funding cooling 2024-2025"
+                },
+                {
+                  "heading": "Recommended Go-to-Market Strategy",
+                  "content": "**Phase 1: MVP + Credibility (Months 0-3)**\n1. Build thin accessibility wrapper around Pollinations API\n   - Focus: Yoruba, Twi, Hausa, French (West African languages)\n   - Target: Voice-to-text + text-to-speech for neurodivergent users\n   - Codename: 'Kora Accessible' (beta)\n\n2. Land 3 pilot customers:\n   - EdenVallie community members (neurodivergent founders)\n   - West African fintech companies (for customer support bots)\n   - NGO in Togo (accessibility for education)\n\n3. Open-source language model cards + accessibility benchmarks\n   - Publish on GitHub + Hugging Face\n   - Builds credibility + community\n\n**Phase 2: Grant + Seed Fundraising (Months 3-6)**\n1. Apply for:\n   - OpenAI Fund ($50-100K)\n   - Google Startup School ($25-50K)\n   - Africa Growth Initiative (AGI) grants\n   - Togo government digital transformation funds\n\n2. Approach micro-VCs + angels:\n   - Stripe Press / Stripe Climate (if positioning climate angle)\n   - Africa-focused: The Stack VC, Founders Factory Africa, Plug & Play Africa\n   - Neurodiversity-focused: Founders Fund, Lerer Hippeau (neurodiv track)\n\n**Phase 3: Series A Readiness (Months 12-18)**\n1. Hire co-founder (engineer or biz dev)\n2. Achieve $10K MRR or 5K active users\n3. File for Series A: Target $1.5-2.5M\n\n**Revenue Model (Post-MVP)**:\n- B2B SaaS: Accessibility API for African fintech/e-commerce ($500-2K/month)\n- Open model licensing: For companies training on African language data ($1-5K/month)\n- Government contracts: Accessibility for Togo/WAEMU digital initiatives"
+                },
+                {
+                  "heading": "Immediate Actions (Next 30 Days)",
+                  "content": "**Priority 1: Validate MVP Concept**\n- Interview 5 neurodivergent founders in EdenVallie\n- Interview 3 West African fintech founders (accessibility pain points)\n- Prototype: Build minimal accessibility layer on Pollinations + Twi/Yoruba support\n\n**Priority 2: Build Credibility Foundation**\n- Write & publish: 'Why African Languages Need Sovereign AI' (LinkedIn/Medium)\n- Create landing page: kora-lab.com \u2192 simple value prop + waitlist\n- Join: Masakhane community, Africa.ai, Zindi Africa (network)\n\n**Priority 3: Fundraising Prep**\n- Draft 1-page positioning doc: 'Accessible Sovereign AI for West Africa'\n- Create cap table + financial projections (even with $0 budget)\n- Identify 10 target angels/micro-VCs + warm intro paths via EdenVallie\n\n**Priority 4: Secure First Revenue**\n- Reach out to 3 West African fintech companies\n- Propose: Pilot accessibility layer for customer support (free/discounted)\n- Goal: Get LOI (letter of intent) for $5K pilot"
+                },
+                {
+                  "heading": "Series A Narrative (Future Pitch Deck)",
+                  "content": "**The Narrative Arc**:\n1. **Problem**: African languages underrepresented in AI; accessibility a global blind spot; neurodivergent talent underutilized\n2. **Solution**: Kora Lab = sovereign, accessible, multilingual AI for Africa\n3. **Market**: $50B+ global AI market; Africa + accessibility = $5B+ TAM\n4. **Traction**: 5K users, $50K MRR, 3 government pilots\n5. **Team**: Kheir (sovereignty + neurodiversity visionary) + co-founder + 2 engineers\n6. **Funding**: Series A $1.5-2.5M to scale team, train proprietary Kora Model, expand to East Africa\n7. **Impact**: 1M+ neurodivergent users access African language AI; Africa owns its AI stack\n\n**Key Metrics for Series A**:\n- $50K+ MRR or 10K active users\n- 3+ government/enterprise pilots\n- 2-3 team hires\n- $200K-500K seed raised\n- 18-month runway remaining"
+                },
+                {
+                  "heading": "Risk Mitigation",
+                  "content": "**Risk**: Pollinations pricing changes or API deprecated\n**Mitigation**: Begin planning transition to open-source models (Llama 2, Mistral) by Month 9. Use grant funding to fine-tune on African language data.\n\n**Risk**: Solo founder burnout before Series A\n**Mitigation**: Hire co-founder or part-time advisor by Month 6. Pivot to part-time if needed; don't force full-time without funding.\n\n**Risk**: Better-funded competitors outpace Kora\n**Mitigation**: Lean into accessibility + neurodiversity narrative (defensible). Lelapa won't do this; Sama won't either. Own your niche.\n\n**Risk**: VC bias against African founders\n**Mitigation**: Build US advisor board by Month 6. Pursue government grants + angels first; Series A from mission-driven VCs (not top-tier US VCs).\n\n**Risk**: African VC funding dry-up\n**Mitigation**: Position for US impact investors, not just Africa-focused VCs. Neurodiversity + accessibility resonates in US more than sovereignty alone."
+                },
+                {
+                  "heading": "Conclusion & Next Step",
+                  "content": "Kora Lab is entering a market with strong tailwinds (African sovereign AI, accessibility, neurodiversity) and manageable competition. The path to Series A is clear: build MVP, land 3 pilot customers, raise $200-300K seed, hire co-founder, scale to $50K MRR.\n\nThe unique narrative\u2014accessible sovereign AI for neurodivergent creators in Africa\u2014is defensible and rare. No competitor owns this combination.\n\n**Immediate Next Step**: Execute Priority 1 & 2 this week. By end of Month 1, have validated MVP + 1 pilot customer + published thought leadership. This unlocks Month 3 fundraising.\n\n**Success Metrics (12 months)**:\n- $200-300K seed raised \u2713\n- $10K+ MRR or 5K active users \u2713\n- Co-founder hired \u2713\n- 3 government/enterprise pilots \u2713\n- Series A target defined \u2713\n\nKora is positioned to own West African accessible AI. Go build it."
+                }
+              ],
+              "format": "markdown"
+            },
+            "failure": {
+              "type": "malformed_output",
+              "message": "Registered tool produced no JSON output."
+            },
+            "result": {
+              "stdout": "",
+              "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 56, in <module>\n    _runpy.run_path(_ouro_tool_path, run_name='__main__')\n    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<frozen runpy>\", line 287, in run_path\n  File \"<frozen runpy>\", line 98, in _run_module_code\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"C:\\Users\\junio\\Downloads\\Ouroboros\\nucleus\\tools\\report_builder\\tool.py\", line 6, in <module>\n    ARTIFACTS_DIR = Path.home() / \".ouroboros\" / \"artifacts\"\n                    ~~~~~~~~~^^\n  File \"C:\\Python313\\Lib\\pathlib\\_abc.py\", line 758, in home\n  File \"C:\\Python313\\Lib\\pathlib\\_local.py\", line 808, in expanduser\nRuntimeError: Could not determine home directory.\n",
+              "exit_code": 1,
+              "timed_out": false,
+              "duration_ms": 130,
+              "malformed_output": true,
+              "error": "Registered tool produced no JSON output."
+            }
+          },
+          {
+            "timestamp": "2026-05-14T19:52:31.427095+00:00",
+            "arguments": {
+              "title": "Kora Lab: African AI Sovereignty & Funding Landscape Strategy",
+              "sections": [
+                {
+                  "heading": "African AI Sovereignty: Strategic Positioning",
+                  "content": "Sovereignty in the African AI context is shifting from theoretical research to commercialized infrastructure. Kora Lab's advantage lies in being a 'full-stack' accessibility play. Unlike peers, Kora is not just building a foundation model, but an accessibility-first layer (neurodiversity focus) that uses sovereign datasets to solve local pain points. Recommended positioning: 'The Sovereign Interface for African Accessibility'."
+                },
+                {
+                  "heading": "Pre-Series A Funding Landscape (2024-2025)",
+                  "content": "The current landscape is fragmented. Grants (OpenAI Fund, Google Startup School, and regional government budgets) are the primary sources for $25K-$100K. Impact investors focus on 'reverse colonialism' and ESG-aligned AI. Micro-VCs (Founders Factory Africa, The Stack VC) seek localized use-cases. Strategy: Pitch as a specialized sovereignty tool that solves accessibility gaps, which de-risks the 'model training' cost significantly."
+                },
+                {
+                  "heading": "Operational Recommendations",
+                  "content": "1. MVP: Build a thin accessibility-first API wrapper over existing open-source models that specializes in West African linguistic nuances. 2. Funding Path: Secure $100K in grant/pre-seed capital within 6 months. 3. Traction: Target 3 pilot enterprise customers (fintech/ngo) to generate the revenue story required for a $1.5M+ Series A."
+                }
+              ]
+            },
+            "failure": {
+              "type": "malformed_output",
+              "message": "Registered tool produced no JSON output."
+            },
+            "result": {
+              "stdout": "",
+              "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 56, in <module>\n    _runpy.run_path(_ouro_tool_path, run_name='__main__')\n    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<frozen runpy>\", line 287, in run_path\n  File \"<frozen runpy>\", line 98, in _run_module_code\n  File \"<frozen runpy>\", line 88, in _run_code\n  File \"C:\\Users\\junio\\Downloads\\Ouroboros\\nucleus\\tools\\report_builder\\tool.py\", line 48, in <module>\n    main()\n    ~~~~^^\n  File \"C:\\Users\\junio\\Downloads\\Ouroboros\\nucleus\\tools\\report_builder\\tool.py\", line 39, in main\n    result = build_report(\n        title=str(args.get(\"title\", \"Untitled\")),\n        sections=args.get(\"sections\", []),\n        fmt=str(args.get(\"format\", \"markdown\")),\n    )\n  File \"C:\\Users\\junio\\Downloads\\Ouroboros\\nucleus\\tools\\report_builder\\tool.py\", line 14, in build_report\n    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)\n    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"<string>\", line 33, in wrapper\n    _check(self, True)\n    ~~~~~~^^^^^^^^^^^^\n  File \"<string>\", line 19, in _check\n    raise PermissionError(('undeclared filesystem write access: ' if write else 'undeclared filesystem read access: ')+_os.fspath(path))\nPermissionError: undeclared filesystem write access: C:\\Users\\junio\\Downloads\\Ouroboros\\.ouroboros\\artifacts\n",
+              "exit_code": 1,
+              "timed_out": false,
+              "duration_ms": 109,
+              "malformed_output": true,
+              "error": "Registered tool produced no JSON output."
+            }
+          }
+        ],
         "version": "1.0.0",
         "deprecated": false,
         "deprecation_reason": "",
@@ -452,17 +558,19 @@
             "allow": false
           },
           "secrets": []
-        }
+        },
+        "last_repair_attempt_at": "2026-05-14T19:52:31.427095+00:00",
+        "repair_attempt_count": 2
       },
       "created_at": "2026-05-14T13:56:25.625723+00:00",
-      "updated_at": "2026-05-14T13:56:25.625723+00:00",
+      "updated_at": "2026-05-14T19:52:31.439420+00:00",
       "source_task_id": null,
       "test_command": null,
       "test_plan": "Package tests passed.",
       "sample_arguments": {},
       "last_test_status": "passed",
       "last_error": null,
-      "use_count": 0,
+      "use_count": 2,
       "trusted": true,
       "package": true,
       "package_dir": "tools\\report_builder"
@@ -641,6 +749,82 @@
       "trusted": true,
       "package": true,
       "package_dir": "tools\\delegation_router"
+    },
+    {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
+      "name": "research_tool",
+      "description": "Search DuckDuckGo and optionally scrape web pages for research.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Research query \u2014 what to search for"
+          },
+          "sources": {
+            "type": "integer",
+            "description": "Max sources to return",
+            "default": 5
+          },
+          "depth": {
+            "type": "string",
+            "enum": [
+              "quick",
+              "deep"
+            ],
+            "default": "quick",
+            "description": "quick = search + extract snippets; deep = search + scrape full pages"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "filepath": "tools\\research_tool",
+      "builtin": false,
+      "requires_approval": false,
+      "metadata": {
+        "repair_attempts": [],
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json",
+        "permissions": {
+          "filesystem": [],
+          "network": [
+            {
+              "host": "*",
+              "ports": [
+                80,
+                443
+              ]
+            }
+          ],
+          "environment": [],
+          "process": {
+            "allow": false
+          },
+          "secrets": []
+        }
+      },
+      "created_at": "2026-05-14T20:54:30.567810+00:00",
+      "updated_at": "2026-05-14T20:54:30.567810+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Package tests passed.",
+      "sample_arguments": {},
+      "last_test_status": "passed",
+      "last_error": null,
+      "use_count": 0,
+      "trusted": true,
+      "package": true,
+      "package_dir": "tools\\research_tool"
     }
   ]
 }
