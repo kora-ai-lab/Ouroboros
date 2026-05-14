@@ -318,7 +318,10 @@
     .mv-node .mv-label { color: var(--gray-3); font-size:10px; margin-left:4px; }
     .mv-node.mv-ok { color: var(--gray-4); }
     .mv-node.mv-run { color: var(--white); }
+    .mv-node.mv-fail { color: #ff6b6b; }
     .mv-node.mv-pend { color: var(--gray-5); }
+    .mv-children { margin-left: 0; }
+    .mv-node[data-level="the_one"] { font-weight:700; color:var(--white); font-size:13px; border-bottom:1px solid var(--gray-3); padding-bottom:6px; margin-bottom:6px; }
 
     .role {
       color: var(--gray-3);
@@ -1107,35 +1110,63 @@
       }
     }
 
+    const LEVEL_ICONS = {
+      'the_one': '◆', 'universe_god': '◆', 'galaxy_demigod': '✦', 'system_god': '●',
+      'world_monarch': '◉', 'continent_emperor': '▸', 'country_president': '▹',
+      'info': '·', 'done': '✓', 'running': '◌', 'failed': '✗', 'active': '●', 'error': '⚠',
+      'artifact': '📄', 'denial': '⊘',
+    };
+    function renderTree(node, depth) {
+      if (!node) return '';
+      const icon = LEVEL_ICONS[node.level] || '·';
+      const status = node.status === 'running' ? 'mv-run' : node.status === 'done' || node.status === 'completed' ? 'mv-ok' : node.status === 'error' || node.status === 'failed' ? 'mv-fail' : '';
+      const kids = node.children || [];
+      const hasKids = kids.length > 0;
+      const padding = depth * 16;
+      let label = node.title || '';
+      if (node.level === 'the_one') label = '◆ The One (Ouroboros)';
+      let html = `<div class="mv-node ${status}" style="padding-left:${padding}px" data-depth="${depth}" data-level="${node.level}">`;
+      html += `<span class="mv-icon">${hasKids ? '▾' : '·'}</span> ${label}`;
+      if (node.level === 'the_one') {
+        const total = countDescendants(node);
+        html += ` <span class="mv-label">${total} descendants · Overseer of All</span>`;
+      }
+      if (node.task_id) html += ` <span class="mv-label" style="cursor:pointer" data-task="${node.task_id}">[details]</span>`;
+      html += '</div>';
+      if (hasKids) {
+        html += '<div class="mv-children">';
+        for (const kid of kids) {
+          html += renderTree(kid, depth + 1);
+        }
+        html += '</div>';
+      }
+      return html;
+    }
+    function countDescendants(node) {
+      let n = 0;
+      for (const c of (node.children || [])) { n += 1 + countDescendants(c); }
+      return n;
+    }
+
     async function refreshMultiverse() {
       const panel = document.getElementById('multiversePanel');
       if (panel.style.display === 'none') return;
       try {
-        const sessRes = await fetch('/sessions');
-        const sessData = await sessRes.json();
-        const memRes = await fetch('/memory');
-        const memData = await memRes.json();
-        const groups = {};
-        for (const s of sessData.sessions || []) {
-          const project = 'General';
-          if (!groups[project]) groups[project] = { sessions: [], memories: [] };
-          groups[project].sessions.push(s);
-        }
-        for (const m of memData.memories || []) {
-          const project = 'General';
-          if (!groups[project]) groups[project] = { sessions: [], memories: [] };
-          groups[project].memories.push(m);
-        }
-        let html = '';
-        for (const [universe, data] of Object.entries(groups)) {
-          const total = data.sessions.length + data.memories.length;
-          html += `<div class="mv-node" style="font-weight:600;padding-left:0">◆ ${universe} <span class="mv-label">${total}</span></div>`;
-          for (const s of data.sessions.slice(-5).reverse()) {
-            const label = (s.summary || s.session_id).substring(0, 60);
-            html += `<div class="mv-node">▸ ${label} <span class="mv-label">session</span></div>`;
-          }
-        }
-        panel.innerHTML = html || '<div style="padding:8px;font-size:12px;color:var(--gray-5)">No data yet.</div>';
+        const res = await fetch('/multiverse');
+        const tree = await res.json();
+        panel.innerHTML = renderTree(tree, 0);
+        panel.querySelectorAll('[data-task]').forEach(el => {
+          el.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const taskId = el.dataset.task;
+            setStatus(`Loading task ${taskId}...`);
+            try {
+              const r = await fetch(`/sessions/${taskId}`);
+              if (r.ok) await loadSession(taskId, true);
+              else setStatus(`Task ${taskId}: ${r.status}`);
+            } catch (err) { setStatus(err.message); }
+          });
+        });
       } catch (e) {
         panel.innerHTML = `<div style="padding:8px;font-size:12px;color:var(--gray-5)">${e.message}</div>`;
       }
@@ -1377,7 +1408,32 @@
       } else if (eventName === 'tool_call') {
         renderJsonBlock('Tool call', data);
       } else if (eventName === 'tool_result') {
-        renderJsonBlock('Tool result', data);
+        const toolName = data.tool || 'tool';
+        const node = document.createElement('div');
+        node.className = 'message assistant-msg';
+        node.style.cursor = 'pointer';
+        const role = document.createElement('div');
+        role.className = 'role';
+        role.textContent = `Subsession: ${toolName}`;
+        const summary = document.createElement('div');
+        summary.className = 'content';
+        const exitCode = data.result && data.result.exit_code !== undefined ? data.result.exit_code : '?';
+        const stderr = data.result && data.result.stderr ? (data.result.stderr.substring(0, 80)) : '';
+        summary.textContent = `exit: ${exitCode}${stderr ? ' · ' + stderr : ''}`;
+        node.appendChild(role);
+        node.appendChild(summary);
+        const detail = document.createElement('div');
+        detail.style.display = 'none';
+        detail.style.marginTop = '8px';
+        detail.style.fontSize = '11px';
+        detail.style.color = 'var(--gray-4)';
+        detail.style.fontFamily = 'monospace';
+        detail.style.whiteSpace = 'pre-wrap';
+        detail.textContent = JSON.stringify(data, null, 2);
+        node.appendChild(detail);
+        node.addEventListener('click', () => { detail.style.display = detail.style.display === 'none' ? 'block' : 'none'; });
+        output.appendChild(node);
+        output.scrollTop = output.scrollHeight;
       } else if (eventName === 'approval_request') {
         renderApprovalRequest(data);
       } else if (eventName === 'error') {

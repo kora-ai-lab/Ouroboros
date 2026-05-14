@@ -4521,6 +4521,27 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     disc_str = disc_str[:3000] + "... [truncated]"
                 conversation.append({"role": "tool", "content": "[environment auto-discovered]\n" + disc_str})
 
+                proj_name: str | None = None
+                for kw in ["dans ", "dans le projet ", "sur le projet ", "pour le projet ", "dans l'entreprise ", "dans "]:
+                    idx = user_msg.lower().find(kw)
+                    if idx >= 0:
+                        after = user_msg[idx + len(kw):].strip().split()[0].strip(".,!?;:'\"")
+                        if after:
+                            proj_name = after
+                            break
+                if proj_name:
+                    try:
+                        import json as _json
+                        wf = Path.home() / ".ouroboros" / "workspace.json"
+                        if wf.exists():
+                            ws = _json.loads(wf.read_text(encoding="utf-8"))
+                            project = ws.get("projects", {}).get(proj_name)
+                            if project:
+                                conv_ctx = f"[project context auto-detected: {proj_name}]\nroot: {project.get('root', 'unknown')}"
+                                conversation.append({"role": "tool", "content": conv_ctx})
+                    except Exception:
+                        pass
+
             for _ in range(max_turns):
                 text = ""
                 async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
@@ -4812,6 +4833,102 @@ async def create_goal(request: GoalCreateRequest) -> JSONResponse:
         )
         conn.commit()
     return JSONResponse({"goal": {"id": goal_id, "title": request.title, "description": request.description, "status": request.status, "created_at": timestamp, "updated_at": timestamp}})
+
+
+@app.get("/multiverse")
+async def get_multiverse() -> JSONResponse:
+    goals_rows: list[sqlite3.Row] = []
+    with connect_db() as conn:
+        goals_rows = conn.execute("SELECT id, title, description, status FROM goal ORDER BY created_at DESC").fetchall()
+    tree = {
+        "title": "The One (Ouroboros)",
+        "level": "the_one",
+        "status": "root",
+        "children": [],
+    }
+    seen_universes: dict[str, dict[str, Any]] = {}
+    for g in goals_rows:
+        gd = row_to_dict(g)
+        uid = gd.get("title", gd.get("id", "unknown"))
+        univ: dict[str, Any] = {"title": uid, "level": "universe_god", "status": "active", "children": [], "source": "goal"}
+        seen_universes[uid] = univ
+
+    tasks_dir = DATA_DIR / "tasks"
+    if tasks_dir.exists():
+        for tpath in sorted(tasks_dir.glob("*.json"), reverse=True)[:50]:
+            try:
+                state = json.loads(tpath.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            goal_name = state.get("goal", "General")[:40]
+            task_id = state.get("task_id", tpath.stem)
+            system_node = {
+                "title": goal_name,
+                "level": "system_god",
+                "status": "done" if state.get("done") else "running",
+                "children": [],
+                "source": "task",
+                "task_id": task_id,
+            }
+            for obs in state.get("observations", [])[-10:]:
+                world_node = {
+                    "title": obs.get("tool_name", "tool_call"),
+                    "level": "world_monarch",
+                    "status": "completed" if obs.get("approved") else "failed",
+                    "children": [],
+                    "source": "observation",
+                }
+                res = obs.get("result", {})
+                if isinstance(res, dict):
+                    for k in list(res.keys())[:5]:
+                        world_node["children"].append({"title": f"{k}: {str(res[k])[:60]}", "level": "continent_emperor", "status": "info", "children": [], "source": "result"})
+                system_node["children"].append(world_node)
+            universe_name = "General"
+            for uname in seen_universes:
+                if uname.lower() in goal_name.lower() or goal_name.lower() in uname.lower():
+                    universe_name = uname
+                    break
+            if universe_name not in seen_universes:
+                seen_universes[universe_name] = {"title": universe_name, "level": "universe_god", "status": "active", "children": [], "source": "auto"}
+            seen_universes[universe_name].setdefault("children", []).append(system_node)
+
+    subagents_dir = DATA_DIR / "subagents"
+    if subagents_dir.exists():
+        for spath in sorted(subagents_dir.glob("*.json"), reverse=True)[:30]:
+            try:
+                run = json.loads(spath.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            world_node = {
+                "title": run.get("spec", {}).get("goal", "subtask")[:60],
+                "level": "world_monarch",
+                "status": "done" if run.get("result") else "running",
+                "children": [],
+                "source": "subagent",
+                "run_id": run.get("run_id"),
+            }
+            denials = run.get("denied_tool_calls", [])
+            for d in denials:
+                world_node["children"].append({"title": f"denied: {d.get('tool_name')}", "level": "continent_emperor", "status": "error", "children": [], "source": "denial"})
+            parent_id = run.get("parent_task_id", "")
+            universe_name = "General"
+            tree["children"].append(world_node)
+
+    if not seen_universes:
+        seen_universes["General"] = {"title": "General", "level": "universe_god", "status": "idle", "children": [], "source": "default"}
+    for univ in seen_universes.values():
+        tree["children"].append(univ)
+
+    arts_dir = Path.home() / ".ouroboros" / "artifacts"
+    if arts_dir.exists():
+        art_list = []
+        for af in sorted(arts_dir.glob("*"), reverse=True)[:10]:
+            art_list.append({"title": af.name, "level": "world_monarch", "status": "artifact", "source": "artifact"})
+        if art_list:
+            art_univ = {"title": "Artefacts", "level": "universe_god", "status": "active", "children": art_list, "source": "artifacts"}
+            tree["children"].append(art_univ)
+
+    return JSONResponse(tree)
 
 
 @app.get("/goals")
