@@ -12,6 +12,13 @@ from pydantic import BaseModel, Field
 from agent_loop import TaskState, load_task_state, save_task_state
 
 
+LEVEL_ORDER = [
+    "individual", "house_chief", "family_head", "section_chief", "district_chief",
+    "city_minister", "region_governor", "country_president", "continent_emperor",
+    "world_monarch", "system_god", "galaxy_demigod", "universe_god",
+]
+
+
 class SubagentSpec(BaseModel):
     goal: str
     context: dict[str, Any] | str = Field(default_factory=dict)
@@ -20,6 +27,12 @@ class SubagentSpec(BaseModel):
     sandbox_tier: str = "read_only"
     max_steps: int = 4
     parent_task_id: str
+    title: str = "individual"
+    scope: dict[str, str] = Field(default_factory=dict)
+
+    def can_delegate(self) -> bool:
+        idx = LEVEL_ORDER.index(self.title) if self.title in LEVEL_ORDER else -1
+        return idx >= LEVEL_ORDER.index("section_chief")
 
 
 class SubagentRun(BaseModel):
@@ -84,12 +97,13 @@ def _strip_tool_calls(text: str) -> str:
 
 
 def _system_prompt(spec: SubagentSpec) -> str:
-    return (
-        "You are an isolated subagent. Use only explicitly allowed tools. "
-        f"Allowed tools: {', '.join(spec.allowed_tools) or 'none'}. "
-        f"Memory scope: {spec.memory_scope}. Sandbox tier: {spec.sandbox_tier}. "
-        "Do not request or reveal parent-private memory beyond the provided context."
-    )
+    parts = [f"You are a {spec.title} subagent. Use only explicitly allowed tools."]
+    if spec.scope:
+        parts.append(f"Scope: {json.dumps(spec.scope)}.")
+    parts.append(f"Allowed tools: {', '.join(spec.allowed_tools) or 'none'}.")
+    parts.append(f"Memory scope: {spec.memory_scope}. Sandbox tier: {spec.sandbox_tier}.")
+    parts.append("Do not request or reveal parent-private memory beyond the provided context.")
+    return " ".join(parts)
 
 
 async def _maybe_await(value: Any) -> Any:
