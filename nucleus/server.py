@@ -4880,8 +4880,22 @@ async def get_multiverse() -> JSONResponse:
                 }
                 res = obs.get("result", {})
                 if isinstance(res, dict):
-                    for k in list(res.keys())[:5]:
-                        world_node["children"].append({"title": f"{k}: {str(res[k])[:60]}", "level": "continent_emperor", "status": "info", "children": [], "source": "result"})
+                    for i, (k, v) in enumerate(list(res.items())[:8]):
+                        country_node: dict[str, Any] = {"title": f"{k}: {str(v)[:60]}", "level": "country_president", "status": "info", "children": [], "source": "result"}
+                        for sub_i in range(3):
+                            val_str = str(v)[sub_i*100:(sub_i+1)*100]
+                            if val_str.strip():
+                                region_node: dict[str, Any] = {"title": val_str.strip()[:80], "level": "region_governor", "status": "info", "children": [], "source": "partial"}
+                                city_node: dict[str, Any] = {"title": f"line {sub_i}", "level": "city_minister", "status": "info", "children": [], "source": "sub"}
+                                district_node: dict[str, Any] = {"title": "segment", "level": "district_chief", "status": "info", "children": [], "source": "raw"}
+                                house_node: dict[str, Any] = {"title": "result fragment", "level": "house_chief", "status": "info", "children": [], "source": "raw"}
+                                individual_node: dict[str, Any] = {"title": str(val_str)[:40], "level": "individual", "status": "info", "children": [], "source": "final"}
+                                house_node["children"] = [individual_node]
+                                district_node["children"] = [house_node]
+                                city_node["children"] = [district_node]
+                                region_node["children"] = [city_node]
+                                country_node["children"].append(region_node)
+                        world_node["children"].append(country_node)
                 system_node["children"].append(world_node)
             universe_name = "General"
             for uname in seen_universes:
@@ -4890,7 +4904,9 @@ async def get_multiverse() -> JSONResponse:
                     break
             if universe_name not in seen_universes:
                 seen_universes[universe_name] = {"title": universe_name, "level": "universe_god", "status": "active", "children": [], "source": "auto"}
-            seen_universes[universe_name].setdefault("children", []).append(system_node)
+            galaxy_name = goal_name.split(":")[0] if ":" in goal_name else goal_name
+            galaxy_node: dict[str, Any] = {"title": galaxy_name, "level": "galaxy_demigod", "status": "active", "children": [system_node], "source": "group"}
+            seen_universes[universe_name].setdefault("children", []).append(galaxy_node)
 
     subagents_dir = DATA_DIR / "subagents"
     if subagents_dir.exists():
