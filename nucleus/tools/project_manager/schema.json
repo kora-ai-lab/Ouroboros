@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {"type": "string", "enum": ["list", "add", "switch", "sync", "discover"], "description": "Action to perform"},
+    "name": {"type": "string", "description": "Project name (for add/switch/sync)"},
+    "path": {"type": "string", "description": "Project root path (for add)"}
+  },
+  "required": ["action"]
+}

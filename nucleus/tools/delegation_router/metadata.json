@@ -1,0 +1,16 @@
+{
+  "version": "1.0.0",
+  "deprecated": false,
+  "deprecation_reason": "",
+  "output_format": "json",
+  "permissions": {
+    "filesystem": [
+      {"path": "nucleus/data/tasks", "access": "read_write"},
+      {"path": "nucleus/data/subagents", "access": "read_write"}
+    ],
+    "network": [],
+    "environment": [],
+    "process": {"allow": false},
+    "secrets": []
+  }
+}

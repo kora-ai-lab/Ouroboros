@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "goal": {"type": "string", "description": "The task to delegate"},
+    "context": {"type": "object", "description": "Context for the task"},
+    "title": {"type": "string", "description": "Target hierarchy level (world_monarch, system_god, etc.)"},
+    "scope": {"type": "object", "description": "{universe, galaxy, system} scope"},
+    "max_depth": {"type": "integer", "minimum": 1, "maximum": 5, "description": "Max recursion depth"}
+  },
+  "required": ["goal"],
+  "additionalProperties": false
+}

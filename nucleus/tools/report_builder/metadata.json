@@ -1,0 +1,1 @@
+{"version": "1.0.0", "deprecated": false, "deprecation_reason": "", "output_format": "json", "permissions": {"filesystem": [{"path": "~/.ouroboros/artifacts", "access": "read_write"}], "network": [], "environment": [], "process": {"allow": false}, "secrets": []}}

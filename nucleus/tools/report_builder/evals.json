@@ -1,0 +1,1 @@
+[{"name": "basic report", "input": {"title": "Test", "sections": [{"heading": "A", "content": "B"}]}, "expected": {"title": "Test"}}]

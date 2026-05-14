@@ -1,0 +1,7 @@
+[
+  {
+    "name": "basic delegation",
+    "input": {"goal": "test task", "title": "system_god", "scope": {}, "max_depth": 2},
+    "expected": {"status": "ok"}
+  }
+]

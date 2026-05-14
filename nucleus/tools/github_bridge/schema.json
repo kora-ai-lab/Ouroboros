@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "properties": {
+    "action": {"type": "string", "enum": ["list_repos", "create_repo", "list_issues", "create_issue", "push_commit", "get_readme"], "description": "GitHub action"},
+    "repo": {"type": "string", "description": "owner/repo name"},
+    "title": {"type": "string", "description": "Issue title"},
+    "body": {"type": "string", "description": "Issue body"},
+    "message": {"type": "string", "description": "Commit message"},
+    "branch": {"type": "string", "description": "Branch name"}
+  },
+  "required": ["action"]
+}

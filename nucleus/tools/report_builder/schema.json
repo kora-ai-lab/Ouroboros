@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "properties": {
+    "title": {"type": "string", "description": "Report title"},
+    "sections": {"type": "array", "items": {"type": "object", "properties": {"heading": {"type": "string"}, "content": {"type": "string"}}}, "description": "Report sections"},
+    "format": {"type": "string", "enum": ["markdown", "html", "json"], "default": "markdown"}
+  },
+  "required": ["title", "sections"]
+}

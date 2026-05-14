@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "properties": {
+    "query": {"type": "string", "description": "Search query across project contexts"},
+    "project": {"type": "string", "description": "Filter by project name"}
+  },
+  "required": ["query"]
+}

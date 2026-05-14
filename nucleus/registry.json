@@ -241,6 +241,406 @@
       "use_count": 0,
       "supersedes": null,
       "trusted": false
+    },
+    {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
+      "name": "project_manager",
+      "description": "Discover, add, switch, and track project contexts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list",
+              "add",
+              "switch",
+              "sync",
+              "discover"
+            ],
+            "description": "Action to perform"
+          },
+          "name": {
+            "type": "string",
+            "description": "Project name (for add/switch/sync)"
+          },
+          "path": {
+            "type": "string",
+            "description": "Project root path (for add)"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "filepath": "tools\\project_manager",
+      "builtin": false,
+      "requires_approval": false,
+      "metadata": {
+        "repair_attempts": [],
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json",
+        "permissions": {
+          "filesystem": [
+            {
+              "path": "~/.ouroboros",
+              "access": "read_write"
+            },
+            {
+              "path": ".",
+              "access": "read"
+            }
+          ],
+          "network": [],
+          "environment": [],
+          "process": {
+            "allow": false
+          },
+          "secrets": []
+        }
+      },
+      "created_at": "2026-05-14T13:56:24.540154+00:00",
+      "updated_at": "2026-05-14T13:56:24.540154+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Package tests passed.",
+      "sample_arguments": {},
+      "last_test_status": "passed",
+      "last_error": null,
+      "use_count": 0,
+      "trusted": true,
+      "package": true,
+      "package_dir": "tools\\project_manager"
+    },
+    {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
+      "name": "context_link",
+      "description": "Cross-project context retrieval linking memories across universes.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query across project contexts"
+          },
+          "project": {
+            "type": "string",
+            "description": "Filter by project name"
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "filepath": "tools\\context_link",
+      "builtin": false,
+      "requires_approval": false,
+      "metadata": {
+        "repair_attempts": [],
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json",
+        "permissions": {
+          "filesystem": [
+            {
+              "path": "~/.ouroboros",
+              "access": "read_write"
+            }
+          ],
+          "network": [],
+          "environment": [],
+          "process": {
+            "allow": false
+          },
+          "secrets": []
+        }
+      },
+      "created_at": "2026-05-14T13:56:25.519654+00:00",
+      "updated_at": "2026-05-14T13:56:25.519654+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Package tests passed.",
+      "sample_arguments": {},
+      "last_test_status": "passed",
+      "last_error": null,
+      "use_count": 0,
+      "trusted": true,
+      "package": true,
+      "package_dir": "tools\\context_link"
+    },
+    {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
+      "name": "report_builder",
+      "description": "Generate structured reports (markdown/html/json) saved as artefacts.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Report title"
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "heading": {
+                  "type": "string"
+                },
+                "content": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "Report sections"
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "markdown",
+              "html",
+              "json"
+            ],
+            "default": "markdown"
+          }
+        },
+        "required": [
+          "title",
+          "sections"
+        ]
+      },
+      "filepath": "tools\\report_builder",
+      "builtin": false,
+      "requires_approval": false,
+      "metadata": {
+        "repair_attempts": [],
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json",
+        "permissions": {
+          "filesystem": [
+            {
+              "path": "~/.ouroboros/artifacts",
+              "access": "read_write"
+            }
+          ],
+          "network": [],
+          "environment": [],
+          "process": {
+            "allow": false
+          },
+          "secrets": []
+        }
+      },
+      "created_at": "2026-05-14T13:56:25.625723+00:00",
+      "updated_at": "2026-05-14T13:56:25.625723+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Package tests passed.",
+      "sample_arguments": {},
+      "last_test_status": "passed",
+      "last_error": null,
+      "use_count": 0,
+      "trusted": true,
+      "package": true,
+      "package_dir": "tools\\report_builder"
+    },
+    {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
+      "name": "github_bridge",
+      "description": "GitHub API integration for repo/issue management.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "list_repos",
+              "create_repo",
+              "list_issues",
+              "create_issue",
+              "push_commit",
+              "get_readme"
+            ],
+            "description": "GitHub action"
+          },
+          "repo": {
+            "type": "string",
+            "description": "owner/repo name"
+          },
+          "title": {
+            "type": "string",
+            "description": "Issue title"
+          },
+          "body": {
+            "type": "string",
+            "description": "Issue body"
+          },
+          "message": {
+            "type": "string",
+            "description": "Commit message"
+          },
+          "branch": {
+            "type": "string",
+            "description": "Branch name"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "filepath": "tools\\github_bridge",
+      "builtin": false,
+      "requires_approval": false,
+      "metadata": {
+        "repair_attempts": [],
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json",
+        "permissions": {
+          "filesystem": [],
+          "network": [
+            {
+              "host": "api.github.com",
+              "ports": [
+                443
+              ]
+            }
+          ],
+          "environment": [
+            "GITHUB_TOKEN"
+          ],
+          "process": {
+            "allow": false
+          },
+          "secrets": [
+            "GITHUB_TOKEN"
+          ]
+        }
+      },
+      "created_at": "2026-05-14T13:56:25.779866+00:00",
+      "updated_at": "2026-05-14T13:56:25.779866+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Package tests passed.",
+      "sample_arguments": {},
+      "last_test_status": "passed",
+      "last_error": null,
+      "use_count": 0,
+      "trusted": true,
+      "package": true,
+      "package_dir": "tools\\github_bridge"
+    },
+    {
+      "version": "1.0.0",
+      "supersedes": null,
+      "created_by_task_id": null,
+      "eval_score": null,
+      "rollback_to": null,
+      "deprecation_reason": "",
+      "deprecated": false,
+      "name": "delegation_router",
+      "description": "Recursively delegate tasks across hierarchy levels with title/scope isolation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "goal": {
+            "type": "string",
+            "description": "The task to delegate"
+          },
+          "context": {
+            "type": "object",
+            "description": "Context for the task"
+          },
+          "title": {
+            "type": "string",
+            "description": "Target hierarchy level (world_monarch, system_god, etc.)"
+          },
+          "scope": {
+            "type": "object",
+            "description": "{universe, galaxy, system} scope"
+          },
+          "max_depth": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 5,
+            "description": "Max recursion depth"
+          }
+        },
+        "required": [
+          "goal"
+        ],
+        "additionalProperties": false
+      },
+      "filepath": "tools\\delegation_router",
+      "builtin": false,
+      "requires_approval": false,
+      "metadata": {
+        "repair_attempts": [],
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json",
+        "permissions": {
+          "filesystem": [
+            {
+              "path": "nucleus/data/tasks",
+              "access": "read_write"
+            },
+            {
+              "path": "nucleus/data/subagents",
+              "access": "read_write"
+            }
+          ],
+          "network": [],
+          "environment": [],
+          "process": {
+            "allow": false
+          },
+          "secrets": []
+        }
+      },
+      "created_at": "2026-05-14T13:57:42.660699+00:00",
+      "updated_at": "2026-05-14T13:57:42.660699+00:00",
+      "source_task_id": null,
+      "test_command": null,
+      "test_plan": "Package tests passed.",
+      "sample_arguments": {},
+      "last_test_status": "passed",
+      "last_error": null,
+      "use_count": 0,
+      "trusted": true,
+      "package": true,
+      "package_dir": "tools\\delegation_router"
     }
   ]
 }
