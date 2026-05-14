@@ -103,6 +103,14 @@ MODEL_OPTIONS = {
     ]
 }
 
+MODEL_TIERS = {
+    "coding": ["deepseek", "qwen-coder", "claude-fast"],
+    "research": ["searchgpt", "deepseek", "claude"],
+    "chat": ["openai-fast", "claude-fast", "nova-fast"],
+    "fast": ["openai-fast", "nova-fast"],
+    "reasoning": ["deepseek", "claude"],
+}
+
 RUNTIME_SETTING_DEFAULTS = {
     "n_threads": max((os.cpu_count() or 4) - 1, 1),
     "n_gpu_layers": 0,
@@ -623,10 +631,18 @@ def _backoff(attempt: int) -> float:
 
 
 class ProviderRouter(ModelAdapter):
+    """Routes requests across providers. If provider='auto', tries priority chain.
+    If a specific model is requested, prioritizes providers that serve it."""
     async def complete(self, messages: list[dict[str, str]], model: str, provider: str, tool_choice: str | None = None) -> AsyncIterator[str]:
         adapter = ProviderAdapter()
         settings = load_settings()
-        priority = settings.get("provider_priority", [provider]) if provider == "auto" else [provider]
+        all_priority = settings.get("provider_priority", [provider]) if provider == "auto" else [provider]
+        priority = all_priority[:]
+        if provider == "auto":
+            model_providers = [p for p in all_priority
+                               if model in (settings.get("providers", {}).get(p, {}).get("models") or MODEL_OPTIONS.get(p, []))]
+            if model_providers:
+                priority = model_providers + [p for p in all_priority if p not in model_providers]
         tried: set[str] = set()
         for pid in priority:
             if pid in tried:
@@ -1345,6 +1361,18 @@ def save_settings(settings: dict[str, Any]) -> None:
     save_json(SETTINGS_PATH, settings)
 
 
+def build_unified_models(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    seen: dict[str, dict[str, Any]] = {}
+    for pid, pcfg in settings.get("providers", {}).items():
+        models = pcfg.get("models") or MODEL_OPTIONS.get(pid, [])
+        for m in models:
+            if m not in seen:
+                tiers = [t for t, ms in MODEL_TIERS.items() if m in ms]
+                seen[m] = {"name": m, "providers": [], "tiers": tiers}
+            seen[m]["providers"].append(pid)
+    return sorted(seen.values(), key=lambda x: x["name"])
+
+
 def provider_status() -> dict[str, Any]:
     settings = load_settings()
     providers: dict[str, Any] = {}
@@ -1367,6 +1395,7 @@ def provider_status() -> dict[str, Any]:
         "default_model": settings.get("default_model", "openai-fast"),
         "provider_priority": settings.get("provider_priority", ["pollinations"]),
         "providers": providers,
+        "unified_models": build_unified_models(settings),
     }
 
 

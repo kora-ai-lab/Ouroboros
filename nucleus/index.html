@@ -1269,6 +1269,10 @@
           <label for="providerKey">API key</label>
           <input id="providerKey" type="password" autocomplete="off" placeholder="${provider.configured ? 'Leave blank to keep current key' : 'Paste API key'}">
         </div>
+        <div class="field">
+          <label for="providerApiKeys">Multiple API keys (one per line, round-robin)</label>
+          <textarea id="providerApiKeys" rows="2" style="width:100%;resize:vertical;font-size:11px;font-family:monospace;background:var(--gray-1);color:var(--gray-4);border:1px solid var(--gray-2);padding:6px;" placeholder="key1&#10;key2&#10;key3"></textarea>
+        </div>
         <div class="actions">
           <button id="discoverModels" type="button">Discover models</button>
         </div>
@@ -1293,7 +1297,17 @@
         providerSelect.appendChild(option);
       }
       renderProviderSettings();
-      rebuildModelOptions(modelSelect, settingsState.providers[settingsState.default_provider].models, settingsState.default_model);
+      const unified = settingsState.unified_models || [];
+      modelSelect.innerHTML = '';
+      for (const m of unified) {
+        const opt = document.createElement('option');
+        opt.value = m.name;
+        const providers = m.providers.join(', ');
+        const tiers = m.tiers && m.tiers.length ? ` [${m.tiers.join('/')}]` : '';
+        opt.textContent = `${m.name} — via ${providers}${tiers}`;
+        if (m.name === settingsState.default_model) opt.selected = true;
+        modelSelect.appendChild(opt);
+      }
     }
 
     async function discoverModels() {
@@ -1304,11 +1318,8 @@
         setSettingsStatus(await response.text());
         return;
       }
-      const data = await response.json();
-      settingsState = data.settings;
-      renderProviderSettings();
-      rebuildModelOptions(modelSelect, settingsState.providers[settingsState.default_provider].models, settingsState.default_model);
-      setSettingsStatus(data.models.length ? 'Models discovered.' : 'No models found.');
+      await loadSettings();
+      setSettingsStatus('Models discovered and unified pool updated.');
     }
 
     function renderLocalModels(data) {
@@ -1641,15 +1652,20 @@
       event.preventDefault();
       const providerId = providerSelect.value;
       const keyInput = document.getElementById('providerKey');
+      const multiKeys = document.getElementById('providerApiKeys');
+      let apiKeysList = [];
+      if (multiKeys) {
+        apiKeysList = multiKeys.value.split('\n').map(k => k.trim()).filter(Boolean);
+      }
+      const singleKey = keyInput ? keyInput.value.trim() : '';
       const response = await fetch('/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           default_provider: providerId,
           default_model: settingsModelSelect.value,
-          provider_keys: {
-            [providerId]: keyInput ? keyInput.value.trim() : ''
-          },
+          provider_keys: singleKey ? { [providerId]: singleKey } : {},
+          provider_api_keys: apiKeysList.length ? { [providerId]: apiKeysList } : {},
           runtime_settings: collectRuntimeSettings()
         })
       });
