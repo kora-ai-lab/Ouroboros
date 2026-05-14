@@ -599,7 +599,7 @@
   </style>
 </head>
 <body>
-  <div class="app sidebar-collapsed">
+  <div class="app">
     <aside id="memorySidebar" class="sidebar">
       <div class="sidebar-header">
         <div class="brand">Ouroboros</div>
@@ -1111,7 +1111,8 @@
         container.appendChild(childContainer);
         div.style.cursor = 'pointer';
         div.addEventListener('click', (e) => {
-          if (e.target !== div && !e.target.classList.contains('mv-icon')) return;
+          if (e.target.tagName === 'SPAN' && e.target.classList.contains('mv-label')) return;
+          if (e.target.tagName === 'SPAN' && e.target.style.cursor === 'pointer') return;
           const shown = childContainer.style.display !== 'none';
           childContainer.style.display = shown ? 'none' : 'block';
           iconSpan.textContent = shown ? '▸' : '▾';
