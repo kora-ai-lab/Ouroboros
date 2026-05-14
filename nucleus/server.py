@@ -691,6 +691,18 @@ class ProviderRouter(ModelAdapter):
         raise RuntimeError("All providers exhausted.")
 
 
+def registry_to_openai_tools() -> list[dict[str, Any]]:
+    registry = load_registry()
+    tools: list[dict[str, Any]] = []
+    for tool in registry.get("tools", []):
+        name = tool.get("name")
+        desc = tool.get("description", "")
+        params = tool.get("parameters", {"type": "object", "properties": {}})
+        if name:
+            tools.append({"type": "function", "function": {"name": name, "description": desc, "parameters": params}})
+    return tools
+
+
 async def stream_openai_compatible(
     provider_config: dict[str, Any],
     messages: list[dict[str, str]],
@@ -718,20 +730,7 @@ async def stream_openai_compatible(
 
     payload: dict[str, Any] = {"model": model, "messages": mapped_messages, "stream": True}
     if tool_choice:
-        payload["tools"] = [{
-            "type": "function",
-            "function": {
-                "name": "execute_python",
-                "description": "Execute Python code in the Ouroboros project directory. Use this for any task requiring code (HTTP, files, shell, packages, scraping).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "The Python code to execute"}
-                    },
-                    "required": ["code"]
-                },
-            },
-        }]
+        payload["tools"] = registry_to_openai_tools()
         payload["tool_choice"] = tool_choice
 
     async with httpx.AsyncClient(timeout=None) as client:
