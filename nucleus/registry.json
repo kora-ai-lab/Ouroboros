@@ -106,26 +106,58 @@
     },
     {
       "name": "delegate_subagent",
-      "description": "Delegate bounded work to an isolated subagent with constrained tools, memory scope, sandbox tier, and step limit.",
+      "description": "Delegate bounded work to an isolated subagent with constrained tools, memory scope, sandbox tier, step limit, title, and scope. Title defines the hierarchy level (individual \u2192 universe_god). Scope defines the context boundaries for isolation.",
       "parameters": {
         "type": "object",
         "properties": {
-          "goal": {"type": "string"},
+          "goal": {
+            "type": "string"
+          },
           "context": {},
-          "allowed_tools": {"type": "array", "items": {"type": "string"}},
-          "memory_scope": {"type": "string"},
-          "sandbox_tier": {"type": "string"},
-          "max_steps": {"type": "integer", "minimum": 1},
-          "parent_task_id": {"type": "string"}
+          "allowed_tools": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "memory_scope": {
+            "type": "string"
+          },
+          "sandbox_tier": {
+            "type": "string"
+          },
+          "max_steps": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "parent_task_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string",
+            "description": "Hierarchy level"
+          },
+          "scope": {
+            "type": "object",
+            "description": "Scope: {universe, galaxy, system, world}"
+          }
         },
-        "required": ["goal", "parent_task_id"]
+        "required": [
+          "goal",
+          "parent_task_id"
+        ]
       },
       "filepath": "tools/delegate_subagent",
       "builtin": false,
       "requires_approval": false,
       "package": true,
       "package_dir": "tools/delegate_subagent",
-      "metadata": {"version": "1.0.0", "deprecated": false, "deprecation_reason": "", "output_format": "json"},
+      "metadata": {
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json"
+      },
       "version": "1.0.0",
       "created_at": "2026-05-12T00:00:00+00:00",
       "updated_at": "2026-05-12T00:00:00+00:00",
@@ -134,7 +166,9 @@
       "test_plan": "Package tests cover subprocess delegation and JSON output.",
       "sample_arguments": {
         "goal": "summarize provided context",
-        "context": {"note": "sample"},
+        "context": {
+          "note": "sample"
+        },
         "allowed_tools": [],
         "memory_scope": "provided_context_only",
         "sandbox_tier": "read_only",
@@ -164,12 +198,22 @@
               "list_prompts"
             ]
           },
-          "server": {"type": "string"},
-          "tool_name": {"type": "string"},
-          "arguments": {"type": "object"},
-          "uri": {"type": "string"}
+          "server": {
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          },
+          "arguments": {
+            "type": "object"
+          },
+          "uri": {
+            "type": "string"
+          }
         },
-        "required": ["operation"],
+        "required": [
+          "operation"
+        ],
         "additionalProperties": false
       },
       "filepath": "tools/mcp_bridge",
@@ -177,14 +221,21 @@
       "requires_approval": false,
       "package": true,
       "package_dir": "tools/mcp_bridge",
-      "metadata": {"version": "1.0.0", "deprecated": false, "deprecation_reason": "", "output_format": "json"},
+      "metadata": {
+        "version": "1.0.0",
+        "deprecated": false,
+        "deprecation_reason": "",
+        "output_format": "json"
+      },
       "version": "1.0.0",
       "created_at": "2026-05-12T00:00:00+00:00",
       "updated_at": "2026-05-12T00:00:00+00:00",
       "source_task_id": null,
       "test_command": "python nucleus/tools/mcp_bridge/tests.py",
       "test_plan": "Package smoke test plus adapter unit tests cover generic MCP discovery and call dispatch.",
-      "sample_arguments": {"operation": "list_servers"},
+      "sample_arguments": {
+        "operation": "list_servers"
+      },
       "last_test_status": "pending",
       "last_error": null,
       "use_count": 0,

@@ -7,8 +7,9 @@
     "memory_scope": {"type": "string"},
     "sandbox_tier": {"type": "string"},
     "max_steps": {"type": "integer", "minimum": 1},
-    "parent_task_id": {"type": "string"}
+    "parent_task_id": {"type": "string"},
+    "title": {"type": "string", "description": "Hierarchy level: individual, house_chief, ..., world_monarch, system_god, galaxy_demigod, universe_god"},
+    "scope": {"type": "object", "description": "Context scope: {universe, galaxy, system, world}"}
   },
-  "required": ["goal", "parent_task_id"],
-  "additionalProperties": false
+  "required": ["goal", "parent_task_id"]
 }
