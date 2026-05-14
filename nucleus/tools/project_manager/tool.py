@@ -3,7 +3,11 @@ from __future__ import annotations
 import json, os, sys
 from pathlib import Path
 
-WORKSPACE_FILE = Path.home() / ".ouroboros" / "workspace.json"
+try:
+    _home = Path.home()
+except (RuntimeError, OSError):
+    _home = Path.cwd()
+WORKSPACE_FILE = _home / ".ouroboros" / "workspace.json"
 
 
 def _load() -> dict:

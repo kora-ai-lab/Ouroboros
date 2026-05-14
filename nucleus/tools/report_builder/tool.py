@@ -3,7 +3,11 @@ from __future__ import annotations
 import json, sys, time
 from pathlib import Path
 
-ARTIFACTS_DIR = Path.home() / ".ouroboros" / "artifacts"
+try:
+    _home = Path.home()
+except (RuntimeError, OSError):
+    _home = Path.cwd()
+ARTIFACTS_DIR = _home / ".ouroboros" / "artifacts"
 
 
 def build_report(title: str, sections: list[dict], fmt: str = "markdown") -> dict:

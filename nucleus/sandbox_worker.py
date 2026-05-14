@@ -189,16 +189,17 @@ if _OURO_NETWORK_DISABLED:
 
 
 def available_isolation_backend() -> str | None:
-    if shutil.which("docker"):
-        return "docker"
-    if shutil.which("firejail"):
-        return "firejail"
-    if shutil.which("bwrap"):
-        return "bubblewrap"
+    # Docker is NOT used — it's heavy, breaks Path.home() in containers,
+    # adds latency, and doesn't work reliably on Windows.
+    # The in-process Python guard (monkey-patching) is simpler and portable.
     if platform.system() == "Darwin" and shutil.which("sandbox-exec"):
         return "sandbox-exec"
     if platform.system() == "Windows":
         return "windows-job-object"
+    if shutil.which("firejail"):
+        return "firejail"
+    if shutil.which("bwrap"):
+        return "bubblewrap"
     return None
 
 
