@@ -681,6 +681,9 @@ class ProviderRouter(ModelAdapter):
                         if "429" in msg and attempt < 2:
                             await asyncio.sleep(_backoff(attempt))
                             continue
+                        if any(code in msg for code in ("500", "502", "503")) and attempt < 2:
+                            await asyncio.sleep(_backoff(attempt))
+                            continue
                         if pid != priority[-1]:
                             await asyncio.sleep(0.5)
                             break
