@@ -28,6 +28,10 @@ SAFE_EXECUTION_ENV_VARS = {
     "TMPDIR",
     "TZ",
     "WINDIR",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
 }
 
 

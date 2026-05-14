@@ -2785,6 +2785,10 @@ SAFE_EXECUTION_ENV_VARS = {
     "TMPDIR",
     "TZ",
     "WINDIR",
+    "HOME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
 }
 DESTRUCTIVE_GIT_REASON = "destructive git command requires explicit approval"
 DESTRUCTIVE_GIT_PATTERNS = (
