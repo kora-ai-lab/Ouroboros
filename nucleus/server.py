@@ -70,6 +70,7 @@ TOOLS_DIR = BASE_DIR / "tools"
 KORA_DIR = BASE_DIR / "kora"
 REGISTRY_PATH = BASE_DIR / "registry.json"
 FACTS_PATH = BASE_DIR / "facts.json"
+RULES_DIR = Path.home() / ".ouroboros" / "rules"
 DB_PATH = DATA_DIR / "memory.sqlite3"
 SETTINGS_PATH = BASE_DIR / "settings.json"
 ENV_PATHS = [ROOT_DIR / ".env", BASE_DIR / ".env"]
@@ -4268,6 +4269,32 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
             settings["providers"][provider_id]["api_keys"] = keys
     save_settings(settings)
     return JSONResponse(provider_status())
+
+
+@app.get("/rules")
+async def get_rules() -> JSONResponse:
+    RULES_DIR.mkdir(parents=True, exist_ok=True)
+    rules: dict[str, str] = {}
+    for path in sorted(RULES_DIR.glob("**/*.md")):
+        rel = str(path.relative_to(RULES_DIR).with_suffix(""))
+        rules[rel] = path.read_text(encoding="utf-8")
+    return JSONResponse({"rules": rules, "rules_dir": str(RULES_DIR)})
+
+
+class RuleUpdate(BaseModel):
+    path: str
+    content: str
+
+
+@app.post("/rules")
+async def save_rule(update: RuleUpdate) -> JSONResponse:
+    rel = Path(update.path).with_suffix(".md")
+    if ".." in str(rel):
+        raise HTTPException(status_code=400, detail="Invalid rule path.")
+    target = RULES_DIR / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(update.content, encoding="utf-8")
+    return JSONResponse({"path": str(rel), "saved": True})
 
 
 @app.post("/providers")
