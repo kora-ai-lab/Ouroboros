@@ -612,12 +612,7 @@
         <button id="saveSession" type="button">Save to memory</button>
       </div>
       <div class="sidebar-scroll">
-        <div class="section-title">Threads</div>
-        <div id="sessionList"></div>
-        <div class="section-title">Episodic Memory</div>
-        <div id="memoryList"></div>
-        <div class="section-title" style="cursor:pointer;user-select:none" id="multiverseToggle">Multivers ▸</div>
-        <div id="multiversePanel" style="display:none"></div>
+        <div id="multiversePanel"></div>
       </div>
     </aside>
 
@@ -753,8 +748,8 @@
     const statusNode = document.getElementById('status');
     const fileInput = document.getElementById('fileInput');
     const contextStrip = document.getElementById('contextStrip');
-    const memoryList = document.getElementById('memoryList');
-    const sessionList = document.getElementById('sessionList');
+    const memoryList = document.getElementById('memoryList') || { innerHTML: '' };
+    const sessionList = document.getElementById('sessionList') || { innerHTML: '' };
     const memorySidebar = document.getElementById('memorySidebar');
     const toggleMemory = document.getElementById('toggleMemory');
     const saveSession = document.getElementById('saveSession');
@@ -967,7 +962,7 @@
       activeSessionId = createSessionId();
       renderLoadedMessages([]);
       if (showStatus) setStatus(`New session: ${activeSessionId}`);
-      refreshSessions();
+      refreshMultiverse();
       return activeSessionId;
     }
 
@@ -981,7 +976,7 @@
       });
       if (!response.ok) throw new Error(await response.text());
       if (statusText) setStatus(statusText);
-      await refreshSessions();
+      await refreshMultiverse();
     }
 
     async function loadSession(sessionId, confirmReplace = true) {
@@ -996,118 +991,23 @@
       activeSessionId = data.session_id;
       renderLoadedMessages(data.messages || []);
       setStatus(`Loaded session: ${activeSessionId}`);
-      await refreshSessions();
+      await refreshMultiverse();
     }
 
-    function currentSessionIndex() {
-      return sessionRecords.findIndex(session => session.session_id === activeSessionId);
+    function navigateSession(direction) {
+      setStatus('Navigate sessions from the Multivers panel.');
     }
 
-    async function navigateSession(direction) {
-      if (!sessionRecords.length) {
-        setStatus('No saved sessions yet.');
-        return;
+    async function loadMemoryDetails(memoryId, summary) {
+      const contextItem = { type: 'memory', name: `memory-${memoryId}`, content: summary };
+      if (!contextFiles.some(f => f.name === contextItem.name)) {
+        contextFiles.push(contextItem);
+        addChip(contextItem);
       }
-      const current = currentSessionIndex();
-      const nextIndex = current < 0
-        ? 0
-        : Math.min(Math.max(current + direction, 0), sessionRecords.length - 1);
-      const target = sessionRecords[nextIndex];
-      if (target) await loadSession(target.session_id, true);
-    }
-
-    async function refreshSessions() {
-      try {
-        const response = await fetch('/sessions');
-        const data = await response.json();
-        sessionRecords = data.sessions || [];
-        sessionList.innerHTML = '';
-        for (const session of sessionRecords) {
-          const item = document.createElement('button');
-          item.type = 'button';
-          item.className = `memory-item${session.session_id === activeSessionId ? ' active' : ''}`;
-          const updated = new Date(session.updated_at).toLocaleString();
-          const summary = session.summary || session.session_id;
-          item.innerHTML = `<strong>${session.title || session.session_id}</strong><span style="font-size:10px;color:var(--gray-3);display:block;margin-bottom:6px;">${updated}</span><span style="color:var(--gray-4);line-height:1.4;">${summary.length > 100 ? summary.substring(0, 100) + '...' : summary}</span>`;
-          item.addEventListener('click', async () => {
-            try {
-              await loadSession(session.session_id, true);
-            } catch (err) {
-              setStatus(`Load failed: ${err.message}`);
-            }
-          });
-          sessionList.appendChild(item);
-        }
-        if (!sessionList.children.length) {
-          sessionList.innerHTML = '<div class="memory-item">No saved conversation threads yet.</div>';
-        }
-      } catch (e) {
-        sessionList.innerHTML = `<div class="memory-item">Failed to load sessions: ${e.message}</div>`;
-      }
-    }
-
-    async function refreshMemories() {
-      await refreshSessions();
-      try {
-        const response = await fetch('/memory');
-        const data = await response.json();
-        memoryList.innerHTML = '';
-        for (const memory of data.memories || []) {
-          const item = document.createElement('div');
-          item.className = 'memory-item';
-          
-          const created = document.createElement('div');
-          created.style.fontSize = '10px';
-          created.style.color = 'var(--gray-3)';
-          created.style.marginBottom = '6px';
-          created.textContent = new Date(memory.created_at).toLocaleString();
-          
-          const summary = document.createElement('div');
-          summary.style.color = 'var(--gray-4)';
-          summary.style.lineHeight = '1.4';
-          summary.textContent = memory.summary.length > 100 ? memory.summary.substring(0, 100) + '...' : memory.summary;
-          
-          item.appendChild(created);
-          item.appendChild(summary);
-          
-          item.addEventListener('click', () => {
-            const contextItem = { type: 'memory', name: `memory-${memory.id}`, content: memory.summary };
-            if (!contextFiles.some(f => f.name === contextItem.name)) {
-              contextFiles.push(contextItem);
-              addChip(contextItem);
-            }
-            
-            const contentNode = addMessage('System', `Memory preview: ${memory.id}<br>`);
-            const node = document.createElement('div');
-            node.innerHTML = `<div style="border-left:2px solid var(--gray-3);padding-left:12px;margin-top:8px;font-family:monospace;white-space:pre-wrap;">${memory.summary}</div>`;
-            contentNode.appendChild(node);
-          });
-
-          const loadBtn = document.createElement('button');
-          loadBtn.type = 'button';
-          loadBtn.className = 'chip';
-          loadBtn.style.marginTop = '8px';
-          loadBtn.style.width = '100%';
-          loadBtn.style.textAlign = 'center';
-          loadBtn.textContent = 'Load thread';
-          loadBtn.onclick = async (e) => {
-            e.stopPropagation();
-            try {
-              await loadSession(memory.session_id, true);
-            } catch (err) {
-              setStatus(`Load failed: ${err.message}`);
-            }
-          };
-          item.appendChild(loadBtn);
-
-          memoryList.appendChild(item);
-        }
-        if (!memoryList.children.length) {
-          memoryList.innerHTML = '<div class="memory-item">No episodic memories yet.</div>';
-        }
-      } catch (e) {
-        memoryList.innerHTML = `<div class="memory-item">Failed to load memories: ${e.message}</div>`;
-      }
+      const contentNode = addMessage('System', `Memory preview: ${memoryId}<br>`);
+      const node = document.createElement('div');
+      node.innerHTML = `<div style="border-left:2px solid var(--gray-3);padding-left:12px;margin-top:8px;font-family:monospace;white-space:pre-wrap;">${summary}</div>`;
+      contentNode.appendChild(node);
     }
 
     const LEVELS = [
@@ -1132,12 +1032,19 @@
 
     async function refreshMultiverse() {
       const panel = document.getElementById('multiversePanel');
-      if (panel.style.display === 'none') return;
+      if (!panel) return;
       try {
         const res = await fetch('/multiverse');
         const treeData = await res.json();
         panel.innerHTML = '';
         renderTreeInteractive(panel, treeData, 0);
+        /* Expand first level by default */
+        const firstChildren = panel.querySelector('.mv-children');
+        if (firstChildren) {
+          firstChildren.style.display = 'block';
+          const icon = firstChildren.previousElementSibling?.querySelector('.mv-icon');
+          if (icon) icon.textContent = '▾';
+        }
       } catch (e) {
         panel.innerHTML = `<div style="padding:8px;font-size:12px;color:var(--gray-5)">${e.message}</div>`;
       }
@@ -1562,7 +1469,7 @@
         if (response.ok && data.status !== 'error') {
           activeSessionId = data.session_id || activeSessionId;
           setStatus('Session saved.');
-          refreshMemories();
+          refreshMultiverse();
         } else {
           const errorMsg = data.message || data.detail || 'Unknown error';
           setStatus(`Failed to save: ${errorMsg}`);
@@ -1677,12 +1584,7 @@
     });
 
     toggleMemory.addEventListener('click', () => {
-      const app = document.querySelector('.app');
-      const isOpening = app.classList.contains('sidebar-collapsed');
-      app.classList.toggle('sidebar-collapsed');
-      if (isOpening) {
-        refreshMemories();
-      }
+      document.querySelector('.app').classList.toggle('sidebar-collapsed');
     });
     saveSession.addEventListener('click', saveCurrentSession);
     newSessionButton.addEventListener('click', () => startNewSession(true));
@@ -1753,17 +1655,14 @@
       renderProviderSettings();
       setSettingsStatus('Settings saved.');
     });
-    refreshMemory.addEventListener('click', refreshMemories);
-    // Delegated click for JSON block collapse/expand
-    output.addEventListener('click', function(e) {
-      const toggle = e.target.closest('.json-toggle');
-      if (!toggle) return;
-      const id = toggle.dataset.target;
-      const pre = document.getElementById(id);
-      if (!pre) return;
-      const hidden = pre.style.display === 'none';
-      pre.style.display = hidden ? '' : 'none';
-      toggle.firstChild.textContent = hidden ? '[\u002D]' : '[\u002B]';
+    refreshMemory.addEventListener('click', refreshMultiverse);
+
+    window.addEventListener('load', async () => {
+      await loadSettings();
+      refreshMultiverse();
+      startNewSession(false);
+
+      promptInput.focus();
     });
     // Auto-resize textarea
     promptInput.addEventListener('input', () => {
@@ -1772,7 +1671,7 @@
     });
     loadSettings().catch(() => {});
     startNewSession(false);
-    refreshMemories();
+    refreshMultiverse();
   </script>
 </body>
 </html>
