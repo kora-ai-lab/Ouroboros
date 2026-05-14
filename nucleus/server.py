@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     load_env_files()
     ensure_layout()
     init_db()
-    app.state.model_adapter = ProviderAdapter()
+    app.state.model_adapter = ProviderRouter()
     app.state.pending_approvals = {}
     scheduler_task = asyncio.create_task(background_scheduler_loop())
     try:
@@ -117,8 +117,9 @@ RUNTIME_BOOL_SETTINGS = {"use_mmap", "use_mlock", "flash_attn"}
 RUNTIME_SETTINGS = tuple(RUNTIME_SETTING_DEFAULTS.keys())
 
 DEFAULT_SETTINGS = {
-    "default_provider": "pollinations",
+    "default_provider": "auto",
     "default_model": "openai-fast",
+    "provider_priority": ["pollinations"],
     "tool_repair_max_attempts": 2,
     "memory_recent_days": 30,
     "memory_max_raw_archive_mb": 256,
@@ -130,6 +131,7 @@ DEFAULT_SETTINGS = {
             "type": "openai_compatible",
             "base_url": POLLINATIONS_BASE_URL,
             "api_key_env": "POLLINATIONS_API_KEY",
+            "api_keys": [],
             "models": MODEL_OPTIONS["pollinations"],
         }
     },
@@ -411,9 +413,11 @@ class ApprovalDecision(BaseModel):
 
 
 class SettingsUpdate(BaseModel):
-    default_provider: str = "pollinations"
+    default_provider: str = "auto"
     default_model: str = "openai-fast"
+    provider_priority: list[str] = Field(default_factory=lambda: ["pollinations"])
     provider_keys: dict[str, str] = Field(default_factory=dict)
+    provider_api_keys: dict[str, list[str]] = Field(default_factory=dict)
     runtime_settings: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -589,8 +593,10 @@ class ModelAdapter:
 
 
 class ProviderAdapter(ModelAdapter):
-    async def complete(self, messages: list[dict[str, str]], model: str, provider: str, tool_choice: str | None = None) -> AsyncIterator[str]:
-        provider_config = get_provider(provider)
+    async def complete(self, messages: list[dict[str, str]], model: str, provider: str, tool_choice: str | None = None, api_key: str | None = None) -> AsyncIterator[str]:
+        provider_config = dict(get_provider(provider))
+        if api_key is not None:
+            provider_config["_override_key"] = api_key
         provider_type = provider_config.get("type", "openai_compatible")
         if provider_type == "ollama":
             async for token in stream_ollama(provider_config, messages, model):
@@ -604,6 +610,60 @@ class ProviderAdapter(ModelAdapter):
             yield token
 
 
+_provider_key_indices: dict[str, int] = {}
+import random, asyncio
+
+
+def _backoff(attempt: int) -> float:
+    return min(0.5 * (2 ** attempt) + random.uniform(0, 0.5), 8.0)
+
+
+class ProviderRouter(ModelAdapter):
+    async def complete(self, messages: list[dict[str, str]], model: str, provider: str, tool_choice: str | None = None) -> AsyncIterator[str]:
+        adapter = ProviderAdapter()
+        settings = load_settings()
+        priority = settings.get("provider_priority", [provider]) if provider == "auto" else [provider]
+        tried: set[str] = set()
+        for pid in priority:
+            if pid in tried:
+                continue
+            tried.add(pid)
+            cfg = settings.get("providers", {}).get(pid)
+            if not cfg:
+                continue
+            all_keys: list[str] = list(cfg.get("api_keys") or [])
+            env_key = get_provider_api_key_from_config(cfg)
+            if env_key and env_key not in all_keys:
+                all_keys.append(env_key)
+            if not all_keys:
+                all_keys = [""]
+            start_idx = _provider_key_indices.get(pid, 0) % len(all_keys)
+            for offset in range(len(all_keys)):
+                ki = (start_idx + offset) % len(all_keys)
+                _provider_key_indices[pid] = (ki + 1) % len(all_keys)
+                this_key = all_keys[ki] or None
+                for attempt in range(3):
+                    try:
+                        async for token in adapter.complete(messages, model, pid, tool_choice=tool_choice, api_key=this_key):
+                            yield token
+                        return
+                    except RuntimeError as exc:
+                        msg = str(exc)
+                        if "402" in msg:
+                            if offset < len(all_keys) - 1:
+                                await asyncio.sleep(0.3)
+                                continue
+                            break
+                        if "429" in msg and attempt < 2:
+                            await asyncio.sleep(_backoff(attempt))
+                            continue
+                        if pid != priority[-1]:
+                            await asyncio.sleep(0.5)
+                            break
+                        raise
+        raise RuntimeError("All providers exhausted.")
+
+
 async def stream_openai_compatible(
     provider_config: dict[str, Any],
     messages: list[dict[str, str]],
@@ -611,7 +671,7 @@ async def stream_openai_compatible(
     tool_choice: str | None = None,
 ) -> AsyncIterator[str]:
     base_url = provider_config.get("base_url") or POLLINATIONS_BASE_URL
-    api_key = get_provider_api_key_from_config(provider_config)
+    api_key = provider_config.get("_override_key") or get_provider_api_key_from_config(provider_config)
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -1286,19 +1346,22 @@ def provider_status() -> dict[str, Any]:
     providers: dict[str, Any] = {}
     for provider_id, provider in settings["providers"].items():
         key_name = provider.get("api_key_env", "")
+        configured = bool(os.getenv(key_name)) or bool(provider.get("api_keys"))
         providers[provider_id] = {
             "label": provider.get("label", provider_id),
             "type": provider.get("type", "openai_compatible"),
             "base_url": provider.get("base_url", ""),
             "api_key_env": key_name,
-            "configured": bool(os.getenv(key_name)),
+            "configured": configured,
+            "api_key_count": len(provider.get("api_keys") or []),
             "models": provider.get("models") or MODEL_OPTIONS.get(provider_id, []),
             "models_path": provider.get("models_path", ""),
             "runtime_settings": normalize_runtime_settings(provider.get("runtime_settings")),
         }
     return {
-        "default_provider": settings.get("default_provider", "pollinations"),
+        "default_provider": settings.get("default_provider", "auto"),
         "default_model": settings.get("default_model", "openai-fast"),
+        "provider_priority": settings.get("provider_priority", ["pollinations"]),
         "providers": providers,
     }
 
@@ -4177,16 +4240,19 @@ async def get_settings() -> JSONResponse:
 @app.post("/settings")
 async def update_settings(update: SettingsUpdate) -> JSONResponse:
     settings = load_settings()
-    provider_ids = set(settings["providers"].keys())
-    if update.default_provider not in provider_ids:
-        raise HTTPException(status_code=400, detail="Unknown provider.")
-    provider_models = settings["providers"][update.default_provider].get("models") or MODEL_OPTIONS.get(update.default_provider, [])
-    if update.default_model not in provider_models:
-        raise HTTPException(status_code=400, detail="Unknown model for provider.")
+    if update.default_provider != "auto":
+        provider_ids = set(settings["providers"].keys())
+        if update.default_provider not in provider_ids:
+            raise HTTPException(status_code=400, detail="Unknown provider.")
+        provider_models = settings["providers"][update.default_provider].get("models") or MODEL_OPTIONS.get(update.default_provider, [])
+        if update.default_model not in provider_models:
+            raise HTTPException(status_code=400, detail="Unknown model for provider.")
 
     settings["default_provider"] = update.default_provider
     settings["default_model"] = update.default_model
-    if update.runtime_settings:
+    if update.provider_priority:
+        settings["provider_priority"] = [p for p in update.provider_priority if p in settings["providers"]]
+    if update.runtime_settings and update.default_provider in settings.get("providers", {}):
         settings["providers"][update.default_provider]["runtime_settings"] = normalize_runtime_settings(update.runtime_settings)
     for provider_id, api_key in update.provider_keys.items():
         if not api_key:
@@ -4197,6 +4263,9 @@ async def update_settings(update: SettingsUpdate) -> JSONResponse:
         key_name = provider.get("api_key_env")
         if key_name:
             write_env_value(key_name, api_key)
+    for provider_id, keys in update.provider_api_keys.items():
+        if provider_id in settings.get("providers", {}):
+            settings["providers"][provider_id]["api_keys"] = keys
     save_settings(settings)
     return JSONResponse(provider_status())
 
