@@ -1120,15 +1120,6 @@
       }
     }
 
-    document.getElementById('multiverseToggle').addEventListener('click', () => {
-      const panel = document.getElementById('multiversePanel');
-      const toggle = document.getElementById('multiverseToggle');
-      const shown = panel.style.display !== 'none';
-      panel.style.display = shown ? 'none' : 'block';
-      toggle.textContent = shown ? 'Multivers ▸' : 'Multivers ▾';
-      if (!shown) refreshMultiverse();
-    });
-
     function setSettingsStatus(text) {
       settingsStatus.textContent = text;
     }
