@@ -4837,21 +4837,68 @@ async def create_goal(request: GoalCreateRequest) -> JSONResponse:
 
 @app.get("/multiverse")
 async def get_multiverse() -> JSONResponse:
-    goals_rows: list[sqlite3.Row] = []
-    with connect_db() as conn:
-        goals_rows = conn.execute("SELECT id, title, description, status FROM goal ORDER BY created_at DESC").fetchall()
-    tree = {
-        "title": "The One (Ouroboros)",
-        "level": "the_one",
-        "status": "root",
-        "children": [],
-    }
-    seen_universes: dict[str, dict[str, Any]] = {}
-    for g in goals_rows:
-        gd = row_to_dict(g)
-        uid = gd.get("title", gd.get("id", "unknown"))
-        univ: dict[str, Any] = {"title": uid, "level": "universe_god", "status": "active", "children": [], "source": "goal"}
-        seen_universes[uid] = univ
+    tree: dict[str, Any] = {"title": "The One (Ouroboros)", "level": "the_one", "status": "root", "children": []}
+    universes: dict[str, dict[str, Any]] = {}
+
+    def get_univ(name: str) -> dict[str, Any]:
+        if name not in universes:
+            universes[name] = {"title": name, "level": "universe_god", "status": "active", "children": [], "source": "auto"}
+        return universes[name]
+
+    def get_galaxy(univ: dict[str, Any], name: str) -> dict[str, Any]:
+        for g in univ.get("children", []):
+            if g.get("title") == name and g.get("level") == "galaxy_demigod":
+                return g
+        gn: dict[str, Any] = {"title": name, "level": "galaxy_demigod", "status": "active", "children": [], "source": "group"}
+        univ.setdefault("children", []).append(gn)
+        return gn
+
+    def make_tree(val: Any, depth: int = 0) -> list[dict[str, Any]]:
+        levels = ["country_president", "region_governor", "city_minister", "district_chief", "section_chief", "family_head", "house_chief", "individual"]
+        if depth >= len(levels):
+            return []
+        label = str(val)[:80]
+        node: dict[str, Any] = {"title": label, "level": levels[depth], "status": "info", "children": [], "source": "auto"}
+        if isinstance(val, dict):
+            for k, v in list(val.items())[:4]:
+                child = {"title": f"{k}: {str(v)[:60]}", "level": levels[min(depth+1, len(levels)-1)], "status": "info", "children": make_tree(v, depth+2), "source": "key"}
+                node["children"].append(child)
+        elif isinstance(val, list):
+            for i, item in enumerate(val[:4]):
+                node["children"].append({"title": f"[{i}]: {str(item)[:60]}", "level": levels[min(depth+1, len(levels)-1)], "status": "info", "children": make_tree(item, depth+2), "source": "list"})
+        return [node]
+
+    from glob import glob as _glob
+    ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+    for apath in sorted(ARCHIVE_DIR.glob("*.json"), reverse=True)[:30]:
+        try:
+            arch = json.loads(apath.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        sid = arch.get("session_id", apath.stem)
+        title = arch.get("title") or arch.get("summary", "") or sid
+        summary = (arch.get("summary") or "")[:80]
+        first_msg = ""
+        msgs = arch.get("messages", [])
+        if msgs:
+            first_msg = str(msgs[0].get("content", ""))[:80] if isinstance(msgs[0], dict) else str(msgs[0])[:80]
+        session_node: dict[str, Any] = {
+            "title": summary or first_msg or title, "level": "system_god", "status": "archived",
+            "children": [], "source": "session", "task_id": sid,
+        }
+        for m in msgs[-5:]:
+            role = m.get("role", "?") if isinstance(m, dict) else "?"
+            content = m.get("content", "") if isinstance(m, dict) else str(m)
+            wm = {"title": f"[{role}] {str(content)[:80]}", "level": "world_monarch", "status": "info", "children": [], "source": "message"}
+            if isinstance(content, str):
+                for line in content.split("\n")[:3]:
+                    if line.strip():
+                        wm["children"].append({"title": line.strip()[:100], "level": "continent_emperor", "status": "info", "children": [], "source": "line"})
+            session_node["children"].append(wm)
+        universe_name = "General"
+        u = get_univ(universe_name)
+        g = get_galaxy(u, title[:40] if title else "Session")
+        g["children"].append(session_node)
 
     tasks_dir = DATA_DIR / "tasks"
     if tasks_dir.exists():
@@ -4860,80 +4907,53 @@ async def get_multiverse() -> JSONResponse:
                 state = json.loads(tpath.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            goal_name = state.get("goal", "General")[:40]
+            goal_txt = state.get("goal", "General")[:40]
             task_id = state.get("task_id", tpath.stem)
-            system_node = {
-                "title": goal_name,
-                "level": "system_god",
-                "status": "done" if state.get("done") else "running",
-                "children": [],
-                "source": "task",
-                "task_id": task_id,
+            sys_node: dict[str, Any] = {
+                "title": goal_txt, "level": "system_god", "status": "done" if state.get("done") else "running",
+                "children": [], "source": "task", "task_id": task_id,
             }
-            for obs in state.get("observations", [])[-10:]:
-                world_node = {
-                    "title": obs.get("tool_name", "tool_call"),
-                    "level": "world_monarch",
-                    "status": "completed" if obs.get("approved") else "failed",
-                    "children": [],
-                    "source": "observation",
-                }
+            for obs in state.get("observations", [])[-8:]:
+                tool_name = obs.get("tool_name", "tool")
+                wn: dict[str, Any] = {"title": tool_name, "level": "world_monarch", "status": "completed" if obs.get("approved") else "failed", "children": [], "source": "observation"}
                 res = obs.get("result", {})
                 if isinstance(res, dict):
-                    for i, (k, v) in enumerate(list(res.items())[:8]):
-                        country_node: dict[str, Any] = {"title": f"{k}: {str(v)[:60]}", "level": "country_president", "status": "info", "children": [], "source": "result"}
-                        for sub_i in range(3):
-                            val_str = str(v)[sub_i*100:(sub_i+1)*100]
-                            if val_str.strip():
-                                region_node: dict[str, Any] = {"title": val_str.strip()[:80], "level": "region_governor", "status": "info", "children": [], "source": "partial"}
-                                city_node: dict[str, Any] = {"title": f"line {sub_i}", "level": "city_minister", "status": "info", "children": [], "source": "sub"}
-                                district_node: dict[str, Any] = {"title": "segment", "level": "district_chief", "status": "info", "children": [], "source": "raw"}
-                                house_node: dict[str, Any] = {"title": "result fragment", "level": "house_chief", "status": "info", "children": [], "source": "raw"}
-                                individual_node: dict[str, Any] = {"title": str(val_str)[:40], "level": "individual", "status": "info", "children": [], "source": "final"}
-                                house_node["children"] = [individual_node]
-                                district_node["children"] = [house_node]
-                                city_node["children"] = [district_node]
-                                region_node["children"] = [city_node]
-                                country_node["children"].append(region_node)
-                        world_node["children"].append(country_node)
-                system_node["children"].append(world_node)
+                    for k, v in list(res.items())[:6]:
+                        wn["children"] += make_tree(v)
+                sys_node["children"].append(wn)
             universe_name = "General"
-            for uname in seen_universes:
-                if uname.lower() in goal_name.lower() or goal_name.lower() in uname.lower():
-                    universe_name = uname
-                    break
-            if universe_name not in seen_universes:
-                seen_universes[universe_name] = {"title": universe_name, "level": "universe_god", "status": "active", "children": [], "source": "auto"}
-            galaxy_name = goal_name.split(":")[0] if ":" in goal_name else goal_name
-            galaxy_node: dict[str, Any] = {"title": galaxy_name, "level": "galaxy_demigod", "status": "active", "children": [system_node], "source": "group"}
-            seen_universes[universe_name].setdefault("children", []).append(galaxy_node)
+            u = get_univ(universe_name)
+            g = get_galaxy(u, goal_txt)
+            g["children"].append(sys_node)
 
     subagents_dir = DATA_DIR / "subagents"
     if subagents_dir.exists():
-        for spath in sorted(subagents_dir.glob("*.json"), reverse=True)[:30]:
+        for spath in sorted(subagents_dir.glob("*.json"), reverse=True)[:20]:
             try:
                 run = json.loads(spath.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            world_node = {
-                "title": run.get("spec", {}).get("goal", "subtask")[:60],
-                "level": "world_monarch",
-                "status": "done" if run.get("result") else "running",
-                "children": [],
-                "source": "subagent",
-                "run_id": run.get("run_id"),
-            }
-            denials = run.get("denied_tool_calls", [])
-            for d in denials:
-                world_node["children"].append({"title": f"denied: {d.get('tool_name')}", "level": "continent_emperor", "status": "error", "children": [], "source": "denial"})
-            parent_id = run.get("parent_task_id", "")
+            spec = run.get("spec", {})
+            wn = {"title": spec.get("goal", "subtask")[:60], "level": "world_monarch", "status": "done" if run.get("result") else "running", "children": [], "source": "subagent", "run_id": run.get("run_id")}
+            for d in run.get("denied_tool_calls", []):
+                country_node: dict[str, Any] = {"title": f"denied: {d.get('tool_name')}", "level": "country_president", "status": "error", "children": [], "source": "denial"}
+                for sub_i in range(2):
+                    val_str = str(d)[sub_i*100:(sub_i+1)*100]
+                    if val_str.strip():
+                        region_node: dict[str, Any] = {"title": val_str.strip()[:80], "level": "region_governor", "status": "info", "children": [], "source": "partial"}
+                        ind_node: dict[str, Any] = {"title": str(d)[:40], "level": "individual", "status": "info", "children": [], "source": "final"}
+                        region_node["children"].append(ind_node)
+                        country_node["children"].append(region_node)
+                wn["children"].append(country_node)
             universe_name = "General"
-            tree["children"].append(world_node)
+            u = get_univ(universe_name)
+            g = get_galaxy(u, spec.get("goal", "subtask")[:40])
+            g["children"].append(wn)
 
-    if not seen_universes:
-        seen_universes["General"] = {"title": "General", "level": "universe_god", "status": "idle", "children": [], "source": "default"}
-    for univ in seen_universes.values():
-        tree["children"].append(univ)
+    if not universes:
+        universes["General"] = {"title": "General", "level": "universe_god", "status": "idle", "children": [], "source": "default"}
+    for u in sorted(universes.keys()):
+        tree["children"].append(universes[u])
 
     arts_dir = Path.home() / ".ouroboros" / "artifacts"
     if arts_dir.exists():
@@ -4941,8 +4961,7 @@ async def get_multiverse() -> JSONResponse:
         for af in sorted(arts_dir.glob("*"), reverse=True)[:10]:
             art_list.append({"title": af.name, "level": "world_monarch", "status": "artifact", "source": "artifact"})
         if art_list:
-            art_univ = {"title": "Artefacts", "level": "universe_god", "status": "active", "children": art_list, "source": "artifacts"}
-            tree["children"].append(art_univ)
+            tree["children"].append({"title": "Artefacts", "level": "universe_god", "status": "active", "children": art_list, "source": "artifacts"})
 
     return JSONResponse(tree)
 

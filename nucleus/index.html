@@ -1124,32 +1124,6 @@
       'info': '·', 'done': '✓', 'running': '◌', 'failed': '✗', 'active': '●', 'error': '⚠',
       'artifact': '📄', 'denial': '⊘',
     };
-    function renderTree(node, depth) {
-      if (!node) return '';
-      const icon = LEVEL_ICONS[node.level] || '·';
-      const status = node.status === 'running' ? 'mv-run' : node.status === 'done' || node.status === 'completed' ? 'mv-ok' : node.status === 'error' || node.status === 'failed' ? 'mv-fail' : '';
-      const kids = node.children || [];
-      const hasKids = kids.length > 0;
-      const padding = depth * 16;
-      let label = node.title || '';
-      if (node.level === 'the_one') label = '◆ The One (Ouroboros)';
-      let html = `<div class="mv-node ${status}" style="padding-left:${padding}px" data-depth="${depth}" data-level="${node.level}">`;
-      html += `<span class="mv-icon">${hasKids ? '▾' : '·'}</span> ${label}`;
-      if (node.level === 'the_one') {
-        const total = countDescendants(node);
-        html += ` <span class="mv-label">${total} descendants · Overseer of All</span>`;
-      }
-      if (node.task_id) html += ` <span class="mv-label" style="cursor:pointer" data-task="${node.task_id}">[details]</span>`;
-      html += '</div>';
-      if (hasKids) {
-        html += '<div class="mv-children">';
-        for (const kid of kids) {
-          html += renderTree(kid, depth + 1);
-        }
-        html += '</div>';
-      }
-      return html;
-    }
     function countDescendants(node) {
       let n = 0;
       for (const c of (node.children || [])) { n += 1 + countDescendants(c); }
@@ -1161,22 +1135,80 @@
       if (panel.style.display === 'none') return;
       try {
         const res = await fetch('/multiverse');
-        const tree = await res.json();
-        panel.innerHTML = renderTree(tree, 0);
-        panel.querySelectorAll('[data-task]').forEach(el => {
-          el.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            const taskId = el.dataset.task;
-            setStatus(`Loading task ${taskId}...`);
-            try {
-              const r = await fetch(`/sessions/${taskId}`);
-              if (r.ok) await loadSession(taskId, true);
-              else setStatus(`Task ${taskId}: ${r.status}`);
-            } catch (err) { setStatus(err.message); }
-          });
-        });
+        const treeData = await res.json();
+        panel.innerHTML = '';
+        renderTreeInteractive(panel, treeData, 0);
       } catch (e) {
         panel.innerHTML = `<div style="padding:8px;font-size:12px;color:var(--gray-5)">${e.message}</div>`;
+      }
+    }
+
+    function renderTreeInteractive(container, node, depth) {
+      if (!node) return;
+      const kids = node.children || [];
+      const hasKids = kids.length > 0;
+      const icon = LEVEL_ICONS[node.level] || '·';
+      const cls = node.status === 'running' ? 'mv-run' : node.status === 'done' || node.status === 'completed' ? 'mv-ok' : node.status === 'error' || node.status === 'failed' ? 'mv-fail' : '';
+      const padding = depth * 16;
+      let label = node.title || '';
+      if (node.level === 'the_one') {
+        label = 'The One (Ouroboros)';
+      }
+      const div = document.createElement('div');
+      div.className = `mv-node ${cls}`;
+      div.style.paddingLeft = padding + 'px';
+      if (node.level === 'the_one') {
+        div.style.fontWeight = '700';
+        div.style.color = 'var(--white)';
+        div.style.fontSize = '13px';
+        div.style.borderBottom = '1px solid var(--gray-3)';
+        div.style.paddingBottom = '6px';
+        div.style.marginBottom = '6px';
+      }
+      const iconSpan = document.createElement('span');
+      iconSpan.className = 'mv-icon';
+      iconSpan.textContent = hasKids ? '▾' : '·';
+      div.appendChild(iconSpan);
+      div.appendChild(document.createTextNode(' ' + label));
+      if (node.level === 'the_one') {
+        const total = countDescendants(node);
+        const lbl = document.createElement('span');
+        lbl.className = 'mv-label';
+        lbl.textContent = ` ${total} descendants · Overseer of All`;
+        div.appendChild(lbl);
+      }
+      if (node.task_id) {
+        const det = document.createElement('span');
+        det.className = 'mv-label';
+        det.style.cursor = 'pointer';
+        det.textContent = ' [details]';
+        det.onclick = async (e) => {
+          e.stopPropagation();
+          setStatus(`Loading ${node.task_id}...`);
+          try {
+            const r = await fetch(`/sessions/${node.task_id}`);
+            if (r.ok) await loadSession(node.task_id, true);
+            else setStatus(`Task ${node.task_id}: ${r.status}`);
+          } catch (err) { setStatus(err.message); }
+        };
+        div.appendChild(det);
+      }
+      container.appendChild(div);
+      if (hasKids) {
+        const childContainer = document.createElement('div');
+        childContainer.className = 'mv-children';
+        childContainer.style.display = 'none';
+        for (const kid of kids) {
+          renderTreeInteractive(childContainer, kid, depth + 1);
+        }
+        container.appendChild(childContainer);
+        div.style.cursor = 'pointer';
+        div.addEventListener('click', (e) => {
+          if (e.target !== div && !e.target.classList.contains('mv-icon')) return;
+          const shown = childContainer.style.display !== 'none';
+          childContainer.style.display = shown ? 'none' : 'block';
+          iconSpan.textContent = shown ? '▸' : '▾';
+        });
       }
     }
 
