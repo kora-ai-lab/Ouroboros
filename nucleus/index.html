@@ -1660,9 +1660,8 @@
 
     window.addEventListener('load', async () => {
       await loadSettings();
-      refreshMultiverse();
+      await refreshMultiverse();
       startNewSession(false);
-
       promptInput.focus();
     });
     // Auto-resize textarea
@@ -1670,9 +1669,6 @@
       promptInput.style.height = 'auto';
       promptInput.style.height = Math.min(promptInput.scrollHeight, 200) + 'px';
     });
-    loadSettings().catch(() => {});
-    startNewSession(false);
-    refreshMultiverse();
   </script>
 </body>
 </html>
