@@ -354,6 +354,9 @@ WORKSPACE INDEX CONTEXT:
 KORA KNOWLEDGE BASE:
 {kora_context}
 
+ACTIVE RULES:
+{rules_context}
+
 """
 
 
@@ -2084,6 +2087,17 @@ def discover_environment() -> str:
     return "\n".join(lines)
 
 
+def load_rules_context() -> str:
+    parts: list[str] = []
+    RULES_DIR.mkdir(parents=True, exist_ok=True)
+    for path in sorted(RULES_DIR.glob("**/*.md")):
+        rel = path.relative_to(RULES_DIR)
+        content = path.read_text(encoding="utf-8").strip()
+        if content:
+            parts.append(f"--- {rel} ---\n{content}")
+    return "\n\n".join(parts) if parts else "No active rules."
+
+
 def build_system_prompt(request: ChatRequest) -> str:
     facts = json.dumps(load_json(FACTS_PATH, DEFAULT_FACTS), indent=2)
     registry = json.dumps(load_registry(), indent=2)
@@ -2118,6 +2132,7 @@ def build_system_prompt(request: ChatRequest) -> str:
         recalled_memories=recalled_text,
         workspace_index_context=retrieve_workspace_index_context(first_query),
         kora_context=kora_context,
+        rules_context=load_rules_context(),
     )
 
 
