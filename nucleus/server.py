@@ -3308,7 +3308,8 @@ def permission_runtime_guard(permissions: dict[str, Any], package_dir: Path) -> 
     env_allowed = set(permissions.get("environment", [])) | set(permissions.get("secrets", [])) | SAFE_EXECUTION_ENV_VARS
     scope_payload = []
     for scope in fs_scopes:
-        path_value = Path(scope["path"])
+        raw = scope["path"]
+        path_value = Path(raw).expanduser() if raw.startswith("~") else Path(raw)
         if not path_value.is_absolute():
             path_value = (ROOT_DIR / path_value).resolve()
         scope_payload.append({"path": str(path_value), "access": scope["access"]})
