@@ -632,6 +632,7 @@
             <span id="autoApproveLabel" class="toggle-label-auto">Auto</span>
           </div>
           <button id="openSettings" type="button">Settings</button>
+          <span id="providerIndicator" style="font-size:10px;color:var(--gray-5);min-width:60px;text-align:right"></span>
           <select id="model">
             <option value="openai-fast">openai-fast</option>
             <option value="qwen-coder">qwen-coder</option>
@@ -692,6 +693,10 @@
           </div>
           <div id="localModelRoots" class="status"></div>
           <div id="localModelList"></div>
+        </div>
+        <div class="provider-card">
+          <div class="brand">Provider Priority</div>
+          <div id="providerPriorityList"></div>
         </div>
         <div class="provider-card">
           <div class="brand">Add provider</div>
@@ -1244,6 +1249,7 @@
       if (!settingsState) return;
       const providerId = providerSelect.value;
       const provider = settingsState.providers[providerId];
+      if (!provider) return;
       rebuildModelOptions(settingsModelSelect, provider.models || [], settingsState.default_model);
       providerSettings.innerHTML = '';
       const card = document.createElement('div');
@@ -1259,11 +1265,11 @@
         </div>
         <div class="field">
           <label>Base URL</label>
-          <input type="text" value="${provider.base_url}" readonly>
+          <input id="editBaseUrl" type="text" value="${provider.base_url}">
         </div>
         <div class="field">
-          <label>Models</label>
-          <div>${(provider.models || []).join(', ') || 'No models saved yet'}</div>
+          <label>Models (comma-separated)</label>
+          <input id="editModels" type="text" value="${(provider.models || []).join(', ')}" placeholder="model-1, model-2">
         </div>
         ${runtimeSettingsHtml(provider)}
         <div class="field">
@@ -1272,18 +1278,109 @@
         </div>
         <div class="field">
           <label for="providerApiKeys">Multiple API keys (one per line, round-robin)</label>
-          <textarea id="providerApiKeys" rows="2" style="width:100%;resize:vertical;font-size:11px;font-family:monospace;background:var(--gray-1);color:var(--gray-4);border:1px solid var(--gray-2);padding:6px;" placeholder="key1&#10;key2&#10;key3"></textarea>
+          <textarea id="providerApiKeys" rows="2" style="width:100%;resize:vertical;font-size:11px;font-family:monospace;background:var(--gray-1);color:var(--gray-4);border:1px solid var(--gray-2);padding:6px;" placeholder="key1&#10;key2&#10;key3">${(provider.api_key_count && provider.api_key_count > 0 ? '' : '')}</textarea>
         </div>
-        <div class="actions">
+        <div class="actions" style="display:flex;gap:8px">
           <button id="discoverModels" type="button">Discover models</button>
+          <button id="deleteProvider" type="button" style="background:var(--gray-2);color:var(--gray-4)">Delete provider</button>
+          <button id="saveProviderInline" type="button">Save changes</button>
         </div>
       `;
       providerSettings.appendChild(card);
-      const discoverButton = document.getElementById('discoverModels');
-      discoverButton.addEventListener('click', discoverModels);
+      document.getElementById('discoverModels').addEventListener('click', discoverModels);
+      document.getElementById('deleteProvider').addEventListener('click', async () => {
+        if (!confirm(`Delete provider "${providerId}"?`)) return;
+        const r = await fetch(`/providers/${providerId}`, { method: 'DELETE' });
+        if (!r.ok) { setSettingsStatus(await r.text()); return; }
+        const data = await r.json();
+        settingsState = data.settings;
+        await loadSettings();
+        setSettingsStatus(`Provider "${providerId}" deleted.`);
+      });
+      document.getElementById('saveProviderInline').addEventListener('click', async () => {
+        const baseUrl = document.getElementById('editBaseUrl').value.trim();
+        const models = document.getElementById('editModels').value.split(',').map(s => s.trim()).filter(Boolean);
+        const keyInput = document.getElementById('providerKey');
+        const multiKeys = document.getElementById('providerApiKeys');
+        const apiKeysList = multiKeys ? multiKeys.value.split('\n').map(k => k.trim()).filter(Boolean) : [];
+        const r = await fetch('/providers', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ id: providerId, label: provider.label, type: provider.type, base_url: baseUrl, api_key: keyInput ? keyInput.value.trim() : '', models, models_path: provider.models_path || '' })
+        });
+        if (!r.ok) { setSettingsStatus(await r.text()); return; }
+        if (apiKeysList.length) {
+          await fetch('/settings', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ provider_api_keys: { [providerId]: apiKeysList } })
+          });
+        }
+        await loadSettings();
+        setSettingsStatus('Provider updated.');
+      });
       for (const button of card.querySelectorAll('[data-runtime-preset]')) {
         button.addEventListener('click', () => applyRuntimePreset(button.dataset.runtimePreset));
       }
+    }
+
+    function renderProviderPriority() {
+      const container = document.getElementById('providerPriorityList');
+      if (!container) return;
+      const priority = settingsState.provider_priority || Object.keys(settingsState.providers || {});
+      container.innerHTML = '';
+      for (let i = 0; i < priority.length; i++) {
+        const pid = priority[i];
+        const label = (settingsState.providers[pid] && settingsState.providers[pid].label) || pid;
+        const row = document.createElement('div');
+        row.style.display = 'flex';
+        row.style.alignItems = 'center';
+        row.style.gap = '8px';
+        row.style.padding = '4px 0';
+        row.style.fontSize = '12px';
+        const num = document.createElement('span');
+        num.style.color = 'var(--gray-3)';
+        num.style.minWidth = '20px';
+        num.textContent = `${i + 1}.`;
+        const name = document.createElement('span');
+        name.style.flex = '1';
+        name.style.color = 'var(--gray-4)';
+        name.textContent = label;
+        const up = document.createElement('button');
+        up.type = 'button';
+        up.textContent = '▲';
+        up.style.fontSize = '10px';
+        up.style.padding = '2px 6px';
+        up.style.minHeight = 'auto';
+        up.disabled = i === 0;
+        up.onclick = () => moveProvider(pid, -1);
+        const down = document.createElement('button');
+        down.type = 'button';
+        down.textContent = '▼';
+        down.style.fontSize = '10px';
+        down.style.padding = '2px 6px';
+        down.style.minHeight = 'auto';
+        down.disabled = i === priority.length - 1;
+        down.onclick = () => moveProvider(pid, 1);
+        row.append(num, name, up, down);
+        container.appendChild(row);
+      }
+    }
+
+    async function moveProvider(pid, dir) {
+      const priority = [...(settingsState.provider_priority || Object.keys(settingsState.providers))];
+      const idx = priority.indexOf(pid);
+      if (idx < 0) return;
+      const newIdx = idx + dir;
+      if (newIdx < 0 || newIdx >= priority.length) return;
+      priority.splice(idx, 1);
+      priority.splice(newIdx, 0, pid);
+      const r = await fetch('/settings', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ provider_priority: priority })
+      });
+      if (!r.ok) { setSettingsStatus(await r.text()); return; }
+      settingsState = await r.json();
+      renderProviderPriority();
+      setSettingsStatus('Priority updated.');
     }
 
     async function loadSettings() {
@@ -1298,6 +1395,7 @@
         providerSelect.appendChild(option);
       }
       renderProviderSettings();
+      renderProviderPriority();
       const unified = settingsState.unified_models || [];
       modelSelect.innerHTML = '';
       for (const m of unified) {
@@ -1308,6 +1406,12 @@
         opt.textContent = `${m.name} — via ${providers}${tiers}`;
         if (m.name === settingsState.default_model) opt.selected = true;
         modelSelect.appendChild(opt);
+      }
+      const indicator = document.getElementById('providerIndicator');
+      if (indicator) {
+        const priority = settingsState.provider_priority || Object.keys(settingsState.providers || {});
+        const labels = priority.slice(0, 3).map(p => (settingsState.providers[p] && settingsState.providers[p].label) || p);
+        indicator.textContent = labels.join(' › ') + (priority.length > 3 ? ' …' : '');
       }
     }
 

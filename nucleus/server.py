@@ -4408,6 +4408,21 @@ async def save_provider(update: ProviderUpdate) -> JSONResponse:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.delete("/providers/{provider_id}")
+async def delete_provider(provider_id: str) -> JSONResponse:
+    normalized = normalize_provider_id(provider_id)
+    settings = load_settings()
+    if normalized not in settings["providers"]:
+        raise HTTPException(status_code=404, detail="Provider not found.")
+    del settings["providers"][normalized]
+    if settings.get("provider_priority") and normalized in settings["provider_priority"]:
+        settings["provider_priority"] = [p for p in settings["provider_priority"] if p != normalized]
+    if settings.get("default_provider") == normalized:
+        settings["default_provider"] = list(settings["providers"].keys())[0] if settings["providers"] else "auto"
+    save_settings(settings)
+    return JSONResponse({"deleted": normalized, "settings": provider_status()})
+
+
 @app.post("/providers/{provider_id}/discover")
 async def discover_provider_models(provider_id: str) -> JSONResponse:
     settings = load_settings()
