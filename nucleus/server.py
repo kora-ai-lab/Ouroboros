@@ -4400,52 +4400,28 @@ async def chat(request: ChatRequest) -> StreamingResponse:
         max_repair_attempts = tool_repair_max_attempts()
 
         try:
-            # Auto-discover project structure on first turn
-            try:
-                disc_lines = ["[auto-discovered project structure]"]
-                for item in sorted(ROOT_DIR.iterdir()):
-                    if item.is_dir() and not item.name.startswith("."):
-                        disc_lines.append(f"  {item.name}/")
-                    elif item.is_file() and item.suffix in {".py", ".json", ".md", ".txt", ".toml", ".yaml", ".yml"}:
-                        disc_lines.append(f"  {item.name}")
-                if BASE_DIR.exists() and BASE_DIR != ROOT_DIR:
-                    disc_lines.append("")
-                    disc_lines.append("NUCLEUS/:")
-                    for x in sorted(BASE_DIR.iterdir()):
-                        if not x.name.startswith("."):
-                            disc_lines.append(f"  {x.name}")
-                conversation.append({"role": "tool", "content": "\n".join(disc_lines)})
-            except Exception:
-                pass
-
-            force_tool = last_user_message(request.messages)
-            force_tc = "required" if len(force_tool) > 25 else None
-
-            tool_forced = force_tc == "required"
+            user_msg = last_user_message(request.messages)
+            if len(user_msg) > 25:
+                disc_code = "import os, platform, sys; print('OS:', platform.system(), platform.release()); print('Python:', sys.version); print('CWD:', os.getcwd()); print('Files:', [x for x in os.listdir('.') if not x.startswith('.')][:15])"
+                disc_result, _ = await dispatch_task_tool("execute_python", {"code": disc_code}, policy_approved=True)
+                yield sse("tool_result", {"tool": "execute_python", "result": disc_result})
+                disc_str = json.dumps(disc_result)
+                if len(disc_str) > 3000:
+                    disc_str = disc_str[:3000] + "... [truncated]"
+                conversation.append({"role": "tool", "content": "[environment auto-discovered]\n" + disc_str})
 
             for _ in range(max_turns):
                 text = ""
-                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider, tool_choice=force_tc):
+                async for token in app.state.model_adapter.complete(prune_conversation(conversation), model, provider):
                     text += token
                     yield sse("delta", {"content": token})
 
-                force_tc = None
                 conversation.append({"role": "assistant", "content": text})
                 display_text = strip_tool_calls(text).strip()
                 public_messages.append({"role": "assistant", "content": display_text})
                 tool_calls = extract_tool_calls(text)
 
                 if not tool_calls:
-                    if tool_forced:
-                        tool_forced = False
-                        disc_code = "import os, platform, sys; print('OS:', platform.system(), platform.release()); print('Python:', sys.version); print('CWD:', os.getcwd()); print('Files:', [x for x in os.listdir('.') if not x.startswith('.')][:15])"
-                        result, _ = await dispatch_task_tool("execute_python", {"code": disc_code}, policy_approved=True)
-                        yield sse("tool_result", {"tool": "execute_python", "result": result})
-                        result_str = json.dumps(result)
-                        if len(result_str) > 3000:
-                            result_str = result_str[:3000] + "... [truncated]"
-                        conversation.append({"role": "tool", "content": "[auto-executed environment inspection]\n" + result_str})
-                        continue
                     break
 
                 restart_turn = False
