@@ -1710,6 +1710,7 @@
       const assistantMsg = addMessage('Ouroboros', ''); // returns .content node
       const assistantNode = assistantMsg;
       const turnId = Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+      getTurnContainer(turnId); // initialize tools container for this turn
       sendButton.disabled = true;
       setStatus('Thinking.');
 
