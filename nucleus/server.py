@@ -4302,6 +4302,32 @@ async def get_tools() -> JSONResponse:
     return JSONResponse(load_registry())
 
 
+ARTIFACTS_DIR = Path.home() / ".ouroboros" / "artifacts"
+
+
+@app.get("/artifacts")
+async def list_artifacts() -> JSONResponse:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    files = []
+    for af in sorted(ARTIFACTS_DIR.iterdir(), reverse=True)[:50]:
+        if af.is_file():
+            files.append({"name": af.name, "size": af.stat().st_size, "mtime": af.stat().st_mtime})
+    return JSONResponse({"artifacts": files, "dir": str(ARTIFACTS_DIR)})
+
+
+@app.get("/artifacts/{filename:path}")
+async def get_artifact(filename: str) -> JSONResponse:
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = (ARTIFACTS_DIR / filename).resolve()
+    if not str(path).startswith(str(ARTIFACTS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path.")
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not found.")
+    content = path.read_text(encoding="utf-8", errors="replace")
+    ext = path.suffix.lower()
+    return JSONResponse({"name": filename, "content": content, "size": len(content), "format": ext.lstrip(".")})
+
+
 @app.get("/memory")
 async def get_memory() -> JSONResponse:
     with connect_db() as conn:
