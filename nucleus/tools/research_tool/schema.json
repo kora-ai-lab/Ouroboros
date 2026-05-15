@@ -1,9 +1,0 @@
-{
-  "type": "object",
-  "properties": {
-    "query": {"type": "string", "description": "Research query — what to search for"},
-    "sources": {"type": "integer", "description": "Max sources to return", "default": 5},
-    "depth": {"type": "string", "enum": ["quick", "deep"], "default": "quick", "description": "quick = search + extract snippets; deep = search + scrape full pages"}
-  },
-  "required": ["query"]
-}
