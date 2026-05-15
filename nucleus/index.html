@@ -1122,23 +1122,28 @@
         div.appendChild(det);
       }
       container.appendChild(div);
-      if (hasKids) {
-        const childContainer = document.createElement('div');
-        childContainer.className = 'mv-children';
-        childContainer.style.display = 'none';
-        for (const kid of kids) {
-          renderTreeInteractive(childContainer, kid, depth + 1);
-        }
-        container.appendChild(childContainer);
-        div.style.cursor = 'pointer';
-        div.addEventListener('click', (e) => {
-          if (e.target.tagName === 'SPAN' && e.target.classList.contains('mv-label')) return;
-          if (e.target.tagName === 'SPAN' && e.target.style.cursor === 'pointer') return;
+      const childContainer = document.createElement('div');
+      childContainer.className = 'mv-children';
+      childContainer.style.display = 'none';
+      for (const kid of kids) {
+        renderTreeInteractive(childContainer, kid, depth + 1);
+      }
+      container.appendChild(childContainer);
+      div.style.cursor = 'pointer';
+      div.addEventListener('click', (e) => {
+        if (e.target.tagName === 'SPAN' && e.target.style.cursor === 'pointer') return;
+        if (hasKids) {
           const shown = childContainer.style.display !== 'none';
           childContainer.style.display = shown ? 'none' : 'block';
           iconSpan.textContent = shown ? '▸' : '▾';
-        });
-      }
+        }
+        if (node.task_id) {
+          setStatus(`Loading ${node.task_id}...`);
+          fetch(`/sessions/${node.task_id}`).then(r => { if (r.ok) loadSession(node.task_id, true); else setStatus(`Task ${node.task_id}: ${r.status}`); }).catch(err => setStatus(err.message));
+        } else if (node.source === 'artifact') {
+          setStatus(`Artifact: ${node.title} (saved in ~/.ouroboros/artifacts/)`);
+        }
+      });
     }
 
     function setSettingsStatus(text) {
