@@ -4634,10 +4634,8 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 disc_code = "import os, platform, sys; print('OS:', platform.system(), platform.release()); print('Python:', sys.version); print('CWD:', os.getcwd()); print('Files:', [x for x in os.listdir('.') if not x.startswith('.')][:15])"
                 disc_result, _ = await dispatch_task_tool("execute_python", {"code": disc_code}, policy_approved=True)
                 yield sse("tool_result", {"tool": "execute_python", "result": disc_result})
-                disc_str = json.dumps(disc_result)
-                if len(disc_str) > 3000:
-                    disc_str = disc_str[:3000] + "... [truncated]"
-                conversation.append({"role": "tool", "content": "[environment auto-discovered]\n" + disc_str})
+                disc_out = disc_result.get("stdout", "")[:1500]
+                conversation.append({"role": "tool", "content": "[environment auto-discovered]\n" + disc_out})
 
                 proj_name: str | None = None
                 for kw in ["dans ", "dans le projet ", "sur le projet ", "pour le projet ", "dans l'entreprise ", "dans "]:
@@ -4704,10 +4702,10 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                     observation = task_state.add_observation(step, result, True)
                     save_task_state(task_state, DATA_DIR)
 
-                    result_str = json.dumps(result)
-                    if len(result_str) > 10000:
-                        result_str = result_str[:10000] + "... [Result truncated for context]"
-                    conversation.append({"role": "tool", "content": result_str})
+                    err = result.get("stderr") or result.get("error") or ""
+                    out = result.get("stdout") or ""
+                    summary = err[:1500] if result.get("exit_code", 0) != 0 else out[:1500]
+                    conversation.append({"role": "tool", "content": summary})
 
                     if tool is not None and not tool.get("builtin") and registered_tool_failed(result, tool):
                         attempt_number = repair_attempts_by_tool.get(tool_name, 0) + 1
