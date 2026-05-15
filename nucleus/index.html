@@ -1702,32 +1702,23 @@
     }
 
     async function sendMessage(text) {
-      if (currentChatAbort) {
-        currentChatAbort.abort();
-      }
-      const abort = new AbortController();
-      currentChatAbort = abort;
-
-      messages.push({ role: 'user', content: text });
-      addTextMessage('User', text);
-      const assistantMsg = addMessage('Ouroboros', ''); // returns .content node
-      const assistantNode = assistantMsg;
       const turnId = Date.now() + '-' + Math.random().toString(36).slice(2, 6);
-      getTurnContainer(turnId); // initialize tools container for this turn
-      sendButton.disabled = true;
-      setStatus('Thinking.');
+      addTextMessage('User', text);
+      const assistantMsg = addMessage('Ouroboros', '');
+      const assistantNode = assistantMsg;
+      getTurnContainer(turnId);
+      const msgSnapshot = [...messages, { role: 'user', content: text }];
 
       const response = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          messages,
+          messages: msgSnapshot,
           model: modelSelect.value,
           provider: providerSelect.value || 'pollinations',
           context_files: contextFiles,
           auto_approve: autoApproveToggle.checked
         }),
-        signal: abort.signal,
       });
 
       const reader = response.body.getReader();
@@ -1756,10 +1747,6 @@
         }
       }
 
-      if (abort.signal.aborted) {
-        sendButton.disabled = false;
-        return;
-      }
       const tc = TURN_TOOLS.get(turnId);
       if (tc && tc.container.children.length > 0) {
         tc.details.querySelector('summary').textContent = `${tc.container.children.length / 2} tool${tc.container.children.length / 2 > 1 ? 's' : ''} used`;
@@ -1767,26 +1754,17 @@
       }
       TURN_TOOLS.delete(turnId);
       messages.push({ role: 'assistant', content: assistantText });
-      try {
-        await persistSessionArchive();
-      } catch (error) {
-        setStatus(`Session archive failed: ${error.message}`);
-      }
-      sendButton.disabled = false;
-      promptInput.focus();
+      messages.push({ role: 'user', content: text });
+      try { await persistSessionArchive(); } catch (error) { setStatus(`Archive failed: ${error.message}`); }
+      refreshMultiverse();
     }
 
-    composer.addEventListener('submit', async (event) => {
+    composer.addEventListener('submit', (event) => {
       event.preventDefault();
       const text = promptInput.value.trim();
-      if (!text || sendButton.disabled) return;
+      if (!text) return;
       promptInput.value = '';
-      try {
-        await sendMessage(text);
-      } catch (error) {
-        setStatus(error.message || String(error));
-        sendButton.disabled = false;
-      }
+      sendMessage(text).catch(error => setStatus(error.message || String(error)));
     });
 
     promptInput.addEventListener('keydown', (event) => {
