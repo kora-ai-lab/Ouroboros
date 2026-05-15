@@ -959,7 +959,10 @@ async def discover_google_models(provider_config: dict[str, Any]) -> list[str]:
             return []
         data = response.json()
         models = data.get("models", [])
-        return sorted(set(str(m["name"]).split("/")[-1] for m in models if "name" in m))
+        return sorted(set(
+            str(m["name"]).split("/")[-1] for m in models
+            if "name" in m and "generateContent" in m.get("supportedGenerationMethods", [])
+        ))
 
 
 async def discover_openai_compatible_models(provider_config: dict[str, Any]) -> list[str]:
