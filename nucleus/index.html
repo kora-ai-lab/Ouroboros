@@ -1518,7 +1518,10 @@
 
     function handleSseLine(eventName, data, assistantNode) {
       if (eventName === 'delta') {
-        assistantNode.appendChild(document.createTextNode(data.content));
+        const clean = data.content.replace(/<tool_call>.*?<\/tool_call>/gs, '').replace(/<tool_call>\s*\{.*?\}\s*<\/tool_call>/gs, '').trim();
+        if (clean) {
+          assistantNode.appendChild(document.createTextNode(clean));
+        }
       } else if (eventName === 'assistant_replace') {
         assistantNode.textContent = data.content;
       } else if (TASK_EVENT_LABELS[eventName]) {
