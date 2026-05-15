@@ -1527,31 +1527,50 @@
         renderJsonBlock('Tool call', data);
       } else if (eventName === 'tool_result') {
         const toolName = data.tool || 'tool';
-        const node = document.createElement('div');
-        node.className = 'message assistant-msg';
-        node.style.cursor = 'pointer';
-        const role = document.createElement('div');
-        role.className = 'role';
-        role.textContent = `Subsession: ${toolName}`;
-        const summary = document.createElement('div');
-        summary.className = 'content';
-        const exitCode = data.result && data.result.exit_code !== undefined ? data.result.exit_code : '?';
-        const stderr = data.result && data.result.stderr ? (data.result.stderr.substring(0, 80)) : '';
-        summary.textContent = `exit: ${exitCode}${stderr ? ' · ' + stderr : ''}`;
-        node.appendChild(role);
-        node.appendChild(summary);
-        const detail = document.createElement('div');
-        detail.style.display = 'none';
-        detail.style.marginTop = '8px';
-        detail.style.fontSize = '11px';
-        detail.style.color = 'var(--gray-4)';
-        detail.style.fontFamily = 'monospace';
-        detail.style.whiteSpace = 'pre-wrap';
-        detail.textContent = JSON.stringify(data, null, 2);
-        node.appendChild(detail);
-        node.addEventListener('click', () => { detail.style.display = detail.style.display === 'none' ? 'block' : 'none'; });
-        output.appendChild(node);
-        output.scrollTop = output.scrollHeight;
+        const lastKey = Array.from(TURN_TOOLS.keys()).pop();
+        const tc = lastKey ? getTurnContainer(lastKey) : null;
+        if (tc) {
+          const line = document.createElement('div');
+          line.style.cursor = 'pointer';
+          line.style.padding = '2px 0';
+          line.textContent = `▸ ${toolName} · exit: ${data.result && data.result.exit_code !== undefined ? data.result.exit_code : '?'}`;
+          const detail = document.createElement('div');
+          detail.style.display = 'none';
+          detail.style.padding = '4px 0 4px 12px';
+          detail.style.whiteSpace = 'pre-wrap';
+          detail.style.fontSize = '10px';
+          detail.style.color = 'var(--gray-5)';
+          detail.textContent = JSON.stringify(data, null, 2).substring(0, 2000);
+          line.addEventListener('click', (e) => { e.stopPropagation(); detail.style.display = detail.style.display === 'none' ? 'block' : 'none'; });
+          tc.container.appendChild(line);
+          tc.container.appendChild(detail);
+          const ttl = parseInt(tc.details.querySelector('summary').textContent.match(/\d+/)?.[0] || '0') + 1;
+          tc.details.querySelector('summary').textContent = `${ttl} tool${ttl > 1 ? 's' : ''} used`;
+        } else {
+          setStatus(`Tool: ${toolName} completed`);
+        }
+      } else if (eventName === 'evaluation') {
+        const lastKey = Array.from(TURN_TOOLS.keys()).pop();
+        if (lastKey) {
+          const tc = getTurnContainer(lastKey);
+          const thinkLine = document.createElement('div');
+          thinkLine.style.fontSize = '10px';
+          thinkLine.style.color = 'var(--gray-5)';
+          thinkLine.style.padding = '2px 0';
+          thinkLine.textContent = `🧠 ${data.decision || 'thinking...'}${data.rationale ? ': ' + data.rationale.substring(0, 120) : ''}`;
+          tc.container.appendChild(thinkLine);
+        }
+      } else if (eventName === 'tool_repair') {
+        const lastKey = Array.from(TURN_TOOLS.keys()).pop();
+        if (lastKey) {
+          const tc = getTurnContainer(lastKey);
+          const repairLine = document.createElement('div');
+          repairLine.style.fontSize = '10px';
+          repairLine.style.color = '#ff6b6b';
+          repairLine.style.padding = '2px 0';
+          repairLine.textContent = `⚠ repair #${data.attempt}: ${(data.failure && data.failure.message) || 'fixing...'}`;
+          tc.container.appendChild(repairLine);
+        }
       } else if (eventName === 'approval_request') {
         renderApprovalRequest(data);
       } else if (eventName === 'error') {
@@ -1658,6 +1677,27 @@
       }
     }
 
+    const TURN_TOOLS = new Map();
+
+    function getTurnContainer(turnId) {
+      if (!TURN_TOOLS.has(turnId)) {
+        const details = document.createElement('details');
+        details.style.marginTop = '8px';
+        const summary = document.createElement('summary');
+        summary.style.cursor = 'pointer';
+        summary.style.fontSize = '11px';
+        summary.style.color = 'var(--gray-3)';
+        summary.textContent = 'Tools used';
+        const container = document.createElement('div');
+        container.style.fontSize = '11px';
+        container.style.color = 'var(--gray-4)';
+        details.appendChild(summary);
+        details.appendChild(container);
+        TURN_TOOLS.set(turnId, { details, container });
+      }
+      return TURN_TOOLS.get(turnId);
+    }
+
     async function sendMessage(text) {
       if (currentChatAbort) {
         currentChatAbort.abort();
@@ -1667,7 +1707,9 @@
 
       messages.push({ role: 'user', content: text });
       addTextMessage('User', text);
-      const assistantNode = addTextMessage('Ouroboros', '');
+      const assistantMsg = addMessage('Ouroboros', ''); // returns .content node
+      const assistantNode = assistantMsg;
+      const turnId = Date.now() + '-' + Math.random().toString(36).slice(2, 6);
       sendButton.disabled = true;
       setStatus('Thinking.');
 
@@ -1714,6 +1756,12 @@
         sendButton.disabled = false;
         return;
       }
+      const tc = TURN_TOOLS.get(turnId);
+      if (tc && tc.container.children.length > 0) {
+        tc.details.querySelector('summary').textContent = `${tc.container.children.length / 2} tool${tc.container.children.length / 2 > 1 ? 's' : ''} used`;
+        assistantNode.parentNode.appendChild(tc.details);
+      }
+      TURN_TOOLS.delete(turnId);
       messages.push({ role: 'assistant', content: assistantText });
       try {
         await persistSessionArchive();
