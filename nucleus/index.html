@@ -1531,6 +1531,14 @@
       risk.style.marginBottom = '12px';
       risk.textContent = data.risk_summary || 'Review this tool execution before approving.';
 
+      const sandbox = data.sandbox_tier || 'read_only';
+      const tierInfo = document.createElement('div');
+      tierInfo.style.fontSize = '10px';
+      tierInfo.style.color = 'var(--gray-3)';
+      tierInfo.style.marginBottom = '12px';
+      tierInfo.textContent = `Sandbox: ${sandbox}${sandbox === 'network_enabled' ? ' (network)' : sandbox === 'host_full' ? ' (full)' : sandbox === 'workspace_write' ? ' (writes)' : ' (read)'}`;
+      risk.after(tierInfo);
+
       const codeLabel = document.createElement('div');
       codeLabel.className = 'role';
       codeLabel.textContent = data.code ? 'Exact code to execute' : 'Arguments';
