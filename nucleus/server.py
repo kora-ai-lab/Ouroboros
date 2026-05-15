@@ -4729,6 +4729,15 @@ async def chat(request: ChatRequest) -> StreamingResponse:
                 tool_calls = extract_tool_calls(text)
 
                 if not tool_calls:
+                    search_kw = ["cherche", "search", "online", "web", "trouve", "find", "recherche", "internet"]
+                    if any(kw in user_msg.lower() for kw in search_kw):
+                        esc_query = user_msg[:120].replace("'", "\\'")
+                        search_code = "import urllib.request, urllib.parse; url='https://lite.duckduckgo.com/lite/?q='+urllib.parse.quote('" + esc_query + "'); req=urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'}); data=urllib.request.urlopen(req,timeout=10).read().decode('utf-8'); print(data[:3000])"
+                        search_result, _ = await dispatch_task_tool("execute_python", {"code": search_code}, policy_approved=True)
+                        yield sse("tool_result", {"tool": "execute_python", "result": search_result})
+                        search_out = search_result.get("stdout", "")[:2000] or search_result.get("stderr", "")[:500]
+                        conversation.append({"role": "tool", "content": "[web search]\n" + search_out})
+                        continue
                     break
 
                 restart_turn = False
