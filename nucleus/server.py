@@ -3815,7 +3815,8 @@ async def evaluate_tool_result(
         raw_response = await complete_model_text(prune_conversation(conversation), model, provider)
     except Exception as exc:
         conversation.pop()
-        return {"decision": "continue", "rationale": f"Evaluation unavailable", "error": str(exc)}
+        decision = "final" if any(kw in str(exc).lower() for kw in ["503", "402", "429", "provider", "exhausted", "unavailable", "balance"]) else "continue"
+        return {"decision": decision, "rationale": f"Evaluation unavailable", "error": str(exc)}
     conversation.append({"role": "assistant", "content": raw_response})
     parsed = parse_evaluation_decision(raw_response)
     store_evaluation_decision(session_id, parsed["decision"], parsed["rationale"], raw_response)
