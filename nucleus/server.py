@@ -2326,10 +2326,27 @@ def _find_json_span(text: str, start: int = 0) -> tuple[int, int] | None:
     if brace_start == -1:
         return None
     depth = 0
+    in_string = False
+    escape = False
     for i in range(brace_start, len(text)):
-        if text[i] == "{":
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"' and not in_string:
+            in_string = True
+            continue
+        if ch == '"' and in_string:
+            in_string = False
+            continue
+        if in_string:
+            continue
+        if ch == "{":
             depth += 1
-        elif text[i] == "}":
+        elif ch == "}":
             depth -= 1
             if depth == 0:
                 return (brace_start, i + 1)
@@ -2337,10 +2354,13 @@ def _find_json_span(text: str, start: int = 0) -> tuple[int, int] | None:
 
 
 def _try_parse_tool_json(text: str, json_start: int, json_end: int) -> dict[str, Any] | None:
+    raw = text[json_start:json_end]
     try:
-        payload = json.loads(text[json_start:json_end], strict=False)
+        payload = json.loads(raw, strict=False)
     except json.JSONDecodeError:
-        return None
+        payload = _extract_tool_json_fallback(raw)
+        if payload is None:
+            return None
     if not isinstance(payload, dict) or "name" not in payload:
         return None
     if "arguments" not in payload:
@@ -2348,6 +2368,19 @@ def _try_parse_tool_json(text: str, json_start: int, json_end: int) -> dict[str,
     if not isinstance(payload["arguments"], dict):
         payload["arguments"] = {"code": str(payload["arguments"])}
     return payload
+
+
+def _extract_tool_json_fallback(raw: str) -> dict[str, Any] | None:
+    m = re.search(r'"name"\s*:\s*"([^"]+)"', raw)
+    if not m:
+        return None
+    name = m.group(1)
+    cm = re.search(r'"code"\s*:\s*"(.+)"', raw, re.DOTALL)
+    if cm:
+        code = cm.group(1)
+        code = re.sub(r'\\(.)', r'\1', code)
+        return {"name": name, "arguments": {"code": code}}
+    return {"name": name}
 
 
 def extract_tool_calls(text: str) -> list[dict[str, Any]]:
