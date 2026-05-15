@@ -1703,11 +1703,12 @@
 
     async function sendMessage(text) {
       const turnId = Date.now() + '-' + Math.random().toString(36).slice(2, 6);
+      messages.push({ role: 'user', content: text });
       addTextMessage('User', text);
       const assistantMsg = addMessage('Ouroboros', '');
       const assistantNode = assistantMsg;
       getTurnContainer(turnId);
-      const msgSnapshot = [...messages, { role: 'user', content: text }];
+      const msgSnapshot = [...messages];
 
       const response = await fetch('/chat', {
         method: 'POST',
@@ -1754,7 +1755,6 @@
       }
       TURN_TOOLS.delete(turnId);
       messages.push({ role: 'assistant', content: assistantText });
-      messages.push({ role: 'user', content: text });
       try { await persistSessionArchive(); } catch (error) { setStatus(`Archive failed: ${error.message}`); }
       refreshMultiverse();
     }
