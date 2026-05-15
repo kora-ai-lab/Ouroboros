@@ -5108,10 +5108,20 @@ async def get_multiverse() -> JSONResponse:
     arts_dir = Path.home() / ".ouroboros" / "artifacts"
     if arts_dir.exists():
         art_list = []
-        for af in sorted(arts_dir.glob("*"), reverse=True)[:10]:
+        for af in sorted(arts_dir.glob("*"), reverse=True)[:20]:
             art_list.append({"title": af.name, "level": "world_monarch", "status": "artifact", "source": "artifact"})
         if art_list:
-            tree["children"].append({"title": "Artefacts", "level": "universe_god", "status": "active", "children": art_list, "source": "artifacts"})
+            u = get_univ("General")
+            reports_node: dict[str, Any] = {"title": "Reports", "level": "system_god", "status": "active", "children": art_list, "source": "artifacts"}
+            galaxy_found = False
+            for g in u.get("children", []):
+                if g.get("title") == "Generated Reports" and g.get("level") == "galaxy_demigod":
+                    g["children"].append(reports_node)
+                    galaxy_found = True
+                    break
+            if not galaxy_found:
+                gn: dict[str, Any] = {"title": "Generated Reports", "level": "galaxy_demigod", "status": "active", "children": [reports_node], "source": "group"}
+                u.setdefault("children", []).append(gn)
 
     return JSONResponse(tree)
 

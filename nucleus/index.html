@@ -1145,38 +1145,45 @@
           setStatus(`Loading artifact: ${name}...`);
           fetch(`/artifacts/${encodeURIComponent(name)}`).then(r => r.json()).then(data => {
             if (!data.content) { setStatus('Artifact not found.'); return; }
-            const node2 = document.createElement('div');
-            node2.className = 'message assistant-msg';
+            const content = data.content;
+            const isMd = name.endsWith('.md') || name.endsWith('.markdown');
+            const isHtml = name.endsWith('.html');
+            const isJson = name.endsWith('.json');
+            const body = document.createElement('div');
+            body.className = 'message assistant-msg';
             const role = document.createElement('div');
             role.className = 'role';
-            role.textContent = `Artifact: ${name}`;
-            node2.appendChild(role);
-            if (name.endsWith('.md') || name.endsWith('.markdown')) {
-              const content = document.createElement('div');
-              content.className = 'content';
-              content.style.whiteSpace = 'pre-wrap';
-              content.style.fontFamily = 'monospace';
-              content.style.fontSize = '12px';
-              content.textContent = data.content.substring(0, 5000);
-              node2.appendChild(content);
-            } else if (name.endsWith('.html')) {
-              const iframe = document.createElement('iframe');
-              iframe.style.width = '100%';
-              iframe.style.height = '400px';
-              iframe.style.border = '1px solid var(--gray-2)';
-              iframe.style.background = 'white';
-              iframe.srcdoc = data.content.substring(0, 50000);
-              node2.appendChild(iframe);
+            role.textContent = `Artefact: ${name}`;
+            body.appendChild(role);
+            const rendered = document.createElement('div');
+            rendered.style.margin = '8px 0';
+            if (isMd) {
+              const h = content.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+              const html = h.replace(/^### (.+)$/gm, '<h3>$1</h3>').replace(/^## (.+)$/gm, '<h2>$1</h2>').replace(/^# (.+)$/gm, '<h1>$1</h1>').replace(/^(\d+)\. (.+)$/gm, '<li>$2</li>').replace(/^- (.+)$/gm, '<li>$1</li>').replace(/\n\n/g, '</p><p>').replace(/`([^`]+)`/g, '<code style="background:var(--gray-2);padding:1px 4px;font-size:11px">$1</code>');
+              const ifr = document.createElement('iframe');
+              ifr.style.width = '100%'; ifr.style.height = '400px'; ifr.style.border = '1px solid var(--gray-2)'; ifr.style.background = 'var(--surface)';
+              ifr.srcdoc = `<html><head><style>body{font-family:Inter,sans-serif;font-size:14px;line-height:1.6;color:#ccc;background:#111;padding:16px;max-width:780px;margin:auto}h1{font-size:20px;font-weight:700}h2{font-size:16px;font-weight:600;color:#eee}h3{font-size:14px;font-weight:600}code{font-family:'JetBrains Mono',monospace;font-size:12px;background:#222;padding:1px 4px}pre{background:#0a0a0a;padding:12px;overflow-x:auto}pre code{background:transparent;padding:0}li{margin:4px 0}p{margin:8px 0}</style></head><body>${html}</body></html>`;
+              rendered.appendChild(ifr);
+            } else if (isHtml) {
+              const ifr = document.createElement('iframe');
+              ifr.style.width = '100%'; ifr.style.height = '500px'; ifr.style.border = '1px solid var(--gray-2)'; ifr.style.background = '#fff';
+              ifr.srcdoc = content;
+              rendered.appendChild(ifr);
+            } else if (isJson) {
+              const pre = document.createElement('pre');
+              pre.style.fontSize = '11px'; pre.style.color = 'var(--gray-4)'; pre.style.background = 'var(--gray-1)'; pre.style.padding = '12px'; pre.style.overflowX = 'auto';
+              try { pre.textContent = JSON.stringify(JSON.parse(content), null, 2); } catch(e) { pre.textContent = content.substring(0, 5000); }
+              rendered.appendChild(pre);
             } else {
               const pre = document.createElement('pre');
-              pre.style.fontSize = '11px';
-              pre.style.color = 'var(--gray-4)';
-              pre.textContent = data.content.substring(0, 3000);
-              node2.appendChild(pre);
+              pre.style.fontSize = '12px'; pre.style.color = 'var(--gray-4)'; pre.style.background = 'var(--gray-1)'; pre.style.padding = '12px'; pre.style.overflowX = 'auto'; pre.style.fontFamily = "'JetBrains Mono',monospace";
+              pre.textContent = content.substring(0, 8000);
+              rendered.appendChild(pre);
             }
-            output.appendChild(node2);
+            body.appendChild(rendered);
+            output.appendChild(body);
             output.scrollTop = output.scrollHeight;
-            setStatus(`Artifact: ${name} (${data.size} bytes)`);
+            setStatus(`Artefact: ${name} (${data.size} bytes)`);
           }).catch(err => setStatus(`Failed: ${err.message}`));
         }
       });
