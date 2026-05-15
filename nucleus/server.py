@@ -2341,9 +2341,13 @@ def _try_parse_tool_json(text: str, json_start: int, json_end: int) -> dict[str,
         payload = json.loads(text[json_start:json_end], strict=False)
     except json.JSONDecodeError:
         return None
-    if isinstance(payload, dict) and "name" in payload and "arguments" in payload:
-        return payload
-    return None
+    if not isinstance(payload, dict) or "name" not in payload:
+        return None
+    if "arguments" not in payload:
+        payload["arguments"] = {k: v for k, v in payload.items() if k != "name"}
+    if not isinstance(payload["arguments"], dict):
+        payload["arguments"] = {"code": str(payload["arguments"])}
+    return payload
 
 
 def extract_tool_calls(text: str) -> list[dict[str, Any]]:
