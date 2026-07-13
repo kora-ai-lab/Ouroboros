@@ -1,0 +1,16 @@
+nom: ouroboros
+venture: kora
+archetype: ia_agent_local
+description: "Agent IA local souverain, offline, auto-évolutif"
+repo: "https://github.com/kora-ai-lab/Ouroboros.git"
+phase_state:
+  phase_actuelle: 3
+  palier_actuel: "3.1"
+  paliers:
+    "3.1": {nom: "MVP fonctionnel", clos: false}
+    "3.2": {nom: "Tests réels", clos: false}
+    "3.3": {nom: "Itération", clos: false}
+  gate_criteres:
+    produit_stable: false
+    usage_reel: false
+    retours_incorpores: false
