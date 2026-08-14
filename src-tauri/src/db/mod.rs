@@ -58,6 +58,9 @@ impl Database {
         if current_version < 5 {
             migrations::v5::apply(&conn)?;
         }
+        if current_version < 6 {
+            migrations::v6::apply(&conn)?;
+        }
 
         Ok(())
     }
