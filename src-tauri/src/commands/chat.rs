@@ -245,7 +245,7 @@ pub async fn get_messages(
 ) -> Result<Vec<MessageResponse>, String> {
     let state = app.state::<crate::state::AppState>();
     let conn = state.db.conn();
-    let mut stmt = conn.prepare("SELECT id, conversation_id, role, content, tool_calls_json, token_count, created_at FROM messages WHERE conversation_id = ?1 ORDER BY created_at ASC").map_err(|e| e.to_string())?;
+    let mut stmt = conn.prepare("SELECT id, conversation_id, role, content, tool_calls_json, COALESCE(token_count, 0), created_at FROM messages WHERE conversation_id = ?1 ORDER BY created_at ASC").map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(params![conversation_id], |row| {
             Ok(MessageResponse {

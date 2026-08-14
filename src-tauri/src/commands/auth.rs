@@ -162,6 +162,36 @@ async fn complete_from_cloud_provider(
     }
 }
 
+async fn response_json_or_error(
+    resp: reqwest::Response,
+    provider: &str,
+) -> Result<serde_json::Value, String> {
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("{provider} response read failed: {e}"))?;
+
+    let json: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("{provider} parse error: {e}"))?;
+
+    if !status.is_success() {
+        let message = json
+            .pointer("/error/message")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                json.pointer("/error/status")
+                    .and_then(|value| value.as_str())
+            })
+            .unwrap_or("request was rejected");
+        return Err(format!(
+            "{provider} request failed with HTTP {status}: {message}"
+        ));
+    }
+
+    Ok(json)
+}
+
 async fn complete_openai(api_key: &str, message: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
     let body = serde_json::json!({
@@ -178,10 +208,7 @@ async fn complete_openai(api_key: &str, message: &str) -> Result<String, String>
         .await
         .map_err(|e| format!("OpenAI request failed: {}", e))?;
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Parse error: {}", e))?;
+    let json = response_json_or_error(resp, "OpenAI").await?;
     Ok(json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("No response")
@@ -205,10 +232,7 @@ async fn complete_anthropic(api_key: &str, message: &str) -> Result<String, Stri
         .await
         .map_err(|e| format!("Anthropic request failed: {}", e))?;
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Parse error: {}", e))?;
+    let json = response_json_or_error(resp, "Anthropic").await?;
     Ok(json["content"][0]["text"]
         .as_str()
         .unwrap_or("No response")
@@ -232,10 +256,7 @@ async fn complete_google(api_key: &str, message: &str) -> Result<String, String>
         .await
         .map_err(|e| format!("Google request failed: {}", e))?;
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Parse error: {}", e))?;
+    let json = response_json_or_error(resp, "Google").await?;
     Ok(json["candidates"][0]["content"]["parts"][0]["text"]
         .as_str()
         .unwrap_or("No response")
